@@ -1,0 +1,33 @@
+build/
+build-*/
+*.o
+*.so
+*.dylib
+*.log
+__pycache__/
+
+bench/calib/
+bench/calib_v2/
+bench/corpus_v2/
+bench/calib/mtp_ft2/
+bench/calib_v3/
+bench/calib_v23/
+bench/corpus_v3/
+bench/sparse/*.tqf
+bench/quality_ladder/*.tqf
+bench/quality_ladder/*.npz
+bench/quality_ladder/lib_snapshot/
+bench/sparse/act_norms.*
+bench/sparse/taxbench/*.bin
+bench/quality_ladder/bf16_ref_argmax.npz
+bench/quality_ladder/engine_argmax_*.npz
+bench/quality_ladder/*.json
+bench/gptq_e2m1/
+
+# Internal-only content lives in a separate PRIVATE git repo rooted at internal/
+# (engineering log qwentin_live.md, docs/, the SM120 probes/, and bench/ corpora).
+# These dirs are never tracked by the public repo (recreated scratch stays ignored too).
+internal/
+probes/
+bench/
+
