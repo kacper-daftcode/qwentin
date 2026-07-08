@@ -10,7 +10,7 @@ so any client — including an `opencode`/`continue`-style coding agent — can 
 ```
 27B params + 256k context            →  one 32 GB RTX 5090   (steady-state 30.9 GiB)
 single-stream decode                 →  118-122 tok/s @ short · 112 @ 32k · 97-99 @ 128k · 67 @ 200k
-cold prefill (wide+MMA, default ON)  →  2-3× faster at any length · 1626 tok/s @ 32k · 851 @ 128k
+cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1626 tok/s @ 32k · 1210 @ 128k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
 
 (long-context tok/s: 2026-07, RTX PRO 6000 — same GB202/SM120 class; pre-update 5090 tables below)
@@ -82,8 +82,9 @@ Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
 > numbers): 1k ~121-122 tok/s, 32k 112, 64k 107-114, 128k **97-99** (was 59 on the
 > same card), 200k **67** (was 43) — ms/round -33-40% at 64k+, short contexts
 > bit-identical and unchanged in speed. Cold-prefill wide+MMA is now the server
-> default (works at Q4-KV/256k, no 16k cap): 1626 tok/s @ 32k, 1261 @ 64k, 851 @
-> 128k, 636 @ 200k (needle 4/4 @24k and 4/4 @120k on these paths).
+> default (works at Q4-KV/256k, no 16k cap) and its attention is key-split at long
+> range: 1626 tok/s @ 32k, 1527 @ 64k, 1210 @ 128k (108 s), 981 @ 200k (204 s) —
+> needle 4/4 @24k and 4/4 @120k on these paths.
 
 **Cold prefill** — the first turn of a long prompt (RAG / large paste / agent turn 1). The
 original fp32-KV wide path vs the N=16 baseline (5090, pre-2026-07; the wide+MMA successor is
