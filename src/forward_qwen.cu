@@ -1247,10 +1247,10 @@ static __device__ void tq_attn_mma_block(
                             int c = 2 * g + cc;
                             const uint32_t *a = &sm[TQ_AMM_QA + (c * 32 + lane) * 4];
                             // the quad's 8 int4-code bytes [8c .. 8c+8) in ONE
-                            // 8-byte load (lane t4 uses bytes t4 and t4+4);
-                            // same bytes as the two scattered loads -- bit-exact
-                            uint64_t w0 = *(const uint64_t *)(kr0 + 8 * c);
-                            uint64_t w1 = *(const uint64_t *)(kr1 + 8 * c);
+                            // 8-byte read-only load (lane t4 uses bytes t4 and
+                            // t4+4); same bytes as the scattered loads -- bit-exact
+                            uint64_t w0 = __ldg((const unsigned long long *)(kr0 + 8 * c));
+                            uint64_t w1 = __ldg((const unsigned long long *)(kr1 + 8 * c));
                             uint8_t a0 = (uint8_t)(w0 >> (8 * t4));
                             uint8_t a8 = (uint8_t)(w0 >> (8 * t4 + 32));
                             uint8_t b0v = (uint8_t)(w1 >> (8 * t4));
@@ -10334,12 +10334,15 @@ extern "C" int qwn_init(const char *path) {
     maybe_e2m1_convert_all();
     maybe_ldsm_convert_all();
     {
+        // Default ON since 2026-07-08: bit-exact by construction (deadlock-free
+        // per-m-tile gating), measured +0.5-0.6% e2e on both 5090 and PRO 6000.
+        // TQ_PERSIST_P2P=0 reverts to the plain bar6 grid barrier.
         const char *e = getenv("TQ_PERSIST_P2P");
-        int p2p = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        int p2p = (e && e[0]) ? (strcmp(e, "0") != 0 ? 1 : 0) : 1;
         cudaMemcpyToSymbol(gc_use_p2p, &p2p, sizeof(int));
         if (p2p)
-            fprintf(stderr, "TQ_PERSIST_P2P=1 (PROBE): part-1 gemv2->reduce_final uses "
-                            "per-m-tile point-to-point readiness (bar6 replaced)\n");
+            fprintf(stderr, "TQ_PERSIST_P2P=1: part-1 gemv2->reduce_final uses "
+                            "per-m-tile point-to-point readiness (bar6 replaced; =0 reverts)\n");
     }
     return 0;
 }
