@@ -2017,6 +2017,13 @@ __global__ void k_tq_wide_attn(
 // MMA P.V. Reuses tq_attn_mma_block's mode-1 fragment layout / helpers; NO spec-tree /
 // ancestor / archive machinery (that path stays intact). Replaces the scalar k_tq_wide_attn
 // where it beats the baseline tensor-core path (>~16k), lifting the wide-prefill ctx cap.
+// Key-split (gridDim.z = S > 1): the causal key range [0..maxpos] is cut into S
+// even super-tile chunks -- one (head, qtile, kchunk) block each -- so a long
+// prefix no longer serializes in nh x ceil(N/16) blocks (192 blocks left half
+// the GPU idle and each walked ~1000 super-tiles at 128k). Chunks write
+// unnormalized (m, l, O) partials to `part`; k_tq_wide_attn_mma_merge combines
+// them (same flash-decoding math as the verify path). S == 1 keeps the exact
+// single-pass epilogue (bit-identical to the pre-split kernel).
 template <int MODE>                                          // 1 = fp32 KV, 3 = contiguous Q4, 4 = paged Q4
 __global__ void k_tq_wide_attn_mma(
     float *out, const float *q_proj_base, const uint16_t *q_norm_w,
@@ -2024,7 +2031,8 @@ __global__ void k_tq_wide_attn_mma(
     const uint8_t *k4, const float *kq4s, const uint8_t *v8, const float *vscale,
     const int *positions,
     int slot, const int *block_table, int max_blocks, int page, int page_log,
-    int N, int nh, int nkv, int hd, int q_m, int attn_m, float eps, float rope_theta) {
+    int N, int nh, int nkv, int hd, int q_m, int attn_m, float eps, float rope_theta,
+    float *part) {
     __shared__ uint32_t sm[TQ_AMM_WORDS];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int gr = lane >> 2, t4 = lane & 3;
@@ -2084,13 +2092,21 @@ __global__ void k_tq_wide_attn_mma(
         }
         __syncthreads();
     }
-    // ---- main loop: 128-key super-tiles over [0..maxpos], online softmax ----
+    // ---- main loop: 128-key super-tiles over [0..maxpos], online softmax.
+    // Key-split: this block only walks its gridDim.z-slice of the super-tiles.
     float oacc[4][4];
     #pragma unroll
     for (int f = 0; f < 4; f++) for (int j = 0; j < 4; j++) oacc[f][j] = 0.0f;
     const float rsc = rsqrtf((float)hd);
-    int nst = (maxpos + 128) >> 7;                              // ceil((maxpos+1)/128)
-    for (int it = 0; it < nst; it++) {
+    int nst_all = (maxpos + 128) >> 7;                          // ceil((maxpos+1)/128)
+    int it_lo = 0, nst = nst_all;
+    if (gridDim.z > 1) {
+        int per = (nst_all + gridDim.z - 1) / gridDim.z;
+        it_lo = blockIdx.z * per;
+        int hi = it_lo + per;
+        nst = hi < nst_all ? hi : nst_all;                      // exclusive upper tile
+    }
+    for (int it = it_lo; it < nst; it++) {
         const int t0 = it << 7;
         // paged (MODE 4): a 128-aligned super-tile lies in ONE physical block (page>=128),
         // so one block-table lookup gives a contiguous physical-row base for the 128 keys.
@@ -2224,6 +2240,23 @@ __global__ void k_tq_wide_attn_mma(
 #undef TQ_PROW
         __syncthreads();
     }
+    // ---- key-split partial: unnormalized (m, l, O) for the merge kernel ----
+    if (gridDim.z > 1) {
+        float *ps = part + (size_t)((head * gridDim.y + qtile) * gridDim.z + blockIdx.z)
+                               * TQ_AMM_PART_F;
+        if (tid < 16) { ps[tid] = mst[tid]; ps[16 + tid] = lst[tid]; }
+        float *po = ps + 32;
+        #pragma unroll
+        for (int f = 0; f < 4; f++) {
+            int col = warp * 32 + f * 8 + 2 * t4;
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                po[(size_t)gr * 256 + col + j] = oacc[f][j];
+                po[(size_t)(8 + gr) * 256 + col + j] = oacc[f][2 + j];
+            }
+        }
+        return;
+    }
     // ---- epilogue: out = (O / l) * sigmoid(gate) ----
     float inv_lo = 1.0f / lst[gr], inv_hi = 1.0f / lst[8 + gr];
     #pragma unroll
@@ -2245,6 +2278,65 @@ __global__ void k_tq_wide_attn_mma(
             }
         }
     }
+}
+
+// Merge phase for the key-split wide-prefill attention: grid (nh, nqt), 256
+// threads; per query row r combine the S chunk partials (m* = max, l/O rescaled
+// by exp(m_c - m*)) and run the same gate epilogue the single-pass kernel uses.
+// Fully-masked chunks wrote m = TQ_AMM_NINF, l = 0, O = 0 and vanish under the
+// exp underflow (row 0's chunk 0 always has at least key 0, so l* > 0).
+__global__ void k_tq_wide_attn_mma_merge(
+    float *out, const float *q_proj_base, int N, int nh, int hd,
+    int q_m, int attn_m, int S, const float *part) {
+    int head = blockIdx.x, qtile = blockIdx.y, qtile_base = qtile * 16;
+    int tid = threadIdx.x;
+    int nvalid = N - qtile_base; if (nvalid > 16) nvalid = 16;
+    const float *ps0 = part + (size_t)((head * gridDim.y + qtile) * S) * TQ_AMM_PART_F;
+    for (int r = 0; r < nvalid; r++) {
+        float m_star = TQ_AMM_NINF;
+        for (int c = 0; c < S; c++)
+            m_star = fmaxf(m_star, ps0[(size_t)c * TQ_AMM_PART_F + r]);
+        float l = 0.0f, o = 0.0f;
+        for (int c = 0; c < S; c++) {
+            const float *ps = ps0 + (size_t)c * TQ_AMM_PART_F;
+            float w = expf(ps[r] - m_star);
+            l += w * ps[16 + r];
+            o += w * ps[32 + (size_t)r * 256 + tid];
+        }
+        const float *q_proj = q_proj_base + (size_t)(qtile_base + r) * q_m;
+        float gate = q_proj[head * (2 * hd) + hd + tid];
+        out[(size_t)(qtile_base + r) * attn_m + head * hd + tid] =
+            (o / l) * (1.0f / (1.0f + expf(-gate)));
+    }
+}
+
+// S key-chunks for a wide-prefill attention launch over prefix [0..max_pos]:
+// 1 (bit-identical single pass) until the prefix outgrows what nh x nqt blocks
+// keep parallel, then ~1 chunk per TQ_WIDE_ATTN_SPLIT positions, capped at 8.
+static int wide_attn_split_S(int max_pos) {
+    static int chunk = -1;
+    if (chunk < 0) {
+        const char *e = getenv("TQ_WIDE_ATTN_SPLIT");
+        chunk = e ? atoi(e) : 16384;
+        if (chunk == 0) chunk = 1 << 30;               // 0 = never split
+        if (chunk < 2048) chunk = 2048;
+    }
+    int S = max_pos >= 0 ? (max_pos + chunk) / chunk : 1;
+    if (S > 8) S = 8;
+    return S < 1 ? 1 : S;
+}
+
+// Dedicated partial slab for the split (nh x nqt x S x TQ_AMM_PART_F floats,
+// ~25 MB at the production 24 x 8 x 8 -- NOT the verify scores scratch, so the
+// batched/paged tier does not pay the 0.5 GiB d_attn_scores allocation here).
+static float *g_wide_attn_part = NULL;
+static size_t g_wide_attn_part_f = 0;
+static int ensure_wide_attn_part(size_t floats) {
+    if (g_wide_attn_part_f >= floats) return 0;
+    if (g_wide_attn_part) { cudaFree(g_wide_attn_part); g_wide_attn_part = NULL; g_wide_attn_part_f = 0; }
+    if (cudaMalloc(&g_wide_attn_part, floats * sizeof(float)) != cudaSuccess) return -1;
+    g_wide_attn_part_f = floats;
+    return 0;
 }
 
 static int wide_attn_mma_enabled(void) {
@@ -2273,10 +2365,16 @@ static int launch_wide_attn(float *out, const float *q_proj, const uint16_t *q_n
     (void)max_pos;
     if (wide_attn_mma_enabled()) {       // tensor-core prefill attention (compute-bound regime)
         int nqt = (N + 15) / 16;
-        k_tq_wide_attn_mma<1><<<dim3(nh, nqt), 256, 0, st>>>(
+        int S = wide_attn_split_S(max_pos);
+        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
+            S = 1;
+        k_tq_wide_attn_mma<1><<<dim3(nh, nqt, S), 256, 0, st>>>(
             out, q_proj, q_norm_w, k_cache, v_cache, NULL, NULL, NULL, NULL, positions,
             0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m,
-            g_qwen.eps, g_qwen.rope_theta);
+            g_qwen.eps, g_qwen.rope_theta, g_wide_attn_part);
+        if (S > 1)
+            k_tq_wide_attn_mma_merge<<<dim3(nh, nqt), 256, 0, st>>>(
+                out, q_proj, N, nh, hd, q_m, attn_m, S, g_wide_attn_part);
     } else {
         k_tq_wide_attn<<<dim3(nh, N), hd, 0, st>>>(
             out, q_proj, q_norm_w, k_cache, v_cache, positions, nh, nkv, hd, q_m, attn_m,
@@ -18013,7 +18111,7 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N);
 static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_t *q_norm_w,
                                   const float *k_proj, const float *v_proj, const uint16_t *k_norm_w,
                                   uint8_t *k4_base, float *kq4s_base, uint8_t *v8_base, float *vscale_base,
-                                  const int *positions, int N,
+                                  const int *positions, int N, int max_pos,
                                   size_t k4_stride, size_t kq4s_stride, size_t v8_stride, size_t vscale_stride,
                                   cudaStream_t st);
 
@@ -18143,7 +18241,7 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             if (g_qwen.kv_q4) {
                 if (launch_batched_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                            l->d_k_cache4, l->d_k_q4s, l->d_v_cache8, l->d_v_scale,
-                                           g_wide_pos, n, 0, 0, 0, 0, g_qwen.stream) != 0)
+                                           g_wide_pos, n, max_pos, 0, 0, 0, 0, g_qwen.stream) != 0)
                     return -57;
             } else if (launch_wide_attn(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                  l->d_k_cache, l->d_v_cache, g_wide_pos, n, max_pos, g_qwen.stream) != 0) {
@@ -18707,7 +18805,7 @@ __global__ void k_tq_batched_attn_q4(
 static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_t *q_norm_w,
                                   const float *k_proj, const float *v_proj, const uint16_t *k_norm_w,
                                   uint8_t *k4_base, float *kq4s_base, uint8_t *v8_base, float *vscale_base,
-                                  const int *positions, int N,
+                                  const int *positions, int N, int max_pos,
                                   size_t k4_stride, size_t kq4s_stride, size_t v8_stride, size_t vscale_stride,
                                   cudaStream_t st) {
     int nh = g_qwen.nh, nkv = g_qwen.nkv, hd = g_qwen.hd;
@@ -18720,9 +18818,16 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
     bool wide_shared = (k4_stride == 0 && kq4s_stride == 0 && v8_stride == 0 && vscale_stride == 0);
     if (wide_shared && wide_attn_mma_enabled()) {
         int nqt = (N + 15) / 16;
-        k_tq_wide_attn_mma<3><<<dim3(nh, nqt), 256, 0, st>>>(
+        int S = wide_attn_split_S(max_pos);
+        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
+            S = 1;
+        k_tq_wide_attn_mma<3><<<dim3(nh, nqt, S), 256, 0, st>>>(
             out, q_proj, q_norm_w, NULL, NULL, k4_base, kq4s_base, v8_base, vscale_base, positions,
-            0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta);
+            0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+            g_wide_attn_part);
+        if (S > 1)
+            k_tq_wide_attn_mma_merge<<<dim3(nh, nqt), 256, 0, st>>>(
+                out, q_proj, N, nh, hd, q_m, attn_m, S, g_wide_attn_part);
     } else {
         k_tq_batched_attn_q4<<<dim3(nh, N), hd, 0, st>>>(
             out, q_proj, q_norm_w, k4_base, kq4s_base, v8_base, vscale_base, positions,
@@ -18961,7 +19066,7 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
             if (g_bat_q4) {
                 if (launch_batched_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                            g_bat_k4[L], g_bat_kq4s[L], g_bat_v8[L], g_bat_vscale[L],
-                                           g_wide_pos, N, k4_stride, kq4s_stride, v8_stride, vscale_stride,
+                                           g_wide_pos, N, -1, k4_stride, kq4s_stride, v8_stride, vscale_stride,
                                            g_qwen.stream) != 0) return -24;
             } else {
                 if (launch_batched_attn(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
@@ -19598,7 +19703,8 @@ static int launch_paged_attn_q4_mma_prefill(
     uint8_t *k4_pool, float *kq4s_pool, uint8_t *v8_pool, float *vscale_pool,
     const int *positions, const int *slot_ids, const int *block_table,
     int max_blocks, int page, int page_log,
-    const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T,
+    const int *seg_slot, const int *seg_off, const int *seg_len,
+    const int *col_pos_host, int K, int T,
     cudaStream_t st) {
     int nh = g_qwen.nh, nkv = g_qwen.nkv, hd = g_qwen.hd;
     int q_m = nh * hd * 2, kv_m = nkv * hd, attn_m = nh * hd;
@@ -19608,11 +19714,22 @@ static int launch_paged_attn_q4_mma_prefill(
     for (int k = 0; k < K; k++) {
         int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
         int nqt = (n + 15) / 16;
-        k_tq_wide_attn_mma<4><<<dim3(nh, nqt), 256, 0, st>>>(
+        // key-split by this segment's own prefix depth (its last column's slot pos);
+        // segments run sequentially on one stream, so the partial slab is reused
+        int max_pos = col_pos_host ? col_pos_host[off + n - 1] : -1;
+        int S = wide_attn_split_S(max_pos);
+        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
+            S = 1;
+        k_tq_wide_attn_mma<4><<<dim3(nh, nqt, S), 256, 0, st>>>(
             out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
             NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
             positions + off, slot, block_table, max_blocks, page, page_log,
-            n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta);
+            n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+            g_wide_attn_part);
+        if (S > 1)
+            k_tq_wide_attn_mma_merge<<<dim3(nh, nqt), 256, 0, st>>>(
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
+                n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -19969,7 +20086,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                 if (launch_paged_attn_q4_mma_prefill(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
-                                     seg_slot, seg_off, seg_len, K, T, g_qwen.stream) != 0) return -94;
+                                     seg_slot, seg_off, seg_len, col_pos, K, T, g_qwen.stream) != 0) return -94;
             } else if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
