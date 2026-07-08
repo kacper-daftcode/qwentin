@@ -9,7 +9,7 @@ so any client — including an `opencode`/`continue`-style coding agent — can 
 
 ```
 27B params + 256k context            →  one 32 GB RTX 5090   (steady-state 30.9 GiB)
-single-stream decode                 →  118-122 tok/s @ short · 112 @ 32k · 96-99 @ 128k · 85 @ 200k
+single-stream decode                 →  118-122 tok/s @ short · 112 @ 32k · 96-99 @ 128k · 91 @ 200k
 cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1626 tok/s @ 32k · 1210 @ 128k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
 
@@ -80,7 +80,7 @@ Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
 > outputs) plus fused Q4 scale/code loads. Measured on an RTX PRO 6000 Blackwell
 > (188 SM, same GB202/SM120 class; the tables on this page keep the pre-update 5090
 > numbers): 1k ~121-122 tok/s, 32k 112, 64k 107-114, 128k **96-99** (was 59 on the
-> same card), 200k **85** (was 43 — near-2x) — short contexts bit-identical and
+> same card), 200k **91** (was 43 — 2.1x) — short contexts bit-identical and
 > unchanged in speed. Past ~196k a kv-group attention kernel takes over (K/V read
 > once for all 6 heads of a GQA group). Cold-prefill wide+MMA is now the server
 > default (works at Q4-KV/256k, no 16k cap) and its attention is key-split at long
