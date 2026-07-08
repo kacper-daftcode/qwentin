@@ -1246,9 +1246,15 @@ static __device__ void tq_attn_mma_block(
                         for (int cc = 0; cc < 2; cc++) {
                             int c = 2 * g + cc;
                             const uint32_t *a = &sm[TQ_AMM_QA + (c * 32 + lane) * 4];
-                            int d0 = 16 * c + 2 * t4;
-                            uint8_t a0 = kr0[d0 >> 1], a8 = kr0[(d0 >> 1) + 4];
-                            uint8_t b0v = kr1[d0 >> 1], b8 = kr1[(d0 >> 1) + 4];
+                            // the quad's 8 int4-code bytes [8c .. 8c+8) in ONE
+                            // 8-byte load (lane t4 uses bytes t4 and t4+4);
+                            // same bytes as the two scattered loads -- bit-exact
+                            uint64_t w0 = *(const uint64_t *)(kr0 + 8 * c);
+                            uint64_t w1 = *(const uint64_t *)(kr1 + 8 * c);
+                            uint8_t a0 = (uint8_t)(w0 >> (8 * t4));
+                            uint8_t a8 = (uint8_t)(w0 >> (8 * t4 + 32));
+                            uint8_t b0v = (uint8_t)(w1 >> (8 * t4));
+                            uint8_t b8 = (uint8_t)(w1 >> (8 * t4 + 32));
                             tq_mma_bf16_m16n8k16(
                                 s0, a,
                                 tq_pack_bf16(((float)(a0 & 15) - zp0) * sc0,
