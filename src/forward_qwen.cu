@@ -952,6 +952,7 @@ static __device__ __forceinline__ float tq_attn_tail_pp(
 #define TQ_AMM_RED     4688                 // [9] block-reduce scratch
 #define TQ_AMM_WORDS   4704
 #define TQ_ATTN_MMA_SMEM ((size_t)TQ_AMM_WORDS * 4)
+#define TQ_ATTN_SCORE_SLOTS 512             // [512 x max_seq] gmem score/partial slab
 #define TQ_AMM_NINF    (-3.402823466e38f)   // finite -inf stand-in (exp underflows to 0)
 
 static __device__ __forceinline__ uint32_t tq_pack_bf16(float lo, float hi) {
@@ -1007,6 +1008,13 @@ static __device__ __forceinline__ float *tq_attn_mma_part_slab(float *scratch, i
 // at B-fragment build and run through the bf16 HMMA exactly like mode 1; Q is
 // FWHT-rotated at prep (so the fp32 tree-archive seam, whose K rows were
 // rotated at kv_prep, shares the same A-fragments); V stays E4M3 like mode 2.
+// PAIR mode (pair != 0, requires N <= 8, even GQA group): one item covers TWO
+// q-heads of the same kv group -- `head` and `head + 1` -- with head/lo nodes in
+// tile rows 0..N-1 and head+1 nodes in rows 8..8+N-1. The m16 tile is otherwise
+// half-masked at the production N=8, so this reads the SAME K/V bytes once for
+// two heads (the long-ctx phase is L1/L2-traffic/latency-bound, DRAM ~6%) at
+// identical per-row MMA/softmax math: each row's scores, partials and epilogue
+// are bit-identical to the unpaired item of its head.
 template <int MODE>
 static __device__ void tq_attn_mma_block(
     const float *q_proj_base, size_t q_stride, const uint16_t *q_norm_w,
@@ -1016,7 +1024,7 @@ static __device__ void tq_attn_mma_block(
     const uint8_t *kc4, const float *kq4s,                  // int4 prefix K (mode 3)
     const float *ka, const float *va,                       // fp32 tree archive
     const int *pos_arr, const int *anc, int base_in, int N,
-    int head, int nh, int nkv, int hd, int kv_m,
+    int head, int pair, int nh, int nkv, int hd, int kv_m,
     float eps, float rope_theta, int chunk, int nchunks,
     float *out, size_t out_stride, float *absmax, float *part_out,
     uint32_t *sm) {
@@ -1045,28 +1053,35 @@ static __device__ void tq_attn_mma_block(
     float *qsc = (float *)(sm + TQ_AMM_QSC);
 
     // ---- init: zero the fragment staging (rows >= N stay inert), softmax state,
-    // ancestor bitmasks (bit j = archive slot j is on node i's chain incl. self)
+    // ancestor bitmasks (bit j = archive slot j is on node i's chain incl. self).
+    // PAIR: tile row r maps to node (r & 7) of head + (r >> 3); rows 8-15 carry
+    // head+1's copies of the same nodes, so they take the same node mask.
     for (int i = tid; i < TQ_AMM_PST + 1024; i += 256) sm[i] = 0;
     if (tid < 16) {
         mst[tid] = TQ_AMM_NINF;
         lst[tid] = 0.0f;
         uint32_t m = 0;
-        if (tid < N) {
-            int len = pos_arr[tid] - base - 1 + 1;          // chain incl. the node itself
-            const int *an = anc + tid * TQ_SPEC_MAX_N;
+        int node = pair ? (tid & 7) : tid;
+        if (node < N) {
+            int len = pos_arr[node] - base - 1 + 1;         // chain incl. the node itself
+            const int *an = anc + node * TQ_SPEC_MAX_N;
             for (int d = 0; d < len; d++) m |= 1u << an[d];
         }
         sm[TQ_AMM_AMASK + tid] = m;
     }
     __syncthreads();
 
-    // ---- Q prep: per node, the same norm+rope math as the scalar kernels, then
-    // packed straight into MMA A-fragments (bf16 always; e4m3 with a per-row
-    // pow2 scale for mode 2)
-    for (int n = 0; n < N; n++) {
+    // ---- Q prep: per tile row, the same norm+rope math as the scalar kernels,
+    // then packed straight into MMA A-fragments (bf16 always; e4m3 with a
+    // per-row pow2 scale for mode 2)
+    const int nqr = pair ? 16 : N;                          // packed tile rows
+    for (int rq = 0; rq < nqr; rq++) {
+        const int n = pair ? (rq & 7) : rq;                 // node of this row
+        if (pair && n >= N) continue;                       // uniform whole-block skip
+        const int hh = head + (pair ? (rq >> 3) : 0);       // this row's q-head
         const float *q_proj = q_proj_base + (size_t)n * q_stride;
         int pos = pos_arr[n];
-        float qv = q_proj[head * (2 * hd) + tid];
+        float qv = q_proj[hh * (2 * hd) + tid];
         float qsum = qv * qv;
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) qsum += __shfl_down_sync(0xffffffffu, qsum, o);
@@ -1085,7 +1100,7 @@ static __device__ void tq_attn_mma_block(
             float freq = powf(rope_theta, -((float)(2 * idx) / 64.0f));
             float angle = (float)pos * freq;
             float c = cosf(angle), s = sinf(angle);
-            float q_pair = q_proj[head * (2 * hd) + ((tid < 32) ? tid + 32 : tid - 32)];
+            float q_pair = q_proj[hh * (2 * hd) + ((tid < 32) ? tid + 32 : tid - 32)];
             q_pair = q_pair * rsqrtf(q_sum_shared / (float)hd + eps) *
                      (1.0f + tq_bf16_to_float(q_norm_w[(tid < 32) ? tid + 32 : tid - 32]));
             float q_rot = (tid < 32) ? -q_pair : q_pair;
@@ -1095,24 +1110,24 @@ static __device__ void tq_attn_mma_block(
         float qscl = 1.0f;
         if (MODE == 2) {
             qscl = tq_kv_block_scale(qv, red, red + 8);     // pow2 absmax scale
-            if (tid == 0) qsc[n] = qscl;
+            if (tid == 0) qsc[rq] = qscl;
         }
         qtmp[tid] = qv;
         __syncthreads();
         if (MODE == 3)
             tq_fwht256(qtmp, tid);   // rotated-space q (matches int4 K + rotated arch)
-        // bf16 A-frags: 128 words per node (16 k16-chunks x 4 quad-lanes x 2 regs)
+        // bf16 A-frags: 128 words per row (16 k16-chunks x 4 quad-lanes x 2 regs)
         if (tid < 128) {
             int c16 = tid >> 3, tt = (tid >> 1) & 3, rsel = tid & 1;
             int d0 = 16 * c16 + 2 * tt + 8 * rsel;
-            int l = 4 * (n & 7) + tt, r = ((n >> 3) & 1) + 2 * rsel;
+            int l = 4 * (rq & 7) + tt, r = ((rq >> 3) & 1) + 2 * rsel;
             sm[TQ_AMM_QA + (c16 * 32 + l) * 4 + r] = tq_pack_bf16(qtmp[d0], qtmp[d0 + 1]);
         }
-        // e4m3 A-frags (mode 2): 64 words per node (8 k32-chunks x 4 x 2)
+        // e4m3 A-frags (mode 2): 64 words per row (8 k32-chunks x 4 x 2)
         if (MODE == 2 && tid < 64) {
             int c32 = tid >> 3, tt = (tid >> 1) & 3, rsel = tid & 1;
             int d0 = 32 * c32 + 4 * tt + 16 * rsel;
-            int l = 4 * (n & 7) + tt, r = ((n >> 3) & 1) + 2 * rsel;
+            int l = 4 * (rq & 7) + tt, r = ((rq >> 3) & 1) + 2 * rsel;
             float inv = 1.0f / qscl;
             sm[TQ_AMM_QA8 + (c32 * 32 + l) * 4 + r] =
                 tq_pack_e4m3x4(qtmp[d0] * inv, qtmp[d0 + 1] * inv,
@@ -1357,18 +1372,23 @@ static __device__ void tq_attn_mma_block(
         __syncthreads();                                    // pst/wmax reuse next iter
     }
 
-    // ---- chunk partial: unnormalized (m, l, O) for the merge phase
+    // ---- chunk partial: unnormalized (m, l, O) for the merge phase. PAIR:
+    // tile rows 8-15 are head+1's copies of nodes 0-7 -> they land in head+1's
+    // per-head slab rows 0-7 (the merge phase stays head-indexed and unchanged).
     if (part_out) {
         float *ps = tq_attn_mma_part_slab(part_out, head, nchunks, chunk);
-        if (tid < 16) { ps[tid] = mst[tid]; ps[16 + tid] = lst[tid]; }
-        float *po = ps + 32;
+        float *ph = pair ? tq_attn_mma_part_slab(part_out, head + 1, nchunks, chunk)
+                         : ps + 8;                     // unpaired: rows 8-15 in-slab
+        if (tid < 8)       { ps[tid] = mst[tid]; ps[16 + tid] = lst[tid]; }
+        else if (tid < 16) { ph[tid - 8] = mst[tid]; ph[16 + tid - 8] = lst[tid]; }
+        float *po = ps + 32, *qo = pair ? ph + 32 : po + 8 * 256;
         #pragma unroll
         for (int f = 0; f < 4; f++) {
             int col = warp * 32 + f * 8 + 2 * t4;
             #pragma unroll
             for (int j = 0; j < 2; j++) {
                 po[(size_t)gr * 256 + col + j] = oacc[f][j];
-                po[(size_t)(8 + gr) * 256 + col + j] = oacc[f][2 + j];
+                qo[(size_t)gr * 256 + col + j] = oacc[f][2 + j];
             }
         }
         __syncthreads();
@@ -1376,6 +1396,8 @@ static __device__ void tq_attn_mma_block(
     }
 
     // ---- epilogue: out = (O / l) * sigmoid(gate); optional per-node absmax fold
+    const int n_hi = pair ? gr : 8 + gr;                // hi half: node / head of row 8+gr
+    const int h_hi = pair ? head + 1 : head;
     float inv_lo = 1.0f / lst[gr], inv_hi = 1.0f / lst[8 + gr];
     float am_lo = 0.0f, am_hi = 0.0f;
     #pragma unroll
@@ -1390,11 +1412,11 @@ static __device__ void tq_attn_mma_block(
                 out[(size_t)gr * out_stride + head * hd + col + j] = v;
                 am_lo = fmaxf(am_lo, fabsf(v));
             }
-            if (8 + gr < N) {
-                const float *q_proj = q_proj_base + (size_t)(8 + gr) * q_stride;
-                float gate = q_proj[head * (2 * hd) + hd + col + j];
+            if (n_hi < N) {
+                const float *q_proj = q_proj_base + (size_t)n_hi * q_stride;
+                float gate = q_proj[h_hi * (2 * hd) + hd + col + j];
                 float v = oacc[f][2 + j] * inv_hi * (1.0f / (1.0f + expf(-gate)));
-                out[(size_t)(8 + gr) * out_stride + head * hd + col + j] = v;
+                out[(size_t)n_hi * out_stride + h_hi * hd + col + j] = v;
                 am_hi = fmaxf(am_hi, fabsf(v));
             }
         }
@@ -1407,10 +1429,13 @@ static __device__ void tq_attn_mma_block(
         }
         if (t4 == 0) { wmax[warp * 16 + gr] = am_lo; wmax[warp * 16 + 8 + gr] = am_hi; }
         __syncthreads();
-        if (warp == 0 && lane < 16 && lane < N) {
-            float m = wmax[lane];
-            for (int w = 1; w < 8; w++) m = fmaxf(m, wmax[w * 16 + lane]);
-            atomicMax((unsigned int *)&absmax[lane], __float_as_uint(m));
+        if (warp == 0 && lane < 16) {
+            int node = pair ? (lane & 7) : lane;        // rows 8-15 fold into node 0-7
+            if (node < N) {
+                float m = wmax[lane];
+                for (int w = 1; w < 8; w++) m = fmaxf(m, wmax[w * 16 + lane]);
+                atomicMax((unsigned int *)&absmax[node], __float_as_uint(m));
+            }
         }
     }
     __syncthreads();
@@ -1458,9 +1483,9 @@ static __device__ void tq_attn_mma_merge_block(
 }
 
 // Standalone replacement for k_tq_spec_attn_tree under TQ_ATTN_MMA: grid =
-// (nh, nchunks), all N nodes handled per block (launch with TQ_ATTN_MMA_SMEM
-// dynamic smem). gridDim.y == 1 writes the output directly; > 1 writes chunk
-// partials into `scratch` for the merge kernel below.
+// (nh or nh/2 with `pair`, nchunks), all N nodes handled per block (launch with
+// TQ_ATTN_MMA_SMEM dynamic smem). gridDim.y == 1 writes the output directly;
+// > 1 writes chunk partials into `scratch` for the merge kernel below.
 template <int MODE>
 __global__ void k_tq_spec_attn_tree_mma(float *out, const float *q_proj_base,
                                         const uint16_t *q_norm_w,
@@ -1470,6 +1495,7 @@ __global__ void k_tq_spec_attn_tree_mma(float *out, const float *q_proj_base,
                                         const uint8_t *k_cache4, const float *k_q4s,
                                         const float *k_arch, const float *v_arch,
                                         const int *pos_arr, const int *anc, int N,
+                                        int pair,
                                         int nh, int nkv, int hd, int kv_m,
                                         int q_stride, int out_stride,
                                         float eps, float rope_theta, int base_in,
@@ -1480,7 +1506,8 @@ __global__ void k_tq_spec_attn_tree_mma(float *out, const float *q_proj_base,
                             k_cache, v_cache, k_cache8, k_scale, v_cache8, v_scale,
                             k_cache4, k_q4s,
                             k_arch, v_arch, pos_arr, anc, base_in, N,
-                            blockIdx.x, nh, nkv, hd, kv_m, eps, rope_theta,
+                            pair ? 2 * blockIdx.x : blockIdx.x, pair,
+                            nh, nkv, hd, kv_m, eps, rope_theta,
                             blockIdx.y, nchunks,
                             out, out_stride, NULL, nchunks > 1 ? scratch : NULL,
                             tq_dyn_sm);
@@ -1508,17 +1535,54 @@ static int attn_mma_chunk_tokens(void) {
     return cached;
 }
 
-// number of position chunks for a verify/wave round at `base` (1..16). The cap
-// is the partial-slab budget (nh x 16 x TQ_AMM_PART_F floats inside the scores
-// scratch), NOT a coverage limit: the kernel splits the prefix super-tiles
-// evenly across nchunks, so at 128k+ each chunk just covers more positions
-// (e.g. 8192 pos/chunk @131072).
-static int attn_mma_nchunks(int base) {
+// Chunk-count cap for the flash-decoding split below (TQ_ATTN_MMA_NCHUNKS to
+// A/B). MEASURED (2026-07-07, PRO 6000, prod Q4): unpaired items want the old
+// cap 16 (384 items ~= one wave of the ~376-CTA grid; 32 chunks = 28.5 vs 26.7
+// ms/round @32k -- extra per-item Q-prep, no balance win). PAIRED items halve
+// the head count, so cap 16 leaves half the grid idle: with cap 32 the wave is
+// 12 heads x 32 = 384 items again -- @64k 32.8 -> 27.3 ms/round (+26% tok/s).
+// 64 loses to 32 (2 items/CTA + doubled Q-prep): target ~1 item per CTA.
+static int attn_mma_nchunks_cap(int pair) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("TQ_ATTN_MMA_NCHUNKS");
+        cached = e ? atoi(e) : 0;                    // 0 = auto (16 / 32 with pair)
+        if (cached < 0) cached = 0;
+        if (cached > 256) cached = 256;
+    }
+    if (cached > 0) return cached;
+    return pair ? 32 : 16;
+}
+
+// number of position chunks for a verify/wave round at `base`: ~1 chunk per
+// TQ_ATTN_MMA_CHUNK positions, capped by attn_mma_nchunks_cap() and the
+// partial-slab budget (nh x nchunks x TQ_AMM_PART_F floats inside the scores
+// scratch). The kernel splits the prefix super-tiles evenly across nchunks.
+static int attn_mma_nchunks(int base, int pair) {
     int ch = attn_mma_chunk_tokens();
     int n = base >= 0 ? (base + ch) / ch : 1;
     if (n < 1) n = 1;
-    if (n > 16) n = 16;
+    int cap = attn_mma_nchunks_cap(pair);
+    int max_seq = g_qwen.max_seq > 0 ? g_qwen.max_seq : 8192;
+    int slab_cap = (int)(((size_t)TQ_ATTN_SCORE_SLOTS * max_seq) /
+                         ((size_t)g_qwen.nh * TQ_AMM_PART_F));
+    if (slab_cap < 1) slab_cap = 1;
+    if (cap > slab_cap) cap = slab_cap;
+    if (n > cap) n = cap;
     return n;
+}
+
+// Two q-heads of one kv group per item (same K/V bytes read once, both m16 tile
+// halves live) -- see tq_attn_mma_block PAIR mode. Requires N <= 8 (production
+// tree budget) and an even GQA group so (2b, 2b+1) share a kv head. Per-row
+// numerics are bit-identical to unpaired items; TQ_ATTN_MMA_PAIR=0 disables.
+static int attn_mma_pair_ok(int N) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("TQ_ATTN_MMA_PAIR");
+        en = e ? (atoi(e) != 0) : 1;
+    }
+    return en && N <= 8 && (g_qwen.nh & 1) == 0 && ((g_qwen.nh / g_qwen.nkv) & 1) == 0;
 }
 
 static int launch_attn_tree_mma(float *out, const float *q_proj_base,
@@ -1532,26 +1596,27 @@ static int launch_attn_tree_mma(float *out, const float *q_proj_base,
                                 int q_stride, int out_stride, int base_in,
                                 int host_base, int mode) {
     if (ensure_attn_scores() != 0) return -97;       // chunk-partial scratch
-    int nchunks = attn_mma_nchunks(host_base);
-    dim3 grid(g_qwen.nh, nchunks);
+    int pair = attn_mma_pair_ok(N);
+    int nchunks = attn_mma_nchunks(host_base, pair);
+    dim3 grid(pair ? g_qwen.nh / 2 : g_qwen.nh, nchunks);
     if (mode == 3)
         k_tq_spec_attn_tree_mma<3><<<grid, 256, TQ_ATTN_MMA_SMEM, g_qwen.stream>>>(
             out, q_proj_base, q_norm_w, k_cache, v_cache, k_cache8, k_scale, v_cache8,
-            v_scale, k_cache4, k_q4s, k_arch, v_arch, pos_arr, anc, N, g_qwen.nh,
+            v_scale, k_cache4, k_q4s, k_arch, v_arch, pos_arr, anc, N, pair, g_qwen.nh,
             g_qwen.nkv, g_qwen.hd,
             g_qwen.nkv * g_qwen.hd, q_stride, out_stride, g_qwen.eps, g_qwen.rope_theta,
             base_in, g_qwen.d_attn_scores);
     else if (mode == 2)
         k_tq_spec_attn_tree_mma<2><<<grid, 256, TQ_ATTN_MMA_SMEM, g_qwen.stream>>>(
             out, q_proj_base, q_norm_w, k_cache, v_cache, k_cache8, k_scale, v_cache8,
-            v_scale, k_cache4, k_q4s, k_arch, v_arch, pos_arr, anc, N, g_qwen.nh,
+            v_scale, k_cache4, k_q4s, k_arch, v_arch, pos_arr, anc, N, pair, g_qwen.nh,
             g_qwen.nkv, g_qwen.hd,
             g_qwen.nkv * g_qwen.hd, q_stride, out_stride, g_qwen.eps, g_qwen.rope_theta,
             base_in, g_qwen.d_attn_scores);
     else
         k_tq_spec_attn_tree_mma<1><<<grid, 256, TQ_ATTN_MMA_SMEM, g_qwen.stream>>>(
             out, q_proj_base, q_norm_w, k_cache, v_cache, k_cache8, k_scale, v_cache8,
-            v_scale, k_cache4, k_q4s, k_arch, v_arch, pos_arr, anc, N, g_qwen.nh,
+            v_scale, k_cache4, k_q4s, k_arch, v_arch, pos_arr, anc, N, pair, g_qwen.nh,
             g_qwen.nkv, g_qwen.hd,
             g_qwen.nkv * g_qwen.hd, q_stride, out_stride, g_qwen.eps, g_qwen.rope_theta,
             base_in, g_qwen.d_attn_scores);
@@ -6558,6 +6623,7 @@ typedef struct {
     int nh, nkv, hd, kv_m, q_m, attn_m, attn_base;
     int attn_mma;                 // TQ_ATTN_MMA: ph3 items become per-head MMA blocks
     int attn_nchunks;             // position chunks per head (host-derived from base)
+    int attn_pair;                // two q-heads of a kv group per item (N <= 8)
     float rope_theta;
     // ---- L2 prefetch programs (consumed while waiting) ----
     // program 1 (cursor 27): group-1 weights, streamed during the pack-1 barrier;
@@ -7531,6 +7597,8 @@ static __device__ void tq_persist_attn_item(const tq_spec_persist_args_t *A, int
 
 // TQ_ATTN_MMA variant of the attention phase: one item = one (q-head, pos-chunk),
 // all N nodes in m16n8 tiles (16x fewer K/V passes than per-(head,node) items).
+// attn_pair halves the head grid: one item covers heads (2b, 2b+1) of a kv group
+// with both m16 tile halves live (same K/V bytes once for two heads).
 // attn_nchunks == 1 keeps the full epilogue in the item (same pack2 + absmax-fold
 // side effects as tq_persist_attn_item); > 1 writes flash partials to the scores
 // slab, combined by the merge items below. __noinline__ so the MMA codegen cannot
@@ -7538,7 +7606,10 @@ static __device__ void tq_persist_attn_item(const tq_spec_persist_args_t *A, int
 static __device__ __noinline__ void tq_persist_attn_mma_item(const tq_spec_persist_args_t *A,
                                                              int item, uint32_t *sm) {
     int nc = A->attn_nchunks;
-    int head = item % A->nh, chunk = item / A->nh;
+    int pair = A->attn_pair;
+    int nheads = pair ? A->nh >> 1 : A->nh;
+    int head = pair ? 2 * (item % nheads) : item % nheads;
+    int chunk = item / nheads;
     float *part = nc > 1 ? A->attn_scores : NULL;
     float *outp = nc > 1 ? NULL : A->pack2_in;
     float *am = nc > 1 ? NULL : A->absmax;
@@ -7549,7 +7620,7 @@ static __device__ __noinline__ void tq_persist_attn_mma_item(const tq_spec_persi
                              A->attn_kcache4, A->attn_kq4s,
                              A->attn_karch, A->attn_varch,
                              A->attn_pos, A->attn_anc, A->attn_base, A->N,
-                             head, A->nh, A->nkv, A->hd, A->kv_m, A->eps, A->rope_theta,
+                             head, pair, A->nh, A->nkv, A->hd, A->kv_m, A->eps, A->rope_theta,
                              chunk, nc, outp, (size_t)A->attn_m, am, part, sm);
     else if (A->attn_mma == 2)
         tq_attn_mma_block<2>(A->w1[0].out, (size_t)A->q_m, A->attn_qnorm,
@@ -7558,7 +7629,7 @@ static __device__ __noinline__ void tq_persist_attn_mma_item(const tq_spec_persi
                              A->attn_kcache4, A->attn_kq4s,
                              A->attn_karch, A->attn_varch,
                              A->attn_pos, A->attn_anc, A->attn_base, A->N,
-                             head, A->nh, A->nkv, A->hd, A->kv_m, A->eps, A->rope_theta,
+                             head, pair, A->nh, A->nkv, A->hd, A->kv_m, A->eps, A->rope_theta,
                              chunk, nc, outp, (size_t)A->attn_m, am, part, sm);
     else
         tq_attn_mma_block<1>(A->w1[0].out, (size_t)A->q_m, A->attn_qnorm,
@@ -7567,7 +7638,7 @@ static __device__ __noinline__ void tq_persist_attn_mma_item(const tq_spec_persi
                              A->attn_kcache4, A->attn_kq4s,
                              A->attn_karch, A->attn_varch,
                              A->attn_pos, A->attn_anc, A->attn_base, A->N,
-                             head, A->nh, A->nkv, A->hd, A->kv_m, A->eps, A->rope_theta,
+                             head, pair, A->nh, A->nkv, A->hd, A->kv_m, A->eps, A->rope_theta,
                              chunk, nc, outp, (size_t)A->attn_m, am, part, sm);
 }
 
@@ -8367,7 +8438,8 @@ static __device__ void tq_persist_layer_body(const tq_spec_persist_args_t &A, fl
         // unused by the part-2 body and the fused half-A glue).
         if (A.attn_mma) {
             extern __shared__ uint32_t tq_dyn_sm[];
-            while ((item = tq_persist_grab(&A, 7, A.nh * A.attn_nchunks, &s_grab)) >= 0)
+            int nheads = A.attn_pair ? A.nh >> 1 : A.nh;
+            while ((item = tq_persist_grab(&A, 7, nheads * A.attn_nchunks, &s_grab)) >= 0)
                 tq_persist_attn_mma_item(&A, item, tq_dyn_sm);
             if (A.attn_nchunks > 1) {
                 tq_persist_bar(&A, 7);
@@ -9938,7 +10010,6 @@ extern "C" int qwn_gpu_pack_e2m3_test(const uint16_t *h_bf16, int M, int K,
     return (err == cudaSuccess) ? 0 : -3;
 }
 
-#define TQ_ATTN_SCORE_SLOTS 512
 static int ensure_attn_scores(void) {
     if (g_qwen.d_attn_scores) return 0;
     if (g_qwen.max_seq <= 0) g_qwen.max_seq = 8192;
@@ -14942,7 +15013,8 @@ static int spec_persist_fill(tq_layer_t *l, int N, int lin_idx, int part, int n_
         A.attn_pos = g_qwen.d_spec_positions;
         A.attn_anc = g_qwen.d_spec_anc;
         A.attn_mma = g_spec_attn_mma_round;
-        A.attn_nchunks = attn_mma_nchunks(g_spec_attn_base_host);
+        A.attn_pair = attn_mma_pair_ok(N);
+        A.attn_nchunks = attn_mma_nchunks(g_spec_attn_base_host, A.attn_pair);
         if (ensure_attn_scores() != 0) return -97;
         A.attn_scores = g_qwen.d_attn_scores;
         A.max_seq = g_qwen.max_seq;
@@ -20515,7 +20587,7 @@ extern "C" int qwn_attn_mma_unit(const float *q_proj, const uint16_t *qnorm,
     {
         // exercise the production chunking (flash partials + merge when the base
         // crosses the chunk size); partial scratch allocated here, standalone-style
-        int nchunks = attn_mma_nchunks(base);
+        int nchunks = attn_mma_nchunks(base, 0);
         float *d_part = NULL;
         if (cudaMalloc(&d_part, (size_t)nh * nchunks * TQ_AMM_PART_F * sizeof(float)) != cudaSuccess) {
             ret = -6; goto done;
@@ -20525,13 +20597,13 @@ extern "C" int qwn_attn_mma_unit(const float *q_proj, const uint16_t *qnorm,
             k_tq_spec_attn_tree_mma<2><<<grid, 256, TQ_ATTN_MMA_SMEM>>>(
                 d_out, d_q, d_qn, d_kc, d_vc, d_k8, d_ksc, d_v8, d_vsc,
                 NULL, NULL,
-                d_ka, d_va, d_pos, d_anc, N, nh, nkv, hd, kv_m, q_m, attn_m,
+                d_ka, d_va, d_pos, d_anc, N, 0, nh, nkv, hd, kv_m, q_m, attn_m,
                 eps, rope_theta, base, d_part);
         else
             k_tq_spec_attn_tree_mma<1><<<grid, 256, TQ_ATTN_MMA_SMEM>>>(
                 d_out, d_q, d_qn, d_kc, d_vc, NULL, NULL, NULL, NULL,
                 NULL, NULL,
-                d_ka, d_va, d_pos, d_anc, N, nh, nkv, hd, kv_m, q_m, attn_m,
+                d_ka, d_va, d_pos, d_anc, N, 0, nh, nkv, hd, kv_m, q_m, attn_m,
                 eps, rope_theta, base, d_part);
         if (nchunks > 1)
             k_tq_spec_attn_tree_mma_merge<<<nh, 256>>>(
