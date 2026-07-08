@@ -1846,12 +1846,12 @@ __global__ void __launch_bounds__(256, 2) k_tq_spec_attn_group_mma(
 // path. Block = 256 threads (one output column each), rows looped; sm9 = 9-float
 // scratch for the per-row absmax fold (persist only).
 static __device__ void tq_attn_mma_merge_block(
-    const float *q_proj_base, size_t q_stride, int head, int N, int hd,
+    const float *q_proj_base, size_t q_stride, int head, int r_lo, int r_hi, int hd,
     int nchunks, const float *scratch,
     float *out, size_t out_stride, float *absmax, float *sm9) {
     int tid = threadIdx.x;
     const float *ps0 = scratch + (size_t)head * nchunks * TQ_AMM_PART_F;
-    for (int r = 0; r < N; r++) {
+    for (int r = r_lo; r < r_hi; r++) {
         float m_star = TQ_AMM_NINF;
         for (int c = 0; c < nchunks; c++)
             m_star = fmaxf(m_star, ps0[(size_t)c * TQ_AMM_PART_F + r]);
@@ -1913,11 +1913,16 @@ __global__ void k_tq_spec_attn_tree_mma(float *out, const float *q_proj_base,
                             tq_dyn_sm);
 }
 
+// grid (nh, N): one (head, row) per block -- at the >=96k gate the group path
+// runs ~96 chunks and a 24-block/8-serial-row merge was 2.6 ms/round (7.6% of
+// the round, 13% GPU occupancy); per-row blocks make it ~8x wider.
 __global__ void k_tq_spec_attn_tree_mma_merge(float *out, const float *q_proj_base,
                                               int N, int nh, int hd,
                                               int q_stride, int out_stride,
                                               int nchunks, const float *scratch) {
-    tq_attn_mma_merge_block(q_proj_base, (size_t)q_stride, blockIdx.x, N, hd,
+    int r = blockIdx.y;
+    if (r >= N) return;
+    tq_attn_mma_merge_block(q_proj_base, (size_t)q_stride, blockIdx.x, r, r + 1, hd,
                             nchunks, scratch, out, (size_t)out_stride, NULL, NULL);
 }
 
@@ -2040,7 +2045,7 @@ static int launch_attn_tree_mma(float *out, const float *q_proj_base,
             g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
             pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
             g_qwen.d_attn_scores);
-        k_tq_spec_attn_tree_mma_merge<<<g_qwen.nh, 256, 0, g_qwen.stream>>>(
+        k_tq_spec_attn_tree_mma_merge<<<dim3(g_qwen.nh, N), 256, 0, g_qwen.stream>>>(
             out, q_proj_base, N, g_qwen.nh, g_qwen.hd, q_stride, out_stride,
             nc3, g_qwen.d_attn_scores);
         return 0;
@@ -2068,7 +2073,7 @@ static int launch_attn_tree_mma(float *out, const float *q_proj_base,
             g_qwen.nkv * g_qwen.hd, q_stride, out_stride, g_qwen.eps, g_qwen.rope_theta,
             base_in, g_qwen.d_attn_scores);
     if (nchunks > 1)
-        k_tq_spec_attn_tree_mma_merge<<<g_qwen.nh, 256, 0, g_qwen.stream>>>(
+        k_tq_spec_attn_tree_mma_merge<<<dim3(g_qwen.nh, N), 256, 0, g_qwen.stream>>>(
             out, q_proj_base, N, g_qwen.nh, g_qwen.hd, q_stride, out_stride,
             nchunks, g_qwen.d_attn_scores);
     return 0;
@@ -8195,7 +8200,7 @@ static __device__ __noinline__ void tq_persist_attn_mma_item(const tq_spec_persi
 
 static __device__ __noinline__ void tq_persist_attn_mma_merge_item(
     const tq_spec_persist_args_t *A, int head, float *sm) {
-    tq_attn_mma_merge_block(A->w1[0].out, (size_t)A->q_m, head, A->N, A->hd,
+    tq_attn_mma_merge_block(A->w1[0].out, (size_t)A->q_m, head, 0, A->N, A->hd,
                             A->attn_nchunks, A->attn_scores,
                             A->pack2_in, (size_t)A->attn_m, A->absmax, sm);
 }
@@ -21197,7 +21202,7 @@ extern "C" int qwn_attn_mma_unit(const float *q_proj, const uint16_t *qnorm,
                 d_ka, d_va, d_pos, d_anc, N, 0, nh, nkv, hd, kv_m, q_m, attn_m,
                 eps, rope_theta, base, d_part);
         if (nchunks > 1)
-            k_tq_spec_attn_tree_mma_merge<<<nh, 256>>>(
+            k_tq_spec_attn_tree_mma_merge<<<dim3(nh, N), 256>>>(
                 d_out, d_q, N, nh, hd, q_m, attn_m, nchunks, d_part);
         cudaError_t se = cudaDeviceSynchronize();
         cudaFree(d_part);
