@@ -1,6 +1,6 @@
 # qwentin
 
-**Qwen3.6-27B at 256k context on a single RTX 5090 — ~120 tok/s at short context and 91+ deep into 200k, vLLM-class throughput at higher quality, with cold prefill 2–4× faster by default (2026-07).**
+**Qwen3.6-27B at 256k context on a single RTX 5090 — 119-131 tok/s at short context, 87 at 128k and 75 deep into 245k, vLLM-class throughput at higher quality, with cold prefill 2–4× faster by default (2026-07, measured on the 5090 itself).**
 
 qwentin is a from-scratch CUDA inference engine that runs the 27B hybrid-attention Qwen3.6
 tower on one 32 GB consumer GPU (Blackwell / SM120), using hand-written tensor-core kernels
@@ -8,12 +8,10 @@ tower on one 32 GB consumer GPU (Blackwell / SM120), using hand-written tensor-c
 so any client — including an `opencode`/`continue`-style coding agent — can use it.
 
 ```
-27B params + 256k context            →  one 32 GB RTX 5090   (steady-state 30.9 GiB)
-single-stream decode                 →  118-122 tok/s @ short · 112 @ 32k · 96-99 @ 128k · 91 @ 200k
-cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1626 tok/s @ 32k · 1210 @ 128k
+27B params + 256k context            →  one 32 GB RTX 5090   (steady-state ~30.8 GiB)
+single-stream decode                 →  119-131 tok/s @ short · 113-118 @ 32k · ~87 @ 128k · ~82 @ 200k · ~75 @ 245k
+cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1731 tok/s @ 32k · 1164 @ 128k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
-
-(long-context tok/s: 2026-07 build, RTX PRO 6000 — same GB202/SM120 class; details in Performance)
 ```
 
 ## Why it's interesting
@@ -38,7 +36,7 @@ E2M1 86.46 ≈ NVFP4 85.78.)
 ## Highlights
 
 - **Fits 27B + 256k in 32 GB.** FP6 (E2M3) block-scaled tensor-core weights (~20 GiB) + a
-  4-bit-K / E4M3-V KV cache. Needle-in-a-haystack retrieval: **3/3 @ 240k**.
+  4-bit-K / E4M3-V KV cache. Needle-in-a-haystack retrieval: **4/4 @ 239k** (depths 2k–235k).
 - **MTP speculative decoding.** A multi-token-prediction covering tree + batched FP6 verify
   (each weight read once for the whole tree) → real single-stream speedup at accept-length ~2.6–3.0.
 - **Wide prefill.** A dedicated N-wide prefill path — wide FP6 GEMM + chunkwise-parallel
@@ -63,28 +61,48 @@ E2M1 86.46 ≈ NVFP4 85.78.)
 ## Performance
 
 **Current build (2026-07)** — Qwen3.6-27B, **FP6 weights + Q4 KV**, single stream, MTP
-spec-decode, cold prefill on the default wide+MMA path. Measured on an RTX PRO 6000
-Blackwell workstation card (the same GB202/SM120 silicon class as the 5090, 188 vs 170
-SMs; the 5090 rows below will be re-measured when a card frees up):
+spec-decode, cold prefill on the default wide+MMA path. Measured on an **RTX 5090**
+(170 SM), 256k ship config (`TQ_KV_Q4=1 TQ_EMBED_FP8=2`). Decode tok/s moves a few
+percent with the accept-length at that text offset; ms/round is the hardware truth:
 
-| Context | Decode (tok/s) | Cold prefill (tok/s) |
-|--------:|---------------:|---------------------:|
-|  ~short | **118-122** | — |
-|    32k  | 112 | 1626 |
-|    64k  | 107-114 | 1527 |
-|   128k  | **96-99** | 1210 (full prompt in 108 s) |
-|   200k  | **91** | 981 (204 s) |
-|   245k  | 88 | |
+| Context | Decode (ms/round) | Decode (tok/s) | Cold prefill (tok/s) |
+|--------:|------------------:|---------------:|---------------------:|
+|  ~short | 21.7 | **119-131** | 2050-2160 |
+|    32k  | 23.8 | 113-118 | 1731 |
+|    64k  | 26.3 | 101-103 | 1483 |
+|   128k  | 31.3 | **86-89** | 1164 (full prompt in 113 s) |
+|   200k  | 36.5 | **~82** | 926 (221 s) |
+|   245k  | 40.2 | ~75 | 817 (307 s) |
 
-Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
+Steady-state VRAM @256k ≈ **30.8 / 31.4 GiB** (the `TQ_EMBED_FP8=2` 6-bit embed table
+is what makes 256k fit — without it the 32 GB card OOMs past ~230k).
 
-Short contexts are bit-identical to the 2026-06 build; the long-context gains
-(128k +63%, 200k 2.1×) come from GQA-paired/grouped attention items (K/V read once
-per head pair, and past ~196k once per whole kv group), fused Q4 scale/code loads,
-key-split prefill attention and a context-gated standalone attention path — needle
-retrieval 4/4 @24k, @120k and @239k on all of them. End-to-end on the server: a cold
-10.8k-token first turn drops from ~15 s to **5.5 s**; a follow-up turn hits the prefix
-cache (10752 tokens reused) and prefills only the new suffix in **0.074 s**.
+Short contexts (<32k) are bit-identical to the 2026-06 build; the long-context gains
+come from GQA-paired/grouped attention items (K/V read once per head pair or whole kv
+group), fused Q4 scale/code loads, key-split prefill attention and a context-gated
+standalone attention path — needle retrieval on this card: 4/4 @120k and **4/4 @239k**
+(ship config; @24k 4/4 with the bf16 embed table). The attention auto-gates are
+SM-count-aware (2026-07-08): on the 5090's 170 SMs the standalone branch and the
+kv-GROUP items win from 32k up (128k 33.8 → 31.3 ms/round vs the pre-tuning gates),
+while 188-SM parts keep their measured 96k/196k thresholds. End-to-end on the server:
+a cold 10.8k-token first turn drops from ~15 s to **5.5 s**; a follow-up turn hits the
+prefix cache (10752 tokens reused) and prefills only the new suffix in **0.074 s**.
+
+<details>
+<summary>RTX PRO 6000 Blackwell (188 SM, same GB202/SM120 class, same build)</summary>
+
+| Context | Decode (ms/round) | Decode (tok/s) | Cold prefill (tok/s) |
+|--------:|------------------:|---------------:|---------------------:|
+|  ~short | 22.3 | 118-122 | — |
+|    32k  | 23.7 | 112 | 1626 |
+|    64k  | 25.6 | 107-114 | 1527 |
+|   128k  | 29.0 | 96-99 | 1210 (108 s) |
+|   200k  | 32.7 | 91 | 981 (204 s) |
+|   245k  | 35.2 | 88 | |
+
+The bigger die is 6-14% faster at 64k+ (more SMs + more L2); the 5090 is a touch
+faster at short context (higher boost clocks).
+</details>
 
 **Batched / multi-client** (`serve_batched.py` — paged KV + continuous batching). Aggregate decode
 throughput scales with concurrency N (FP6; measured on the 2026-06 build, whose single-stream
@@ -164,8 +182,9 @@ Inspect a file with `python tools/inspect_tqf.py model.tqf`.
 ```bash
 # Production: FP6 + 4-bit KV, 256k context. The wide+MMA cold-prefill path is
 # ON by default (2-3x faster first turns at any length; --no-wide-prefill or
-# TQ_WIDE_PREFILL=0 reverts to the 16-token chunked baseline).
-CUDA_VISIBLE_DEVICES=0 TQ_CTX=262144 TQ_KV_Q4=1 \
+# TQ_WIDE_PREFILL=0 reverts to the 16-token chunked baseline). TQ_EMBED_FP8=2
+# (6-bit embed table) is required for the full 256k window on a 32 GB card.
+CUDA_VISIBLE_DEVICES=0 TQ_CTX=262144 TQ_KV_Q4=1 TQ_EMBED_FP8=2 \
     python3 tools/serve_openai.py --port 8000 --no-thinking \
     --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf
 ```
@@ -199,9 +218,11 @@ CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
 |------|---------|
 | `TQ_CTX` | max context (default = engine cap, 262144) |
 | `TQ_KV_Q4=1` | 4-bit-K + E4M3-V KV cache (needed for 256k) |
+| `TQ_EMBED_FP8=2` | 6-bit (E2M3) embed table, −1.5 GiB (needed for the full 256k on 32 GB) |
 | `TQ_WIDE_PREFILL=1` | wide prefill path (fp32 or Q4 KV; with `TQ_WIDE_ATTN_MMA=1` uncapped, else 16k gate; server defaults both ON) |
 | `TQ_ATTN_MMA=1` | tensor-core MMA + online-softmax attention (default on) |
 | `TQ_ATTN_MMA_PAIR=0` | disable GQA-paired attention items (default on; bit-identical either way) |
+| `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN` | context thresholds of the long-ctx attention auto-gates (defaults are SM-count-aware: 32k/32k on ≤176-SM cards, 196k/96k on bigger dies) |
 
 ## Verify
 
@@ -211,9 +232,10 @@ CUDA_VISIBLE_DEVICES=0 python3 tools/mtp_spec_smoke.py --prompt-tokens 1024 --ge
 
 # Decode-only round benchmark: prefill once, time M production spec-rounds
 # (ms/round, net tok/s, accept-length; --profile brackets the timed rounds
-# for `nsys profile -c cudaProfilerApi`)
-CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=262144 python3 tools/bench_rounds.py \
-    --prompt-tokens 65536 --rounds 200
+# for `nsys profile -c cudaProfilerApi`). TQ_EMBED_FP8=2 keeps TQ_CTX=262144
+# inside 32 GB on a 5090.
+CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=262144 TQ_EMBED_FP8=2 \
+    python3 tools/bench_rounds.py --prompt-tokens 65536 --rounds 200
 
 # Needle-in-a-haystack retrieval quality at long context
 CUDA_VISIBLE_DEVICES=0 TQ_CTX=16384 python3 tools/needle_check.py
