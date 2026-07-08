@@ -1,6 +1,6 @@
 # qwentin
 
-**Qwen3.6-27B at 256k context on a single RTX 5090 — ~120 tok/s, vLLM-class throughput at higher quality, with cold prefill 2–3× faster by default and long-context decode up to +65% (2026-07).**
+**Qwen3.6-27B at 256k context on a single RTX 5090 — ~120 tok/s at short context and 91+ deep into 200k, vLLM-class throughput at higher quality, with cold prefill 2–4× faster by default (2026-07).**
 
 qwentin is a from-scratch CUDA inference engine that runs the 27B hybrid-attention Qwen3.6
 tower on one 32 GB consumer GPU (Blackwell / SM120), using hand-written tensor-core kernels
@@ -13,7 +13,7 @@ single-stream decode                 →  118-122 tok/s @ short · 112 @ 32k · 
 cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1626 tok/s @ 32k · 1210 @ 128k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
 
-(long-context tok/s: 2026-07, RTX PRO 6000 — same GB202/SM120 class; pre-update 5090 tables below)
+(long-context tok/s: 2026-07 build, RTX PRO 6000 — same GB202/SM120 class; details in Performance)
 ```
 
 ## Why it's interesting
@@ -62,34 +62,44 @@ E2M1 86.46 ≈ NVFP4 85.78.)
 
 ## Performance
 
-RTX 5090 (GB202, SM 12.0), **Qwen3.6-27B, FP6 weights + Q4 KV**, single stream, MTP spec-decode:
+**Current build (2026-07)** — Qwen3.6-27B, **FP6 weights + Q4 KV**, single stream, MTP
+spec-decode, cold prefill on the default wide+MMA path. Measured on an RTX PRO 6000
+Blackwell workstation card (the same GB202/SM120 silicon class as the 5090, 188 vs 170
+SMs; the 5090 rows below will be re-measured when a card frees up):
+
+| Context | Decode (tok/s) | Cold prefill (tok/s) |
+|--------:|---------------:|---------------------:|
+|  ~short | **118-122** | — |
+|    32k  | 112 | 1626 |
+|    64k  | 107-114 | 1527 |
+|   128k  | **96-99** | 1210 (full prompt in 108 s) |
+|   200k  | **91** | 981 (204 s) |
+|   245k  | 88 | |
+
+Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
+
+Short contexts are bit-identical to the 2026-06 build; the long-context gains
+(128k +63%, 200k 2.1×) come from GQA-paired/grouped attention items (K/V read once
+per head pair, and past ~196k once per whole kv group), fused Q4 scale/code loads,
+key-split prefill attention and a context-gated standalone attention path — needle
+retrieval 4/4 @24k, @120k and @239k on all of them. End-to-end on the server: a cold
+10.8k-token first turn drops from ~15 s to **5.5 s**; a follow-up turn hits the prefix
+cache (10752 tokens reused) and prefills only the new suffix in **0.074 s**.
+
+<details>
+<summary><b>Original 2026-06 build (RTX 5090)</b> — the numbers the engine launched with</summary>
 
 | Context | Decode (tok/s) | Notes |
 |--------:|---------------:|-------|
-|  ~short | **118** | |
+|  ~short | 118 | |
 |     8k  | 110 | |
 |    32k  |  85 | |
 |    64k  |  70 | |
 |   100k  |  77 | accept-len 2.66 |
 |   200k  |  49 | accept-len 2.98 |
 
-Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
-
-> **2026-07 update — long-context decode +30-65%.** The verify attention now runs
-> GQA-paired MMA items (two q-heads of a kv group share one K/V pass; bit-identical
-> outputs) plus fused Q4 scale/code loads. Measured on an RTX PRO 6000 Blackwell
-> (188 SM, same GB202/SM120 class; the tables on this page keep the pre-update 5090
-> numbers): 1k ~121-122 tok/s, 32k 112, 64k 107-114, 128k **96-99** (was 59 on the
-> same card), 200k **91** (was 43 — 2.1x) — short contexts bit-identical and
-> unchanged in speed. Past ~196k a kv-group attention kernel takes over (K/V read
-> once for all 6 heads of a GQA group). Cold-prefill wide+MMA is now the server
-> default (works at Q4-KV/256k, no 16k cap) and its attention is key-split at long
-> range: 1626 tok/s @ 32k, 1527 @ 64k, 1210 @ 128k (108 s), 981 @ 200k (204 s) —
-> needle 4/4 @24k, @120k and @239k on these paths.
-
-**Cold prefill** — the first turn of a long prompt (RAG / large paste / agent turn 1). The
-original fp32-KV wide path vs the N=16 baseline (5090, pre-2026-07; the wide+MMA successor is
-uncapped and ON by default in the server — see the update note above):
+Cold prefill, original fp32-KV wide path vs the N=16 baseline (the wide+MMA successor
+is uncapped, works at Q4-KV/256k and is ON by default in the server):
 
 | Prompt | Baseline | Wide | Speedup |
 |-------:|---------:|-----:|--------:|
@@ -97,12 +107,11 @@ uncapped and ON by default in the server — see the update note above):
 | 4k | ~688 tok/s | **1364 tok/s** | 1.98× |
 | 8k | ~679 tok/s | **1062 tok/s** | 1.56× |
 
-End-to-end on the server (2026-07, wide prefill default ON): a cold 10.8k-token first turn drops
-from ~15 s to **5.5 s**; the follow-up turn hits the prefix cache (10752 tokens reused) and
-prefills only the new suffix in **0.074 s**.
+</details>
 
 **Batched / multi-client** (`serve_batched.py` — paged KV + continuous batching). Aggregate decode
-throughput scales with concurrency N (FP6; single-stream = 70 tok/s):
+throughput scales with concurrency N (FP6; measured on the 2026-06 build, whose single-stream
+reference was 70 tok/s):
 
 | N | agg tok/s | vs single-stream |
 |--:|----------:|-----------------:|
