@@ -72,6 +72,15 @@ RTX 5090 (GB202, SM 12.0), **Qwen3.6-27B, FP6 weights + Q4 KV**, single stream, 
 
 Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
 
+> **2026-07 update — long-context decode +30-65%.** The verify attention now runs
+> GQA-paired MMA items (two q-heads of a kv group share one K/V pass; bit-identical
+> outputs) plus fused Q4 scale/code loads. Measured on an RTX PRO 6000 Blackwell
+> (188 SM, same GB202/SM120 class; the table above still shows pre-update 5090
+> numbers): 32k 112 tok/s, 64k 107, 128k **97-99** (was 59 on the same card), 200k
+> **67** (was 43) — ms/round -33-40% at 64k+, short contexts unchanged. Cold-prefill
+> wide+MMA is now the server default (works at Q4-KV/256k, no 16k cap): 32k prefills
+> at ~1626 tok/s, 128k at ~851 (needle 4/4 @24k and @120k on these paths).
+
 **Cold prefill** — the first turn of a long prompt (RAG / large paste / agent turn 1). The wide
 path (`TQ_WIDE_PREFILL=1`, fp32 KV) vs the N=16 baseline:
 
@@ -158,13 +167,10 @@ Inspect a file with `python tools/inspect_tqf.py model.tqf`.
 ## Serve (OpenAI API)
 
 ```bash
-# Production: FP6 + 4-bit KV, 256k context.
+# Production: FP6 + 4-bit KV, 256k context. The wide+MMA cold-prefill path is
+# ON by default (2-3x faster first turns at any length; --no-wide-prefill or
+# TQ_WIDE_PREFILL=0 reverts to the 16-token chunked baseline).
 CUDA_VISIBLE_DEVICES=0 TQ_CTX=262144 TQ_KV_Q4=1 \
-    python3 tools/serve_openai.py --port 8000 --no-thinking \
-    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf
-
-# Fast-prefill mode: fp32 KV + wide prefill, up to 16k (1.5-2.75x faster cold prefill).
-CUDA_VISIBLE_DEVICES=0 TQ_CTX=16384 TQ_WIDE_PREFILL=1 \
     python3 tools/serve_openai.py --port 8000 --no-thinking \
     --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf
 ```
@@ -198,8 +204,9 @@ CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
 |------|---------|
 | `TQ_CTX` | max context (default = engine cap, 262144) |
 | `TQ_KV_Q4=1` | 4-bit-K + E4M3-V KV cache (needed for 256k) |
-| `TQ_WIDE_PREFILL=1` | wide prefill path (requires fp32 KV; gated to `TQ_WIDE_MAX`, default 16384) |
+| `TQ_WIDE_PREFILL=1` | wide prefill path (fp32 or Q4 KV; with `TQ_WIDE_ATTN_MMA=1` uncapped, else 16k gate; server defaults both ON) |
 | `TQ_ATTN_MMA=1` | tensor-core MMA + online-softmax attention (default on) |
+| `TQ_ATTN_MMA_PAIR=0` | disable GQA-paired attention items (default on; bit-identical either way) |
 
 ## Verify
 
