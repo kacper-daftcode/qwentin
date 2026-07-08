@@ -66,7 +66,17 @@ ap.add_argument("--no-thinking", dest="no_thinking", action="store_true",
                      "explicitly sets enable_thinking. Recommended for agent/tool use: "
                      "keeps the prefix cache valid across turns (reasoning otherwise "
                      "forces a full re-prefill each turn). Env: TQ_NO_THINK=1")
+ap.add_argument("--wide-prefill", dest="wide_prefill", action="store_true", default=True,
+                help="wide (N=128) tensor-core prefill path for cold prompts (default ON; "
+                     "~2-3x faster first-turn prefill, works at Q4-KV/256k; validated "
+                     "needle 4/4 @24k/@120k). Sets TQ_WIDE_PREFILL=1 + TQ_WIDE_ATTN_MMA=1 "
+                     "unless those env vars are set explicitly (env always wins).")
+ap.add_argument("--no-wide-prefill", dest="wide_prefill", action="store_false")
 args = ap.parse_args()
+
+# The engine lib and prefill() read these lazily; explicit env overrides the flag.
+os.environ.setdefault("TQ_WIDE_PREFILL", "1" if args.wide_prefill else "0")
+os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if args.wide_prefill else "0")
 
 print(f"[serve] loading {args.tqf} ...", flush=True)
 TOK = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
@@ -125,7 +135,9 @@ if args.prefix_cache_live and EOS_IDS:
 print(f"[serve] ready on :{args.port} (eos={sorted(EOS_IDS)}, "
       f"prefix_cache={'on' if args.prefix_cache else 'off'}"
       f"{'+live' if args.prefix_cache_live else ''}, "
-      f"thinking={'off (default)' if args.no_thinking else 'template-default (on)'})", flush=True)
+      f"thinking={'off (default)' if args.no_thinking else 'template-default (on)'}, "
+      f"wide_prefill={'on' if os.environ.get('TQ_WIDE_PREFILL', '0') not in ('', '0') else 'off'}"
+      f"+mma={'on' if os.environ.get('TQ_WIDE_ATTN_MMA', '0') not in ('', '0') else 'off'})", flush=True)
 
 
 def _common_prefix(a, b):
@@ -137,9 +149,22 @@ def _common_prefix(a, b):
 
 
 def _anchor_of(P):
-    """Last 16-aligned chunk boundary strictly inside a P-token prompt."""
-    A = (P // 16) * 16
-    return A - 16 if A == P else A
+    """Anchor boundary for a P-token prompt: the last 128-aligned chunk boundary
+    at least 8 tokens inside it.
+
+    Margin 8: the chat template's generation tail (e.g. the closed empty
+    `<think>` block, 4 tokens) is NOT part of the next turn's prompt, so an
+    anchor inside it can never match -- the old `last 16-aligned boundary`
+    put the anchor past the shared prefix for P % 16 in {1,2,3} (~19% of
+    turns = guaranteed full re-prefill).
+
+    128-alignment: the wide prefill path chunks at 128; a replay from a
+    128-aligned anchor reproduces the exact chunk seams of a fresh prefill
+    (16-aligned-only anchors kept the 16-token path bit-identical but made
+    wide-path replays eps-equivalent instead). 128 is a multiple of 16, so
+    the baseline chunked path keeps its bit-identity guarantee too."""
+    A = ((P - 8) // 128) * 128
+    return A if A > 0 else 0
 
 
 def _pc_store(prompt_ids, anchor, eng_extra, temp, rounds):
