@@ -649,6 +649,16 @@ static __device__ __forceinline__ const float *q4s_adv(const float *p, size_t n)
 static __device__ __forceinline__ float q4s_at(const float *p, size_t i) {
     return gc_kv_q4_fp32s ? p[i] : __half2float(((const __half *)p)[i]);
 }
+// One group's (scale, zp) pair in a single load (the pair is adjacent in both
+// storage types). Bit-identical values to two q4s_at calls; halves the number
+// of scattered scale loads in the attention hot loop.
+static __device__ __forceinline__ float2 q4s_pair(const float *p, size_t g2) {
+    if (gc_kv_q4_fp32s) {
+        return *(const float2 *)(p + g2);
+    }
+    __half2 h = *(const __half2 *)((const __half *)p + g2);
+    return __half22float2(h);
+}
 static __device__ __forceinline__ void q4s_put(float *p, size_t i, float v) {
     if (gc_kv_q4_fp32s) p[i] = v;
     else ((__half *)p)[i] = __float2half(v);
@@ -1218,32 +1228,40 @@ static __device__ void tq_attn_mma_block(
                     // int4 K: dequant (code - zp) * scale -> bf16 -> HMMA. The
                     // (d0, d0+1) channel pair shares one byte and one group
                     // (g = c>>1: even d0, groups of 32); k16-chunk c covers
-                    // channels 16c..16c+15, all in group c>>1.
+                    // channels 16c..16c+15, all in group c>>1. The (scale, zp)
+                    // pair is one 32-bit load hoisted over its two c's (same
+                    // values/order as per-half loads -- bit-exact, fewer
+                    // scattered L1TEX transactions in the hottest loop).
                     const uint8_t *kr0 = kcb4 + (size_t)min(p0, base) * cstride4;
                     const uint8_t *kr1 = kcb4 + (size_t)min(p1, base) * cstride4;
                     const float *sz0 = q4s_adv(ksz4, (size_t)min(p0, base) * szstride);
                     const float *sz1 = q4s_adv(ksz4, (size_t)min(p1, base) * szstride);
                     #pragma unroll
-                    for (int c = 0; c < 16; c++) {
-                        const uint32_t *a = &sm[TQ_AMM_QA + (c * 32 + lane) * 4];
-                        int d0 = 16 * c + 2 * t4;
-                        int g = c >> 1;
-                        float sc0 = q4s_at(sz0, 2 * g), zp0 = q4s_at(sz0, 2 * g + 1);
-                        float sc1 = q4s_at(sz1, 2 * g), zp1 = q4s_at(sz1, 2 * g + 1);
-                        uint8_t a0 = kr0[d0 >> 1], a8 = kr0[(d0 >> 1) + 4];
-                        uint8_t b0v = kr1[d0 >> 1], b8 = kr1[(d0 >> 1) + 4];
-                        tq_mma_bf16_m16n8k16(
-                            s0, a,
-                            tq_pack_bf16(((float)(a0 & 15) - zp0) * sc0,
-                                         ((float)(a0 >> 4) - zp0) * sc0),
-                            tq_pack_bf16(((float)(a8 & 15) - zp0) * sc0,
-                                         ((float)(a8 >> 4) - zp0) * sc0));
-                        tq_mma_bf16_m16n8k16(
-                            s1, a,
-                            tq_pack_bf16(((float)(b0v & 15) - zp1) * sc1,
-                                         ((float)(b0v >> 4) - zp1) * sc1),
-                            tq_pack_bf16(((float)(b8 & 15) - zp1) * sc1,
-                                         ((float)(b8 >> 4) - zp1) * sc1));
+                    for (int g = 0; g < 8; g++) {
+                        float2 p0s = q4s_pair(sz0, 2 * g);
+                        float2 p1s = q4s_pair(sz1, 2 * g);
+                        float sc0 = p0s.x, zp0 = p0s.y;
+                        float sc1 = p1s.x, zp1 = p1s.y;
+                        #pragma unroll
+                        for (int cc = 0; cc < 2; cc++) {
+                            int c = 2 * g + cc;
+                            const uint32_t *a = &sm[TQ_AMM_QA + (c * 32 + lane) * 4];
+                            int d0 = 16 * c + 2 * t4;
+                            uint8_t a0 = kr0[d0 >> 1], a8 = kr0[(d0 >> 1) + 4];
+                            uint8_t b0v = kr1[d0 >> 1], b8 = kr1[(d0 >> 1) + 4];
+                            tq_mma_bf16_m16n8k16(
+                                s0, a,
+                                tq_pack_bf16(((float)(a0 & 15) - zp0) * sc0,
+                                             ((float)(a0 >> 4) - zp0) * sc0),
+                                tq_pack_bf16(((float)(a8 & 15) - zp0) * sc0,
+                                             ((float)(a8 >> 4) - zp0) * sc0));
+                            tq_mma_bf16_m16n8k16(
+                                s1, a,
+                                tq_pack_bf16(((float)(b0v & 15) - zp1) * sc1,
+                                             ((float)(b0v >> 4) - zp1) * sc1),
+                                tq_pack_bf16(((float)(b8 & 15) - zp1) * sc1,
+                                             ((float)(b8 >> 4) - zp1) * sc1));
+                        }
                     }
                     #pragma unroll
                     for (int j = 0; j < 4; j++) { s0[j] *= rsc; s1[j] *= rsc; }
@@ -2087,19 +2105,25 @@ __global__ void k_tq_wide_attn_mma(
             const float *sz0 = q4s_adv(ksz4, TQ_PROW(p0) * szstride);
             const float *sz1 = q4s_adv(ksz4, TQ_PROW(p1) * szstride);
             #pragma unroll
-            for (int c = 0; c < 16; c++) {
-                const uint32_t *a = &sm[TQ_AMM_QA + (c * 32 + lane) * 4];
-                int d0 = 16 * c + 2 * t4, g = c >> 1;          // 32-channel group == c>>1
-                float sc0 = q4s_at(sz0, 2 * g), zp0 = q4s_at(sz0, 2 * g + 1);
-                float sc1 = q4s_at(sz1, 2 * g), zp1 = q4s_at(sz1, 2 * g + 1);
-                uint8_t a0 = kr0[d0 >> 1], a8 = kr0[(d0 >> 1) + 4];
-                uint8_t e0 = kr1[d0 >> 1], e8 = kr1[(d0 >> 1) + 4];
-                tq_mma_bf16_m16n8k16(s0, a,
-                    tq_pack_bf16(((float)(a0 & 15) - zp0) * sc0, ((float)(a0 >> 4) - zp0) * sc0),
-                    tq_pack_bf16(((float)(a8 & 15) - zp0) * sc0, ((float)(a8 >> 4) - zp0) * sc0));
-                tq_mma_bf16_m16n8k16(s1, a,
-                    tq_pack_bf16(((float)(e0 & 15) - zp1) * sc1, ((float)(e0 >> 4) - zp1) * sc1),
-                    tq_pack_bf16(((float)(e8 & 15) - zp1) * sc1, ((float)(e8 >> 4) - zp1) * sc1));
+            for (int g = 0; g < 8; g++) {                      // 32-channel group == c>>1
+                float2 p0s = q4s_pair(sz0, 2 * g);             // (scale, zp) one load
+                float2 p1s = q4s_pair(sz1, 2 * g);
+                float sc0 = p0s.x, zp0 = p0s.y;
+                float sc1 = p1s.x, zp1 = p1s.y;
+                #pragma unroll
+                for (int cc = 0; cc < 2; cc++) {
+                    int c = 2 * g + cc;
+                    const uint32_t *a = &sm[TQ_AMM_QA + (c * 32 + lane) * 4];
+                    int d0 = 16 * c + 2 * t4;
+                    uint8_t a0 = kr0[d0 >> 1], a8 = kr0[(d0 >> 1) + 4];
+                    uint8_t e0 = kr1[d0 >> 1], e8 = kr1[(d0 >> 1) + 4];
+                    tq_mma_bf16_m16n8k16(s0, a,
+                        tq_pack_bf16(((float)(a0 & 15) - zp0) * sc0, ((float)(a0 >> 4) - zp0) * sc0),
+                        tq_pack_bf16(((float)(a8 & 15) - zp0) * sc0, ((float)(a8 >> 4) - zp0) * sc0));
+                    tq_mma_bf16_m16n8k16(s1, a,
+                        tq_pack_bf16(((float)(e0 & 15) - zp1) * sc1, ((float)(e0 >> 4) - zp1) * sc1),
+                        tq_pack_bf16(((float)(e8 & 15) - zp1) * sc1, ((float)(e8 >> 4) - zp1) * sc1));
+                }
             }
         } else {
             const float *kr0 = kcb + (size_t)min(p0, maxpos) * cstride;
