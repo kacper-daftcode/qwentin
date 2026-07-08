@@ -1465,6 +1465,382 @@ static __device__ void tq_attn_mma_block(
     __syncthreads();
 }
 
+// ===== GROUP attention (TQ_ATTN_MMA_GROUP, standalone verify path only) =====
+// One item = a WHOLE kv group (6 q-heads = 3 pairs) x one position chunk, so the
+// group's K codes/scales are loaded once for 3 pairs' score MMAs and the V codes
+// once for 3 pairs' P.V MMAs (the pair path re-reads them per pair-item; the
+// phase is L1TEX-latency-bound, DRAM ~6%). To hold 3 pairs' O accumulators under
+// the register budget the P.V phase runs in TWO column halves (outer half loop
+// re-runs the score pass; K re-read once more, still 2/3 of the pair path's K
+// traffic and 1/3 of its V traffic). Per-row math and the chunk-partial layout
+// are IDENTICAL to the pair path (same tile order, same merge) -> bit-exact.
+// Q A-fragments come pre-staged from k_tq_attn_qa_stage (one small launch per
+// layer) -- the in-item Q-prep would run 3x more often at the 3x finer chunking
+// this mode wants. MODE 3 (prod Q4 KV) only; requires N <= 8, group == 6,
+// nchunks > 1 (partial+merge path; at the >=96k gate this always holds).
+//
+// dynamic smem layout (words):
+#define TQ_AMG_QA(p)   ((p) * 2048)         // [3 pairs][16 chunks][32 lanes][4] staged A-frags
+#define TQ_AMG_PST(p)  (6144 + (p) * 1024)  // [3 pairs][8 tiles][32][4] P A-frag staging
+#define TQ_AMG_WMAX    9216                 // [8 warps][16 rows] tile row-max (per-pair, reused)
+#define TQ_AMG_WSUM    9344                 // [8 warps][16 rows]
+#define TQ_AMG_MST(p)  (9472 + (p) * 16)    // [3][16] running row max
+#define TQ_AMG_LST(p)  (9520 + (p) * 16)    // [3][16] running row denom
+#define TQ_AMG_ALPH    9568                 // [16] per-row rescale (transient per pair)
+#define TQ_AMG_AMASK   9584                 // [16] ancestor slot bitmask per row
+#define TQ_AMG_WORDS   9600
+#define TQ_ATTN_MMA_GROUP_SMEM ((size_t)TQ_AMG_WORDS * 4)
+
+// Stage the Q A-fragments for all (pair, node) rows of one layer: grid = nh/2
+// pair-blocks x 256 threads; block p writes the exact QA words the pair kernel's
+// in-item Q-prep would build (same math incl. FWHT) to stage[p * 2048 ..].
+__global__ void k_tq_attn_qa_stage(
+    uint32_t *stage, const float *q_proj_base, const uint16_t *q_norm_w,
+    const int *pos_arr, int N, int nh, int hd,
+    int q_stride, float eps, float rope_theta) {
+    __shared__ float qtmp[256];
+    __shared__ float red[9];
+    __shared__ uint32_t qa[2048];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int prg = blockIdx.x;                      // global pair id = head/2
+    const int head = 2 * prg;
+    for (int i = tid; i < 2048; i += 256) qa[i] = 0;
+    __syncthreads();
+    for (int rq = 0; rq < 16; rq++) {
+        const int n = rq & 7;
+        if (n >= N) continue;
+        const int hh = head + (rq >> 3);
+        const float *q_proj = q_proj_base + (size_t)n * q_stride;
+        int pos = pos_arr[n];
+        float qv = q_proj[hh * (2 * hd) + tid];
+        float qsum = qv * qv;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) qsum += __shfl_down_sync(0xffffffffu, qsum, o);
+        if (lane == 0) red[warp] = qsum;
+        __syncthreads();
+        if (tid < 8) {
+            float v = red[tid];
+            for (int o = 4; o > 0; o >>= 1) v += __shfl_down_sync(0xffu, v, o);
+            if (tid == 0) red[8] = v;
+        }
+        __syncthreads();
+        float q_sum_shared = red[8];
+        qv = qv * rsqrtf(q_sum_shared / (float)hd + eps) * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
+        if (tid < 64) {
+            int idx = tid & 31;
+            float freq = powf(rope_theta, -((float)(2 * idx) / 64.0f));
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            float q_pair = q_proj[hh * (2 * hd) + ((tid < 32) ? tid + 32 : tid - 32)];
+            q_pair = q_pair * rsqrtf(q_sum_shared / (float)hd + eps) *
+                     (1.0f + tq_bf16_to_float(q_norm_w[(tid < 32) ? tid + 32 : tid - 32]));
+            float q_rot = (tid < 32) ? -q_pair : q_pair;
+            qv = qv * c + q_rot * s;
+        }
+        __syncthreads();
+        qtmp[tid] = qv;
+        __syncthreads();
+        tq_fwht256(qtmp, tid);                       // MODE 3 rotated-space q
+        if (tid < 128) {
+            int c16 = tid >> 3, tt = (tid >> 1) & 3, rsel = tid & 1;
+            int d0 = 16 * c16 + 2 * tt + 8 * rsel;
+            int l = 4 * (rq & 7) + tt, r = ((rq >> 3) & 1) + 2 * rsel;
+            qa[(c16 * 32 + l) * 4 + r] = tq_pack_bf16(qtmp[d0], qtmp[d0 + 1]);
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < 2048; i += 256) stage[(size_t)prg * 2048 + i] = qa[i];
+}
+
+// The group attention kernel: grid (nkv, nchunks); MODE 3, partial-writing only.
+// __launch_bounds__(256, 2): unconstrained the kernel takes 136 registers ->
+// 1 CTA/SM and loses to the pair path below ~180k (measured); capping at 128
+// (a few local spills) keeps 2 CTAs/SM like the pair kernel.
+__global__ void __launch_bounds__(256, 2) k_tq_spec_attn_group_mma(
+    const uint32_t *qa_stage,
+    const uint8_t *kc4, const float *kq4s, const uint8_t *vc8, const float *vscale,
+    const float *ka, const float *va,
+    const int *pos_arr, const int *anc, int N,
+    int nh, int nkv, int hd, int kv_m, float *part) {
+    extern __shared__ uint32_t sm[];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int gr = lane >> 2, t4 = lane & 3;
+    const int base = pos_arr[0] - 1;                 // root at depth 0 (graph-safe)
+    const int kv_head = blockIdx.x, chunk = blockIdx.y, nchunks = gridDim.y;
+    const int pair0 = kv_head * 3;                   // global pair ids pair0..pair0+2
+    const size_t cstride4 = (size_t)(nkv * hd) >> 1, szstride = (size_t)nkv * 16;
+    const size_t astride = (size_t)kv_m;
+    const uint8_t *kcb4 = kc4 + (size_t)kv_head * (hd >> 1);
+    const float *ksz4 = q4s_adv(kq4s, (size_t)kv_head * 16);
+    const uint8_t *vcb8 = vc8 + (size_t)kv_head * hd;
+    const float *vscb = vscale + kv_head;
+    const float *kab = ka + (size_t)kv_head * hd;
+    const float *vab = va + (size_t)kv_head * hd;
+    float *wmax = (float *)(sm + TQ_AMG_WMAX), *wsum = (float *)(sm + TQ_AMG_WSUM);
+    float *alph = (float *)(sm + TQ_AMG_ALPH);
+
+    // staged A-frags for the group's 3 pairs + ancestor masks
+    for (int p = 0; p < 3; p++)
+        for (int i = tid; i < 2048; i += 256)
+            sm[TQ_AMG_QA(p) + i] = qa_stage[(size_t)(pair0 + p) * 2048 + i];
+    if (tid < 16) {
+        uint32_t m = 0;
+        int node = tid & 7;
+        if (node < N) {
+            int len = pos_arr[node] - base;          // chain incl. the node itself
+            const int *an = anc + node * TQ_SPEC_MAX_N;
+            for (int d = 0; d < len; d++) m |= 1u << an[d];
+        }
+        sm[TQ_AMG_AMASK + tid] = m;
+    }
+    __syncthreads();
+    const uint32_t amask_lo = sm[TQ_AMG_AMASK + gr], amask_hi = sm[TQ_AMG_AMASK + 8 + gr];
+
+    const float rsc = rsqrtf((float)hd);
+    const int nst_all = base >= 0 ? (base + 128) >> 7 : 0;
+    const int st_per = (nst_all + nchunks - 1) / nchunks;
+    const int st_lo = chunk * st_per;
+    int st_hi_t = (chunk + 1) * st_per;
+    const int st_hi = st_hi_t < nst_all ? st_hi_t : nst_all;
+    const int do_arch = (chunk == 0);
+    const int nst = st_hi > st_lo ? st_hi - st_lo : 0;
+
+    for (int half = 0; half < 2; half++) {
+        // per-half softmax state reset (both halves recompute identical m/l)
+        if (tid < 16) {
+            for (int p = 0; p < 3; p++) {
+                ((float *)(sm + TQ_AMG_MST(p)))[tid] = TQ_AMM_NINF;
+                ((float *)(sm + TQ_AMG_LST(p)))[tid] = 0.0f;
+            }
+        }
+        __syncthreads();
+        float oacc[3][2][4];                          // [pair][col-frag of this half][j]
+        #pragma unroll
+        for (int p = 0; p < 3; p++)
+            #pragma unroll
+            for (int f = 0; f < 2; f++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) oacc[p][f][j] = 0.0f;
+
+        for (int it = 0; it < nst + do_arch; it++) {
+            const int is_arch = (it == nst);
+            const int nwt = is_arch ? 1 : 8;
+            const int t0 = (st_lo + it) << 7;
+            float s[3][8];                            // 3 pairs' score tiles (s0|s1)
+            if (warp < nwt) {
+                #pragma unroll
+                for (int p = 0; p < 3; p++)
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) s[p][j] = 0.0f;
+                if (is_arch) {
+                    const float *kr0 = kab + (size_t)gr * astride;
+                    const float *kr1 = kab + (size_t)(8 + gr) * astride;
+                    #pragma unroll
+                    for (int c = 0; c < 16; c++) {
+                        int d0 = 16 * c + 2 * t4;
+                        float2 x0 = *(const float2 *)(kr0 + d0);
+                        float2 x1 = *(const float2 *)(kr0 + d0 + 8);
+                        float2 y0 = *(const float2 *)(kr1 + d0);
+                        float2 y1 = *(const float2 *)(kr1 + d0 + 8);
+                        uint32_t b00 = tq_pack_bf16(x0.x, x0.y), b01 = tq_pack_bf16(x1.x, x1.y);
+                        uint32_t b10 = tq_pack_bf16(y0.x, y0.y), b11 = tq_pack_bf16(y1.x, y1.y);
+                        #pragma unroll
+                        for (int p = 0; p < 3; p++) {
+                            const uint32_t *a = &sm[TQ_AMG_QA(p) + (c * 32 + lane) * 4];
+                            tq_mma_bf16_m16n8k16(&s[p][0], a, b00, b01);
+                            tq_mma_bf16_m16n8k16(&s[p][4], a, b10, b11);
+                        }
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 3; p++)
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            int col = 2 * t4 + (j & 1);
+                            uint32_t am = (j < 2) ? amask_lo : amask_hi;
+                            s[p][j]     = ((am >> col) & 1) ? s[p][j] * rsc : TQ_AMM_NINF;
+                            s[p][4 + j] = ((am >> (col + 8)) & 1) ? s[p][4 + j] * rsc : TQ_AMM_NINF;
+                        }
+                } else {
+                    const int tp = t0 + warp * 16;
+                    int p0 = tp + gr, p1 = tp + 8 + gr;
+                    const uint8_t *kr0 = kcb4 + (size_t)min(p0, base) * cstride4;
+                    const uint8_t *kr1 = kcb4 + (size_t)min(p1, base) * cstride4;
+                    const float *sz0 = q4s_adv(ksz4, (size_t)min(p0, base) * szstride);
+                    const float *sz1 = q4s_adv(ksz4, (size_t)min(p1, base) * szstride);
+                    #pragma unroll
+                    for (int g = 0; g < 8; g++) {
+                        float2 p0s = q4s_pair(sz0, 2 * g);
+                        float2 p1s = q4s_pair(sz1, 2 * g);
+                        #pragma unroll
+                        for (int cc = 0; cc < 2; cc++) {
+                            int c = 2 * g + cc;
+                            uint64_t w0 = __ldg((const unsigned long long *)(kr0 + 8 * c));
+                            uint64_t w1 = __ldg((const unsigned long long *)(kr1 + 8 * c));
+                            uint8_t a0 = (uint8_t)(w0 >> (8 * t4));
+                            uint8_t a8 = (uint8_t)(w0 >> (8 * t4 + 32));
+                            uint8_t b0v = (uint8_t)(w1 >> (8 * t4));
+                            uint8_t b8 = (uint8_t)(w1 >> (8 * t4 + 32));
+                            uint32_t kb00 = tq_pack_bf16(((float)(a0 & 15) - p0s.y) * p0s.x,
+                                                         ((float)(a0 >> 4) - p0s.y) * p0s.x);
+                            uint32_t kb01 = tq_pack_bf16(((float)(a8 & 15) - p0s.y) * p0s.x,
+                                                         ((float)(a8 >> 4) - p0s.y) * p0s.x);
+                            uint32_t kb10 = tq_pack_bf16(((float)(b0v & 15) - p1s.y) * p1s.x,
+                                                         ((float)(b0v >> 4) - p1s.y) * p1s.x);
+                            uint32_t kb11 = tq_pack_bf16(((float)(b8 & 15) - p1s.y) * p1s.x,
+                                                         ((float)(b8 >> 4) - p1s.y) * p1s.x);
+                            #pragma unroll
+                            for (int p = 0; p < 3; p++) {
+                                const uint32_t *a = &sm[TQ_AMG_QA(p) + (c * 32 + lane) * 4];
+                                tq_mma_bf16_m16n8k16(&s[p][0], a, kb00, kb01);
+                                tq_mma_bf16_m16n8k16(&s[p][4], a, kb10, kb11);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 3; p++)
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) s[p][j] *= rsc;
+                    // causal cut at base (uniform across rows)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        int c0 = tp + 2 * t4 + (j & 1);
+                        #pragma unroll
+                        for (int p = 0; p < 3; p++) {
+                            if (c0 > base) s[p][j] = TQ_AMM_NINF;
+                            if (c0 + 8 > base) s[p][4 + j] = TQ_AMM_NINF;
+                        }
+                    }
+                }
+            }
+            // per pair: online-softmax update + P staging (V scale folded)
+            for (int p = 0; p < 3; p++) {
+                float *mst = (float *)(sm + TQ_AMG_MST(p));
+                float *lst = (float *)(sm + TQ_AMG_LST(p));
+                if (warp < nwt) {
+                    float lm_lo = fmaxf(fmaxf(s[p][0], s[p][1]), fmaxf(s[p][4], s[p][5]));
+                    float lm_hi = fmaxf(fmaxf(s[p][2], s[p][3]), fmaxf(s[p][6], s[p][7]));
+                    #pragma unroll
+                    for (int o = 1; o <= 2; o <<= 1) {
+                        lm_lo = fmaxf(lm_lo, __shfl_xor_sync(0xffffffffu, lm_lo, o));
+                        lm_hi = fmaxf(lm_hi, __shfl_xor_sync(0xffffffffu, lm_hi, o));
+                    }
+                    if (t4 == 0) { wmax[warp * 16 + gr] = lm_lo; wmax[warp * 16 + 8 + gr] = lm_hi; }
+                }
+                __syncthreads();
+                if (warp == 0 && lane < 16) {
+                    float m_old = mst[lane], m_new = m_old;
+                    for (int w = 0; w < nwt; w++) m_new = fmaxf(m_new, wmax[w * 16 + lane]);
+                    alph[lane] = expf(m_old - m_new);
+                    mst[lane] = m_new;
+                }
+                __syncthreads();
+                if (warp < nwt) {
+                    float mn_lo = mst[gr], mn_hi = mst[8 + gr];
+                    float p00 = expf(s[p][0] - mn_lo), p01 = expf(s[p][1] - mn_lo);
+                    float p02 = expf(s[p][2] - mn_hi), p03 = expf(s[p][3] - mn_hi);
+                    float p10 = expf(s[p][4] - mn_lo), p11 = expf(s[p][5] - mn_lo);
+                    float p12 = expf(s[p][6] - mn_hi), p13 = expf(s[p][7] - mn_hi);
+                    float ls_lo = p00 + p01 + p10 + p11;
+                    float ls_hi = p02 + p03 + p12 + p13;
+                    #pragma unroll
+                    for (int o = 1; o <= 2; o <<= 1) {
+                        ls_lo += __shfl_xor_sync(0xffffffffu, ls_lo, o);
+                        ls_hi += __shfl_xor_sync(0xffffffffu, ls_hi, o);
+                    }
+                    if (t4 == 0) { wsum[warp * 16 + gr] = ls_lo; wsum[warp * 16 + 8 + gr] = ls_hi; }
+                    if (!is_arch) {
+                        int p0c = t0 + warp * 16 + 2 * t4, p1c = p0c + 8;
+                        float v00 = vscb[(size_t)min(p0c, base) * nkv];
+                        float v01 = vscb[(size_t)min(p0c + 1, base) * nkv];
+                        float v10 = vscb[(size_t)min(p1c, base) * nkv];
+                        float v11 = vscb[(size_t)min(p1c + 1, base) * nkv];
+                        p00 *= v00; p01 *= v01; p02 *= v00; p03 *= v01;
+                        p10 *= v10; p11 *= v11; p12 *= v10; p13 *= v11;
+                    }
+                    uint32_t *pst = &sm[TQ_AMG_PST(p) + (warp * 32 + lane) * 4];
+                    pst[0] = tq_pack_bf16(p00, p01);
+                    pst[1] = tq_pack_bf16(p02, p03);
+                    pst[2] = tq_pack_bf16(p10, p11);
+                    pst[3] = tq_pack_bf16(p12, p13);
+                }
+                __syncthreads();
+                if (warp == 0 && lane < 16) {
+                    float l = lst[lane] * alph[lane];
+                    for (int w = 0; w < nwt; w++) l += wsum[w * 16 + lane];
+                    lst[lane] = l;
+                }
+                // rescale this pair's O slice while alph is fresh
+                {
+                    float a_lo = alph[gr], a_hi = alph[8 + gr];
+                    #pragma unroll
+                    for (int f = 0; f < 2; f++) {
+                        oacc[p][f][0] *= a_lo; oacc[p][f][1] *= a_lo;
+                        oacc[p][f][2] *= a_hi; oacc[p][f][3] *= a_hi;
+                    }
+                }
+                __syncthreads();                      // alph reused by the next pair
+            }
+            // P.V for this half's columns: V fragments built once, 3 pairs' MMAs
+            for (int tt = 0; tt < nwt; tt++) {
+                #pragma unroll
+                for (int f = 0; f < 2; f++) {
+                    int fg = 2 * half + f;
+                    int col = warp * 32 + fg * 8 + gr;
+                    uint32_t b0, b1;
+                    if (is_arch) {
+                        int r0 = 2 * t4;
+                        b0 = tq_pack_bf16(vab[(size_t)r0 * astride + col],
+                                          vab[(size_t)(r0 + 1) * astride + col]);
+                        b1 = tq_pack_bf16(vab[(size_t)(r0 + 8) * astride + col],
+                                          vab[(size_t)(r0 + 9) * astride + col]);
+                    } else {
+                        int r0 = t0 + tt * 16 + 2 * t4;
+                        b0 = tq_pack_bf16(
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0, base) * (size_t)(nkv * hd) + col]),
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0 + 1, base) * (size_t)(nkv * hd) + col]));
+                        b1 = tq_pack_bf16(
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0 + 8, base) * (size_t)(nkv * hd) + col]),
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0 + 9, base) * (size_t)(nkv * hd) + col]));
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 3; p++) {
+                        const uint32_t *pa = &sm[TQ_AMG_PST(p) + (tt * 32 + lane) * 4];
+                        uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
+                        tq_mma_bf16_m16n8k16(oacc[p][f], a, b0, b1);
+                    }
+                }
+            }
+            __syncthreads();                          // PST/wmax reuse next iter
+        }
+        // chunk partials for this half's columns; m/l written by half 0 only
+        // (half 1 recomputes identical values). Pair p's halves land in the
+        // per-head slabs of heads 6*kv_head + 2p and +2p+1 like the pair path.
+        for (int p = 0; p < 3; p++) {
+            float *mst = (float *)(sm + TQ_AMG_MST(p));
+            float *lst = (float *)(sm + TQ_AMG_LST(p));
+            int head_lo = 6 * kv_head + 2 * p, head_hi = head_lo + 1;
+            float *ps = part + (size_t)(head_lo * nchunks + chunk) * TQ_AMM_PART_F;
+            float *ph = part + (size_t)(head_hi * nchunks + chunk) * TQ_AMM_PART_F;
+            if (half == 0) {
+                if (tid < 8)       { ps[tid] = mst[tid]; ps[16 + tid] = lst[tid]; }
+                else if (tid < 16) { ph[tid - 8] = mst[tid]; ph[16 + tid - 8] = lst[tid]; }
+            }
+            float *po = ps + 32, *qo = ph + 32;
+            #pragma unroll
+            for (int f = 0; f < 2; f++) {
+                int col = warp * 32 + (2 * half + f) * 8 + 2 * t4;
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    po[(size_t)gr * 256 + col + j] = oacc[p][f][j];
+                    qo[(size_t)gr * 256 + col + j] = oacc[p][f][2 + j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // Merge phase: flash-decoding combine of one head's chunk partials (m* = max m_c;
 // l*/O* = sum exp(m_c - m*) {l_c, O_c}) + the same epilogue as the single-chunk
 // path. Block = 256 threads (one output column each), rows looped; sm9 = 9-float
@@ -1609,6 +1985,34 @@ static int attn_mma_pair_ok(int N) {
     return en && N <= 8 && (g_qwen.nh & 1) == 0 && ((g_qwen.nh / g_qwen.nkv) & 1) == 0;
 }
 
+// GROUP mode (whole kv group per item, staged Q, col-halved P.V) for the
+// standalone launcher. MODE 3 only, needs the exact production GQA shape.
+// MEASURED (PRO 6000, prod Q4, legacy branch): loses to the pair path below
+// ~190k (128k 31.4 vs 29.4 -- fewer, heavier items at 2 CTA/SM occupancy) and
+// wins past it (200k 35.0 vs 39.8 = -12%, 245k 37.2 vs 39.7), so the auto gate
+// enables it from base >= 196608. TQ_ATTN_MMA_GROUP=1/0 forces always/never;
+// TQ_ATTN_MMA_GROUP_MIN moves the auto threshold.
+static int attn_mma_group_ok(int N, int mode, int host_base) {
+    static int en = -2, gmin = -1;
+    if (en == -2) {
+        const char *e = getenv("TQ_ATTN_MMA_GROUP");
+        en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;           // -1 = auto
+        const char *m = getenv("TQ_ATTN_MMA_GROUP_MIN");
+        gmin = (m && *m) ? atoi(m) : 196608;
+    }
+    if (en == 0) return 0;
+    if (en == -1 && host_base < gmin) return 0;
+    return mode == 3 && N <= 8 && g_qwen.hd == 256 &&
+           g_qwen.nh / g_qwen.nkv == 6 && g_qwen.nh == 6 * g_qwen.nkv;
+}
+
+static uint32_t *g_attn_qa_stage = NULL;   // [nh/2 pairs x 2048] staged Q A-frags
+static int ensure_attn_qa_stage(void) {
+    if (g_attn_qa_stage) return 0;
+    size_t words = (size_t)(g_qwen.nh / 2) * 2048;
+    return cudaMalloc(&g_attn_qa_stage, words * 4) == cudaSuccess ? 0 : -1;
+}
+
 static int launch_attn_tree_mma(float *out, const float *q_proj_base,
                                 const uint16_t *q_norm_w,
                                 const float *k_cache, const float *v_cache,
@@ -1622,6 +2026,25 @@ static int launch_attn_tree_mma(float *out, const float *q_proj_base,
     if (ensure_attn_scores() != 0) return -97;       // chunk-partial scratch
     int pair = attn_mma_pair_ok(N);
     int nchunks = attn_mma_nchunks(host_base, pair);
+    // GROUP path: one item per (kv head, chunk) with staged Q; 3x the chunk
+    // count keeps the grid at the pair path's ~384 blocks (4 kv heads vs 12
+    // pair-heads). Only meaningful with the partial+merge path (nchunks > 1).
+    if (attn_mma_group_ok(N, mode, host_base) && nchunks * 3 > 1 && ensure_attn_qa_stage() == 0) {
+        int nc3 = nchunks * 3;
+        if (nc3 > 128) nc3 = 128;
+        k_tq_attn_qa_stage<<<g_qwen.nh / 2, 256, 0, g_qwen.stream>>>(
+            g_attn_qa_stage, q_proj_base, q_norm_w, pos_arr, N, g_qwen.nh, g_qwen.hd,
+            q_stride, g_qwen.eps, g_qwen.rope_theta);
+        k_tq_spec_attn_group_mma<<<dim3(g_qwen.nkv, nc3), 256, TQ_ATTN_MMA_GROUP_SMEM,
+                                   g_qwen.stream>>>(
+            g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
+            pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
+            g_qwen.d_attn_scores);
+        k_tq_spec_attn_tree_mma_merge<<<g_qwen.nh, 256, 0, g_qwen.stream>>>(
+            out, q_proj_base, N, g_qwen.nh, g_qwen.hd, q_stride, out_stride,
+            nc3, g_qwen.d_attn_scores);
+        return 0;
+    }
     dim3 grid(pair ? g_qwen.nh / 2 : g_qwen.nh, nchunks);
     if (mode == 3)
         k_tq_spec_attn_tree_mma<3><<<grid, 256, TQ_ATTN_MMA_SMEM, g_qwen.stream>>>(
