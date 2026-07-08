@@ -1,6 +1,6 @@
 # qwentin
 
-**Qwen3.6-27B at 256k context on a single RTX 5090 — ~110 tok/s, vLLM-class throughput at higher quality, with 1.5–2.75× faster prefill.**
+**Qwen3.6-27B at 256k context on a single RTX 5090 — ~120 tok/s, vLLM-class throughput at higher quality, with cold prefill 2–3× faster by default and long-context decode up to +65% (2026-07).**
 
 qwentin is a from-scratch CUDA inference engine that runs the 27B hybrid-attention Qwen3.6
 tower on one 32 GB consumer GPU (Blackwell / SM120), using hand-written tensor-core kernels
@@ -8,10 +8,12 @@ tower on one 32 GB consumer GPU (Blackwell / SM120), using hand-written tensor-c
 so any client — including an `opencode`/`continue`-style coding agent — can use it.
 
 ```
-27B params + 256k context           →  one 32 GB RTX 5090   (steady-state 30.9 GiB)
-single-stream decode                 →  118 tok/s @ short · 110 @ 8k · 85 @ 32k · 49 @ 200k
-cold prefill (wide path, ≤16k)       →  up to 2.75× faster than the baseline
+27B params + 256k context            →  one 32 GB RTX 5090   (steady-state 30.9 GiB)
+single-stream decode                 →  118-122 tok/s @ short · 112 @ 32k · 97-99 @ 128k · 67 @ 200k
+cold prefill (wide+MMA, default ON)  →  2-3× faster at any length · 1626 tok/s @ 32k · 851 @ 128k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
+
+(long-context tok/s: 2026-07, RTX PRO 6000 — same GB202/SM120 class; pre-update 5090 tables below)
 ```
 
 ## Why it's interesting
@@ -40,8 +42,9 @@ E2M1 86.46 ≈ NVFP4 85.78.)
 - **MTP speculative decoding.** A multi-token-prediction covering tree + batched FP6 verify
   (each weight read once for the whole tree) → real single-stream speedup at accept-length ~2.6–3.0.
 - **Wide prefill.** A dedicated N-wide prefill path — wide FP6 GEMM + chunkwise-parallel
-  gated-DeltaNet + flash key-chunked attention — makes cold prompts **1.5–2.75× faster** for
-  contexts up to 16k, fully integrated with spec-decode and the prefix cache.
+  gated-DeltaNet + tensor-core wide attention — makes cold prompts **2–3× faster** at any
+  length (works at Q4-KV/256k; the old 16k cap is gone). ON by default in the server, fully
+  integrated with spec-decode and the prefix cache.
 - **Hybrid attention.** Qwen3.6 mixes 48 gated-DeltaNet *linear-attention* layers (O(1) state,
   context-independent) with 16 *full-attention* layers — the engine implements both.
 - **Custom SM120 tensor-core kernels.** Hand-written inline-PTX Blackwell block-scaled MMA
@@ -75,14 +78,16 @@ Steady-state VRAM @256k ≈ **30.9 / 31.4 GiB**.
 > **2026-07 update — long-context decode +30-65%.** The verify attention now runs
 > GQA-paired MMA items (two q-heads of a kv group share one K/V pass; bit-identical
 > outputs) plus fused Q4 scale/code loads. Measured on an RTX PRO 6000 Blackwell
-> (188 SM, same GB202/SM120 class; the table above still shows pre-update 5090
-> numbers): 32k 112 tok/s, 64k 107, 128k **97-99** (was 59 on the same card), 200k
-> **67** (was 43) — ms/round -33-40% at 64k+, short contexts unchanged. Cold-prefill
-> wide+MMA is now the server default (works at Q4-KV/256k, no 16k cap): 32k prefills
-> at ~1626 tok/s, 128k at ~851 (needle 4/4 @24k and @120k on these paths).
+> (188 SM, same GB202/SM120 class; the tables on this page keep the pre-update 5090
+> numbers): 1k ~121-122 tok/s, 32k 112, 64k 107-114, 128k **97-99** (was 59 on the
+> same card), 200k **67** (was 43) — ms/round -33-40% at 64k+, short contexts
+> bit-identical and unchanged in speed. Cold-prefill wide+MMA is now the server
+> default (works at Q4-KV/256k, no 16k cap): 1626 tok/s @ 32k, 1261 @ 64k, 851 @
+> 128k, 636 @ 200k (needle 4/4 @24k and 4/4 @120k on these paths).
 
-**Cold prefill** — the first turn of a long prompt (RAG / large paste / agent turn 1). The wide
-path (`TQ_WIDE_PREFILL=1`, fp32 KV) vs the N=16 baseline:
+**Cold prefill** — the first turn of a long prompt (RAG / large paste / agent turn 1). The
+original fp32-KV wide path vs the N=16 baseline (5090, pre-2026-07; the wide+MMA successor is
+uncapped and ON by default in the server — see the update note above):
 
 | Prompt | Baseline | Wide | Speedup |
 |-------:|---------:|-----:|--------:|
@@ -90,8 +95,9 @@ path (`TQ_WIDE_PREFILL=1`, fp32 KV) vs the N=16 baseline:
 | 4k | ~688 tok/s | **1364 tok/s** | 1.98× |
 | 8k | ~679 tok/s | **1062 tok/s** | 1.56× |
 
-End-to-end on the server: a cold 4196-token prompt prefills in ~3.0 s (~1378 tok/s); a multi-turn
-follow-up reuses the prefix cache and prefills only the new suffix in ~0.1 s.
+End-to-end on the server (2026-07, wide prefill default ON): a cold 10.8k-token first turn drops
+from ~15 s to **5.5 s**; the follow-up turn hits the prefix cache (10752 tokens reused) and
+prefills only the new suffix in **0.074 s**.
 
 **Batched / multi-client** (`serve_batched.py` — paged KV + continuous batching). Aggregate decode
 throughput scales with concurrency N (FP6; single-stream = 70 tok/s):
@@ -121,13 +127,14 @@ HuggingFace Qwen3.6  ──convert_qwen_tqf.py──▶  model.tqf  (FP6 E2M3, b
 - **Weights — FP6 E2M3, block-scaled, QMMA.SF.** 6 bits/param on the tensor cores with 128-wide
   block scales; ~20 GiB for 27B.
 - **KV cache — 4-bit K (rotated int4 + Hadamard) + E4M3 V.** This is what buys 256k in 32 GB. A
-  fp32-KV path exists for the fast-prefill mode (caps ~32–40k).
+  fp32-KV mode also exists (caps ~32–40k); wide prefill runs against either.
 - **Speculative decoding — MTP tree.** Covering-tree build → batched k-split FP6 verify over the
   tree → dense-argmax descent → single-path commit that advances the real
   DeltaNet/conv/full-attn-KV state and extends the draft trunk.
 - **Wide prefill.** Projections become one wide FP6 GEMM (weight read once for N tokens); the 48
-  DeltaNet layers run a chunkwise-parallel gated-delta kernel; the 16 full-attn layers run a flash
-  key-chunked attention. A length gate keeps the baseline tensor-core attention for >16k.
+  DeltaNet layers run a chunkwise-parallel gated-delta kernel; the 16 full-attn layers run a
+  tensor-core MMA wide attention that works against the Q4 KV cache at any length (up to 256k)
+  — no length gate. The server enables the whole path by default.
 - **SM120 kernels.** Block-scaled tensor-core MMA (`mma.sync ...mxf8f6f4.block_scale`), FP6
   `ldmatrix ...b6x16` unpack, fused DeltaNet chains, and the persistent-MLP GEMV are hand-written
   as inline PTX, compiled by the stock CUDA 13 `nvcc`/`ptxas`.
@@ -214,6 +221,12 @@ CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
 # End-to-end MTP spec-decode (tok/s, accept-length, divergence vs greedy)
 CUDA_VISIBLE_DEVICES=0 python3 tools/mtp_spec_smoke.py --prompt-tokens 1024 --gen 128
 
+# Decode-only round benchmark: prefill once, time M production spec-rounds
+# (ms/round, net tok/s, accept-length; --profile brackets the timed rounds
+# for `nsys profile -c cudaProfilerApi`)
+CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=262144 python3 tools/bench_rounds.py \
+    --prompt-tokens 65536 --rounds 200
+
 # Needle-in-a-haystack retrieval quality at long context
 CUDA_VISIBLE_DEVICES=0 TQ_CTX=16384 python3 tools/needle_check.py
 ```
@@ -225,6 +238,9 @@ src/forward_qwen.cu        the Qwen3.6 engine: all kernels + C ABI, one CUDA TU 
 tools/serve_openai.py      single-stream OpenAI server (prefix cache, tools, reasoning split)
 tools/serve_batched.py     multi-client OpenAI server (paged KV + continuous batching)
 tools/mtp_spec_smoke.py    spec-decode harness (also exports prefill() used by the server)
+tools/bench_rounds.py      decode-only spec-round benchmark (ms/round, net tok/s; nsys hook)
+tools/accept_probe.py      teacher-forced accept probe (degeneration-free draft-quality A/B)
+tools/serve_smoke.py       2-turn cold + prefix-cache E2E smoke against a running server
 tools/paged_smoke.py       batched/paged decode parity + throughput harness
 tools/needle_check.py      long-context retrieval gate
 tools/convert_qwen_tqf.py  HuggingFace Qwen -> .tqf converter (+ convert.py, sparse_pack.py)
