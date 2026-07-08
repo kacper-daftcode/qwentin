@@ -1927,6 +1927,7 @@ __global__ void k_tq_spec_attn_tree_mma_merge(float *out, const float *q_proj_ba
 }
 
 static int ensure_attn_scores(void);   // defined with the other host helpers below
+static int paged_sm_count(void);       // cached multiProcessorCount (defined below)
 
 static int attn_mma_chunk_tokens(void) {
     static int cached = -1;
@@ -1992,18 +1993,21 @@ static int attn_mma_pair_ok(int N) {
 
 // GROUP mode (whole kv group per item, staged Q, col-halved P.V) for the
 // standalone launcher. MODE 3 only, needs the exact production GQA shape.
-// MEASURED (PRO 6000, prod Q4, legacy branch): loses to the pair path below
-// ~190k (128k 31.4 vs 29.4 -- fewer, heavier items at 2 CTA/SM occupancy) and
-// wins past it (200k 35.0 vs 39.8 = -12%, 245k 37.2 vs 39.7), so the auto gate
-// enables it from base >= 196608. TQ_ATTN_MMA_GROUP=1/0 forces always/never;
-// TQ_ATTN_MMA_GROUP_MIN moves the auto threshold.
+// MEASURED (PRO 6000 / 188 SM, prod Q4, legacy branch): loses to the pair path
+// below ~190k (128k 31.4 vs 29.4 -- fewer, heavier items at 2 CTA/SM occupancy)
+// and wins past it (200k 35.0 vs 39.8 = -12%, 245k 37.2 vs 39.7), so the auto
+// gate enables it from base >= 196608 there. On the 5090 (170 SM, 2026-07-08
+// sweep) the balance flips: group wins at EVERY measured base from 32k up
+// (32k 23.8 vs 24.2, 98k 28.3 vs 30.3, 128k 31.3 vs 33.9, 225k 38.3 vs 42.0
+// ms/round; the pair cliff never appears) -> auto threshold 32768 on <=176 SM.
+// TQ_ATTN_MMA_GROUP=1/0 forces always/never; TQ_ATTN_MMA_GROUP_MIN moves it.
 static int attn_mma_group_ok(int N, int mode, int host_base) {
     static int en = -2, gmin = -1;
     if (en == -2) {
         const char *e = getenv("TQ_ATTN_MMA_GROUP");
         en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;           // -1 = auto
         const char *m = getenv("TQ_ATTN_MMA_GROUP_MIN");
-        gmin = (m && *m) ? atoi(m) : 196608;
+        gmin = (m && *m) ? atoi(m) : (paged_sm_count() <= 176 ? 32768 : 196608);
     }
     if (en == 0) return 0;
     if (en == -1 && host_base < gmin) return 0;
@@ -15434,22 +15438,26 @@ static int spec_state_skip_enabled(void) {
 static int g_spec_persist_nsegs = 0;   // segments uploaded for this round (0 = depth waves)
 
 // Can this full-attention layer's attn half run through the persistent kernel?
-// CONTEXT GATE (2026-07-08, measured PRO 6000, prod Q4 + pair): past ~96k the
-// standalone-kernel (legacy) branch beats the persistent part2 -- its attention
-// kernel compiles to 102 regs with its own occupancy instead of sharing the
-// 128-reg __launch_bounds__(256,2) budget (which is already spilling,
-// STACK:192), and at long ctx the attn phase dominates the part: 128k 29.8 ->
-// 29.4, 200k 41.4 -> 39.7 ms/round. Short ctx keeps the persistent overlap win
-// (32k: legacy +0.16 ms). Free-run trajectories are identical across the flip
-// (same kernels, same math -- scheduling only). TQ_SPEC_ATTN_LEGACY=1/0 forces
-// always/never; TQ_SPEC_ATTN_LEGACY_MIN moves the auto threshold (default 96k).
+// CONTEXT GATE (2026-07-08, measured PRO 6000 / 188 SM, prod Q4 + pair): past
+// ~96k the standalone-kernel (legacy) branch beats the persistent part2 -- its
+// attention kernel compiles to 102 regs with its own occupancy instead of
+// sharing the 128-reg __launch_bounds__(256,2) budget (which is already
+// spilling, STACK:192), and at long ctx the attn phase dominates the part:
+// 128k 29.8 -> 29.4, 200k 41.4 -> 39.7 ms/round. Short ctx keeps the
+// persistent overlap win there (32k: legacy +0.16 ms). On the 5090 (170 SM,
+// 2026-07-08 sweep) the persistent overlap never wins: legacy is ahead at
+// every base (32k -0.19, 64k -0.59, 128k -0.88 ms/round; 1k-16k within noise)
+// -> auto threshold 32768 on <=176 SM. Free-run trajectories are identical
+// across the flip (same kernels, same math -- scheduling only).
+// TQ_SPEC_ATTN_LEGACY=1/0 forces always/never; TQ_SPEC_ATTN_LEGACY_MIN moves
+// the auto threshold.
 static int spec_persist_attn_ok(tq_layer_t *l) {
     static int legacy = -2, legacy_min = -1;
     if (legacy == -2) {
         const char *e = getenv("TQ_SPEC_ATTN_LEGACY");
         legacy = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;      // -1 = auto
         const char *m = getenv("TQ_SPEC_ATTN_LEGACY_MIN");
-        legacy_min = (m && *m) ? atoi(m) : 98304;
+        legacy_min = (m && *m) ? atoi(m) : (paged_sm_count() <= 176 ? 32768 : 98304);
     }
     if (legacy == 1) return 0;
     if (legacy == -1 && g_spec_attn_base_host >= legacy_min) return 0;
