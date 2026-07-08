@@ -86,29 +86,6 @@ retrieval 4/4 @24k, @120k and @239k on all of them. End-to-end on the server: a 
 10.8k-token first turn drops from ~15 s to **5.5 s**; a follow-up turn hits the prefix
 cache (10752 tokens reused) and prefills only the new suffix in **0.074 s**.
 
-<details>
-<summary><b>Original 2026-06 build (RTX 5090)</b> — the numbers the engine launched with</summary>
-
-| Context | Decode (tok/s) | Notes |
-|--------:|---------------:|-------|
-|  ~short | 118 | |
-|     8k  | 110 | |
-|    32k  |  85 | |
-|    64k  |  70 | |
-|   100k  |  77 | accept-len 2.66 |
-|   200k  |  49 | accept-len 2.98 |
-
-Cold prefill, original fp32-KV wide path vs the N=16 baseline (the wide+MMA successor
-is uncapped, works at Q4-KV/256k and is ON by default in the server):
-
-| Prompt | Baseline | Wide | Speedup |
-|-------:|---------:|-----:|--------:|
-| 2k | ~695 tok/s | **1582 tok/s** | 2.28× |
-| 4k | ~688 tok/s | **1364 tok/s** | 1.98× |
-| 8k | ~679 tok/s | **1062 tok/s** | 1.56× |
-
-</details>
-
 **Batched / multi-client** (`serve_batched.py` — paged KV + continuous batching). Aggregate decode
 throughput scales with concurrency N (FP6; measured on the 2026-06 build, whose single-stream
 reference was 70 tok/s):
