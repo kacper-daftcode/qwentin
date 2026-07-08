@@ -15006,7 +15006,25 @@ static int spec_state_skip_enabled(void) {
 static int g_spec_persist_nsegs = 0;   // segments uploaded for this round (0 = depth waves)
 
 // Can this full-attention layer's attn half run through the persistent kernel?
+// CONTEXT GATE (2026-07-08, measured PRO 6000, prod Q4 + pair): past ~96k the
+// standalone-kernel (legacy) branch beats the persistent part2 -- its attention
+// kernel compiles to 102 regs with its own occupancy instead of sharing the
+// 128-reg __launch_bounds__(256,2) budget (which is already spilling,
+// STACK:192), and at long ctx the attn phase dominates the part: 128k 29.8 ->
+// 29.4, 200k 41.4 -> 39.7 ms/round. Short ctx keeps the persistent overlap win
+// (32k: legacy +0.16 ms). Free-run trajectories are identical across the flip
+// (same kernels, same math -- scheduling only). TQ_SPEC_ATTN_LEGACY=1/0 forces
+// always/never; TQ_SPEC_ATTN_LEGACY_MIN moves the auto threshold (default 96k).
 static int spec_persist_attn_ok(tq_layer_t *l) {
+    static int legacy = -2, legacy_min = -1;
+    if (legacy == -2) {
+        const char *e = getenv("TQ_SPEC_ATTN_LEGACY");
+        legacy = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;      // -1 = auto
+        const char *m = getenv("TQ_SPEC_ATTN_LEGACY_MIN");
+        legacy_min = (m && *m) ? atoi(m) : 98304;
+    }
+    if (legacy == 1) return 0;
+    if (legacy == -1 && g_spec_attn_base_host >= legacy_min) return 0;
     if (g_qwen.hd != 256) return 0;
     const tq_qmma_weight_t *ws[4] = {&l->q_proj, &l->k_proj, &l->v_proj, &l->o_proj};
     for (int i = 0; i < 4; i++)
