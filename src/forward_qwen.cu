@@ -1863,11 +1863,25 @@ __global__ void __launch_bounds__(256, 2) k_tq_spec_attn_group_mma(
 #define TQ_AMG2_AMASK      12736                 // [16] ancestor slot bitmask per row
 #define TQ_AMG2_WORDS      12752
 #define TQ_ATTN_MMA_GROUP2_SMEM ((size_t)TQ_AMG2_WORDS * 4)
+// STAGE=1 extension: cp.async double-buffered staging of the K codes (128 pos x
+// 128 B) and fp16 (scale,zp) rows (128 pos x 32 B) of the NEXT super-tile while
+// the producers score the current one -- the in-flight bytes live in smem, not
+// registers, so the L1TEX load-use chains disappear without touching the reg
+// budget. fp32-scale escape hatch (TQ_KV_Q4_FP32S) falls back to STAGE=0.
+#define TQ_AMG2_KST(s)     (12752 + (s) * 4096)  // [2 slots][128 pos][32 words] K codes
+#define TQ_AMG2_SST(s)     (20944 + (s) * 1024)  // [2 slots][128 pos][8 words] fp16 scales
+#define TQ_AMG2_WORDS_STG  22992
+#define TQ_ATTN_MMA_GROUP2_SMEM_STG ((size_t)TQ_AMG2_WORDS_STG * 4)
 
 static __device__ __forceinline__ void tq_bar_sync(int bar, int nthreads) {
     asm volatile("bar.sync %0, %1;" :: "r"(bar), "r"(nthreads));
 }
 
+static __device__ __forceinline__ void tq_cp_async16(uint32_t dst_smem, const void *src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_smem), "l"(src));
+}
+
+template <int STAGE>
 __global__ void __launch_bounds__(512, 1) k_tq_spec_attn_group_mma2(
     const uint32_t *qa_stage,
     const uint8_t *kc4, const float *kq4s, const uint8_t *vc8, const float *vscale,
@@ -1928,12 +1942,41 @@ __global__ void __launch_bounds__(512, 1) k_tq_spec_attn_group_mma2(
     // roles run DISJOINT loops (same bar-0 count) so the consumer-only oacc
     // does not inflate the producers' register allocation.
     if (prod) {
+    const int ptid = tid;                         // producer-local tid (warps 0-7)
+    // STAGE: cp.async one K super-tile (codes 128 x 128 B + fp16 scales
+    // 128 x 32 B) into stage slot `sl`, clamped rows like the direct path.
+    // 1280 16-B chunks / 256 threads = 5 issues per thread + one commit.
+    auto stage_issue = [&](int it_s, int sl) {
+        if (!STAGE || it_s >= nst) return;
+        const int t0s = (st_lo + it_s) << 7;
+        for (int id = ptid; id < 1024; id += 256) {
+            int pos = id >> 3, sub = id & 7;
+            const uint8_t *src = kcb4 + (size_t)min(t0s + pos, base) * cstride4 + 16 * sub;
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(
+                              sm + TQ_AMG2_KST(sl) + pos * 32 + sub * 4), src);
+        }
+        for (int id = ptid; id < 256; id += 256) {
+            int pos = id >> 1, sub = id & 1;
+            const __half *src = (const __half *)kq4s + (size_t)kv_head * 16 +
+                                (size_t)min(t0s + pos, base) * szstride + 8 * sub;
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(
+                              sm + TQ_AMG2_SST(sl) + pos * 8 + sub * 4), src);
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+    stage_issue(0, 0);
     for (int ph = 0; ph <= T; ph++) {
         if (ph < T) {
             const int it = ph, slot = ph & 1;
             const int is_arch = (it == nst);
             const int nwt = is_arch ? 1 : 8;
             const int t0 = (st_lo + it) << 7;
+            if (STAGE && it < nst) {
+                stage_issue(it + 1, (it + 1) & 1);   // overlap next tile's copy
+                if (it + 1 < nst) asm volatile("cp.async.wait_group 1;\n");
+                else              asm volatile("cp.async.wait_group 0;\n");
+                tq_bar_sync(1, 256);                 // staged bytes visible to all producers
+            }
             float s[3][8];
             if (cw < nwt) {
                 #pragma unroll
@@ -1971,10 +2014,21 @@ __global__ void __launch_bounds__(512, 1) k_tq_spec_attn_group_mma2(
                 } else {
                     const int tp = t0 + cw * 16;
                     int p0 = tp + gr, p1 = tp + 8 + gr;
-                    const uint8_t *kr0 = kcb4 + (size_t)min(p0, base) * cstride4;
-                    const uint8_t *kr1 = kcb4 + (size_t)min(p1, base) * cstride4;
-                    const float *sz0 = q4s_adv(ksz4, (size_t)min(p0, base) * szstride);
-                    const float *sz1 = q4s_adv(ksz4, (size_t)min(p1, base) * szstride);
+                    // STAGE: rows come from the smem stage slot (clamping was
+                    // applied at copy time); direct path reads global.
+                    const int r0i = cw * 16 + gr, r1i = r0i + 8;
+                    const uint8_t *kr0 = STAGE
+                        ? (const uint8_t *)(sm + TQ_AMG2_KST(slot) + r0i * 32)
+                        : kcb4 + (size_t)min(p0, base) * cstride4;
+                    const uint8_t *kr1 = STAGE
+                        ? (const uint8_t *)(sm + TQ_AMG2_KST(slot) + r1i * 32)
+                        : kcb4 + (size_t)min(p1, base) * cstride4;
+                    const float *sz0 = STAGE
+                        ? (const float *)(sm + TQ_AMG2_SST(slot) + r0i * 8)
+                        : q4s_adv(ksz4, (size_t)min(p0, base) * szstride);
+                    const float *sz1 = STAGE
+                        ? (const float *)(sm + TQ_AMG2_SST(slot) + r1i * 8)
+                        : q4s_adv(ksz4, (size_t)min(p1, base) * szstride);
                     #pragma unroll
                     for (int g = 0; g < 8; g++) {
                         float2 p0s = q4s_pair(sz0, 2 * g);
@@ -1982,8 +2036,12 @@ __global__ void __launch_bounds__(512, 1) k_tq_spec_attn_group_mma2(
                         #pragma unroll
                         for (int cc = 0; cc < 2; cc++) {
                             int c = 2 * g + cc;
-                            uint64_t w0 = __ldg((const unsigned long long *)(kr0 + 8 * c));
-                            uint64_t w1 = __ldg((const unsigned long long *)(kr1 + 8 * c));
+                            uint64_t w0 = STAGE
+                                ? *(const unsigned long long *)(kr0 + 8 * c)
+                                : __ldg((const unsigned long long *)(kr0 + 8 * c));
+                            uint64_t w1 = STAGE
+                                ? *(const unsigned long long *)(kr1 + 8 * c)
+                                : __ldg((const unsigned long long *)(kr1 + 8 * c));
                             uint8_t a0 = (uint8_t)(w0 >> (8 * t4));
                             uint8_t a8 = (uint8_t)(w0 >> (8 * t4 + 32));
                             uint8_t b0v = (uint8_t)(w1 >> (8 * t4));
@@ -2333,7 +2391,9 @@ static int attn_mma_group_ok(int N, int mode, int host_base) {
         const char *e = getenv("TQ_ATTN_MMA_GROUP");
         en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;           // -1 = auto
         const char *m = getenv("TQ_ATTN_MMA_GROUP_MIN");
-        gmin = (m && *m) ? atoi(m) : 32768;
+        // 8192 with GROUP2 (5090 sweep 2026-07-09: 8k 22.3 -> 21.4, 16k 22.5
+        // -> 21.7 ms/round free-run; teacher-forced verify -0.8 ms/round @8k)
+        gmin = (m && *m) ? atoi(m) : 8192;
     }
     if (en == 0) return 0;
     if (en == -1 && host_base < gmin) return 0;
@@ -2365,9 +2425,32 @@ static int attn_mma_group2_enabled(void) {
     if (!en) return 0;
     static int smem_ok = -1;
     if (smem_ok < 0)
-        smem_ok = cudaFuncSetAttribute(k_tq_spec_attn_group_mma2,
+        smem_ok = cudaFuncSetAttribute(k_tq_spec_attn_group_mma2<0>,
                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        TQ_ATTN_MMA_GROUP2_SMEM) == cudaSuccess;
+    return smem_ok;
+}
+
+// STAGE extension gate (TQ_ATTN_MMA_GROUP2_STAGE, default OFF -- measured
+// NEUTRAL on the 5090, 2026-07-09: 64k 23.15 vs 23.13, 128k 25.17 vs 25.11,
+// 200k 27.27 vs 27.27 ms/round; streams bit-exact). After the producer/consumer
+// split the producers' K-load stalls already hide behind consumer P.V work; the
+// remaining latency sits in the consumers' V byte loads (8 useful bytes per
+// 32 B sector, inherent to the position-major V layout), which the K staging
+// cannot touch. Kept as an opt-in in case a V-layout change revisits this.
+// cp.async K/scale staging; fp16 scales only (the fp32 escape hatch falls back).
+static int attn_mma_group2_stage_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("TQ_ATTN_MMA_GROUP2_STAGE");
+        en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : 0;
+    }
+    if (!en || g_qwen.kv_q4_fp32s) return 0;
+    static int smem_ok = -1;
+    if (smem_ok < 0)
+        smem_ok = cudaFuncSetAttribute(k_tq_spec_attn_group_mma2<1>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       TQ_ATTN_MMA_GROUP2_SMEM_STG) == cudaSuccess;
     return smem_ok;
 }
 
@@ -2397,20 +2480,31 @@ static int launch_attn_tree_mma(float *out, const float *q_proj_base,
             // 512-thread CTAs run at 1 CTA/SM, so the sweet spot is ONE full
             // wave: nkv * nc3 == SM count (200k sweep on 170 SM: nc3 42 -> 27.2
             // ms/round vs 48 -> 30.9 (1.13-wave tail) vs 24 -> 30.6 (half the
-            // GPU idle)). TQ_ATTN_MMA_NCHUNKS still overrides via nchunks*3.
+            // GPU idle)), clamped to the super-tile count so short contexts do
+            // not launch empty chunks. TQ_ATTN_MMA_NCHUNKS overrides via
+            // nchunks*3.
             if (!getenv("TQ_ATTN_MMA_NCHUNKS")) {
                 nc3 = paged_sm_count() / g_qwen.nkv;
+                int nst_all = host_base >= 0 ? (host_base + 128) >> 7 : 1;
+                if (nc3 > nst_all) nc3 = nst_all;
                 if (nc3 < 2) nc3 = 2;
                 if (nc3 > 128) nc3 = 128;
                 int slab_cap3 = (int)(((size_t)TQ_ATTN_SCORE_SLOTS * g_qwen.max_seq) /
                                       ((size_t)g_qwen.nh * TQ_AMM_PART_F));
                 if (nc3 > slab_cap3) nc3 = slab_cap3 > 0 ? slab_cap3 : 1;
             }
-            k_tq_spec_attn_group_mma2<<<dim3(g_qwen.nkv, nc3), 512, TQ_ATTN_MMA_GROUP2_SMEM,
-                                        g_qwen.stream>>>(
-                g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
-                pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
-                g_qwen.d_attn_scores);
+            if (attn_mma_group2_stage_enabled())
+                k_tq_spec_attn_group_mma2<1><<<dim3(g_qwen.nkv, nc3), 512,
+                                               TQ_ATTN_MMA_GROUP2_SMEM_STG, g_qwen.stream>>>(
+                    g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
+                    pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
+                    g_qwen.d_attn_scores);
+            else
+                k_tq_spec_attn_group_mma2<0><<<dim3(g_qwen.nkv, nc3), 512,
+                                               TQ_ATTN_MMA_GROUP2_SMEM, g_qwen.stream>>>(
+                    g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
+                    pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
+                    g_qwen.d_attn_scores);
         } else
             k_tq_spec_attn_group_mma<<<dim3(g_qwen.nkv, nc3), 256, TQ_ATTN_MMA_GROUP_SMEM,
                                        g_qwen.stream>>>(
@@ -15823,7 +15917,7 @@ static int spec_persist_attn_ok(tq_layer_t *l) {
         const char *e = getenv("TQ_SPEC_ATTN_LEGACY");
         legacy = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;      // -1 = auto
         const char *m = getenv("TQ_SPEC_ATTN_LEGACY_MIN");
-        legacy_min = (m && *m) ? atoi(m) : 32768;
+        legacy_min = (m && *m) ? atoi(m) : 8192;               // measured with GROUP2
     }
     if (legacy == 1) return 0;
     if (legacy == -1 && g_spec_attn_base_host >= legacy_min) return 0;

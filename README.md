@@ -68,6 +68,7 @@ percent with the accept-length at that text offset; ms/round is the hardware tru
 | Context | Decode (ms/round) | Decode (tok/s) | Cold prefill (tok/s) |
 |--------:|------------------:|---------------:|---------------------:|
 |  ~short | 21.7 | **119-131** | 2050-2160 |
+|     8k  | 21.4 | 128-130 | 2044 |
 |    32k  | 22.1 | 119 | 1724 |
 |    64k  | 23.1 | 117 | 1476 |
 |   128k  | 25.1 | **~119** | 1154 (full prompt in 114 s) |
@@ -78,7 +79,7 @@ Steady-state VRAM @256k ≈ **30.8 / 31.4 GiB** (the `TQ_EMBED_FP8=2` 6-bit embe
 is what makes 256k fit — without it the 32 GB card OOMs past ~230k).
 
 The decode column is nearly flat: a 200k-deep conversation decodes at ~83% of the
-short-context speed (27.2 vs 21.7 ms/round). Short contexts (<32k) are bit-identical
+short-context speed (27.2 vs 21.7 ms/round). Short contexts (<8k) are bit-identical
 to the 2026-06 build; the long-context gains come from a producer/consumer group
 attention kernel (one 512-thread CTA: 8 warps score a whole kv group's K read ONCE
 per super-tile while 8 warps run the previous tile's P·V from a double-buffered
@@ -223,7 +224,7 @@ CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
 | `TQ_WIDE_PREFILL=1` | wide prefill path (fp32 or Q4 KV; with `TQ_WIDE_ATTN_MMA=1` uncapped, else 16k gate; server defaults both ON) |
 | `TQ_ATTN_MMA=1` | tensor-core MMA + online-softmax attention (default on) |
 | `TQ_ATTN_MMA_PAIR=0` | disable GQA-paired attention items (default on; bit-identical either way) |
-| `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN` | context thresholds of the long-ctx attention auto-gates (default 32k for both; below them the persistent/pair path keeps short contexts bit-identical) |
+| `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN` | context thresholds of the long-ctx attention auto-gates (default 8k for both; below them the persistent/pair path keeps short contexts bit-identical) |
 | `TQ_ATTN_MMA_GROUP2=0` | revert the producer/consumer group-attention kernel to the 2-half variant (default on) |
 
 ## Verify
