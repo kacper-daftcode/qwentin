@@ -1841,6 +1841,333 @@ __global__ void __launch_bounds__(256, 2) k_tq_spec_attn_group_mma(
     }
 }
 
+// ===== GROUP2: producer/consumer group attention (TQ_ATTN_MMA_GROUP2) =====
+// Same item = whole kv group x position chunk, but ONE 512-thread CTA at
+// __launch_bounds__(512, 1): warps 0-7 (producers) run the score pass -- K
+// codes/scales read ONCE per super-tile (the 2-half kernel above re-runs the
+// whole score pass per column half = 2x K traffic and 2x score MMAs) -- and
+// stage softmax'd P into a double-buffered smem slab; warps 8-15 (consumers)
+// run P.V for the FULL 256 columns of the PREVIOUS tile in parallel (the
+// 4-frag oacc fits because consumers hold no score state). Producer-internal
+// softmax reductions use named barrier 1 (256 threads); one full barrier per
+// tile hands the slot over. Per-row math and accumulation order are IDENTICAL
+// to the 2-half kernel -> bit-exact streams; occupancy is the same 16 warps/SM
+// but the two phases overlap instead of serializing.
+#define TQ_AMG2_QA(p)      ((p) * 2048)          // [3 pairs][16 chunks][32][4] staged Q A-frags
+#define TQ_AMG2_PST(s, p)  (6144 + (s) * 3072 + (p) * 1024)  // [2 slots][3][8 tiles][32][4] P staging
+#define TQ_AMG2_WMAX       12288                 // [8 warps][16 rows] (producer scratch)
+#define TQ_AMG2_WSUM       12416                 // [8 warps][16 rows]
+#define TQ_AMG2_MST(p)     (12544 + (p) * 16)    // [3][16] running row max (producer)
+#define TQ_AMG2_LST(p)     (12592 + (p) * 16)    // [3][16] running row denom (producer)
+#define TQ_AMG2_ALPH(s, p) (12640 + (s) * 48 + (p) * 16)     // [2 slots][3][16] per-tile rescale
+#define TQ_AMG2_AMASK      12736                 // [16] ancestor slot bitmask per row
+#define TQ_AMG2_WORDS      12752
+#define TQ_ATTN_MMA_GROUP2_SMEM ((size_t)TQ_AMG2_WORDS * 4)
+
+static __device__ __forceinline__ void tq_bar_sync(int bar, int nthreads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(bar), "r"(nthreads));
+}
+
+__global__ void __launch_bounds__(512, 1) k_tq_spec_attn_group_mma2(
+    const uint32_t *qa_stage,
+    const uint8_t *kc4, const float *kq4s, const uint8_t *vc8, const float *vscale,
+    const float *ka, const float *va,
+    const int *pos_arr, const int *anc, int N,
+    int nh, int nkv, int hd, int kv_m, float *part) {
+    extern __shared__ uint32_t sm[];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int gr = lane >> 2, t4 = lane & 3;
+    const int prod = warp < 8;                   // producers score, consumers P.V
+    const int cw = warp & 7;                     // role-local warp id
+    const int base = pos_arr[0] - 1;
+    const int kv_head = blockIdx.x, chunk = blockIdx.y, nchunks = gridDim.y;
+    const int pair0 = kv_head * 3;
+    const size_t cstride4 = (size_t)(nkv * hd) >> 1, szstride = (size_t)nkv * 16;
+    const size_t astride = (size_t)kv_m;
+    const uint8_t *kcb4 = kc4 + (size_t)kv_head * (hd >> 1);
+    const float *ksz4 = q4s_adv(kq4s, (size_t)kv_head * 16);
+    const uint8_t *vcb8 = vc8 + (size_t)kv_head * hd;
+    const float *vscb = vscale + kv_head;
+    const float *kab = ka + (size_t)kv_head * hd;
+    const float *vab = va + (size_t)kv_head * hd;
+    float *wmax = (float *)(sm + TQ_AMG2_WMAX), *wsum = (float *)(sm + TQ_AMG2_WSUM);
+
+    for (int p = 0; p < 3; p++)
+        for (int i = tid; i < 2048; i += 512)
+            sm[TQ_AMG2_QA(p) + i] = qa_stage[(size_t)(pair0 + p) * 2048 + i];
+    if (tid < 16) {
+        uint32_t m = 0;
+        int node = tid & 7;
+        if (node < N) {
+            int len = pos_arr[node] - base;
+            const int *an = anc + node * TQ_SPEC_MAX_N;
+            for (int d = 0; d < len; d++) m |= 1u << an[d];
+        }
+        sm[TQ_AMG2_AMASK + tid] = m;
+        for (int p = 0; p < 3; p++) {
+            ((float *)(sm + TQ_AMG2_MST(p)))[tid] = TQ_AMM_NINF;
+            ((float *)(sm + TQ_AMG2_LST(p)))[tid] = 0.0f;
+        }
+    }
+    tq_bar_sync(0, 512);
+    const uint32_t amask_lo = sm[TQ_AMG2_AMASK + gr], amask_hi = sm[TQ_AMG2_AMASK + 8 + gr];
+
+    const float rsc = rsqrtf((float)hd);
+    const int nst_all = base >= 0 ? (base + 128) >> 7 : 0;
+    const int st_per = (nst_all + nchunks - 1) / nchunks;
+    const int st_lo = chunk * st_per;
+    int st_hi_t = (chunk + 1) * st_per;
+    const int st_hi = st_hi_t < nst_all ? st_hi_t : nst_all;
+    const int do_arch = (chunk == 0);
+    const int nst = st_hi > st_lo ? st_hi - st_lo : 0;
+    const int T = nst + do_arch;
+
+    // phase ph: producers build tile ph into slot ph&1; consumers drain tile
+    // ph-1 from slot (ph-1)&1. One full barrier per phase is the handoff. The
+    // roles run DISJOINT loops (same bar-0 count) so the consumer-only oacc
+    // does not inflate the producers' register allocation.
+    if (prod) {
+    for (int ph = 0; ph <= T; ph++) {
+        if (ph < T) {
+            const int it = ph, slot = ph & 1;
+            const int is_arch = (it == nst);
+            const int nwt = is_arch ? 1 : 8;
+            const int t0 = (st_lo + it) << 7;
+            float s[3][8];
+            if (cw < nwt) {
+                #pragma unroll
+                for (int p = 0; p < 3; p++)
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) s[p][j] = 0.0f;
+                if (is_arch) {
+                    const float *kr0 = kab + (size_t)gr * astride;
+                    const float *kr1 = kab + (size_t)(8 + gr) * astride;
+                    #pragma unroll
+                    for (int c = 0; c < 16; c++) {
+                        int d0 = 16 * c + 2 * t4;
+                        float2 x0 = *(const float2 *)(kr0 + d0);
+                        float2 x1 = *(const float2 *)(kr0 + d0 + 8);
+                        float2 y0 = *(const float2 *)(kr1 + d0);
+                        float2 y1 = *(const float2 *)(kr1 + d0 + 8);
+                        uint32_t b00 = tq_pack_bf16(x0.x, x0.y), b01 = tq_pack_bf16(x1.x, x1.y);
+                        uint32_t b10 = tq_pack_bf16(y0.x, y0.y), b11 = tq_pack_bf16(y1.x, y1.y);
+                        #pragma unroll
+                        for (int p = 0; p < 3; p++) {
+                            const uint32_t *a = &sm[TQ_AMG2_QA(p) + (c * 32 + lane) * 4];
+                            tq_mma_bf16_m16n8k16(&s[p][0], a, b00, b01);
+                            tq_mma_bf16_m16n8k16(&s[p][4], a, b10, b11);
+                        }
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 3; p++)
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            int col = 2 * t4 + (j & 1);
+                            uint32_t am = (j < 2) ? amask_lo : amask_hi;
+                            s[p][j]     = ((am >> col) & 1) ? s[p][j] * rsc : TQ_AMM_NINF;
+                            s[p][4 + j] = ((am >> (col + 8)) & 1) ? s[p][4 + j] * rsc : TQ_AMM_NINF;
+                        }
+                } else {
+                    const int tp = t0 + cw * 16;
+                    int p0 = tp + gr, p1 = tp + 8 + gr;
+                    const uint8_t *kr0 = kcb4 + (size_t)min(p0, base) * cstride4;
+                    const uint8_t *kr1 = kcb4 + (size_t)min(p1, base) * cstride4;
+                    const float *sz0 = q4s_adv(ksz4, (size_t)min(p0, base) * szstride);
+                    const float *sz1 = q4s_adv(ksz4, (size_t)min(p1, base) * szstride);
+                    #pragma unroll
+                    for (int g = 0; g < 8; g++) {
+                        float2 p0s = q4s_pair(sz0, 2 * g);
+                        float2 p1s = q4s_pair(sz1, 2 * g);
+                        #pragma unroll
+                        for (int cc = 0; cc < 2; cc++) {
+                            int c = 2 * g + cc;
+                            uint64_t w0 = __ldg((const unsigned long long *)(kr0 + 8 * c));
+                            uint64_t w1 = __ldg((const unsigned long long *)(kr1 + 8 * c));
+                            uint8_t a0 = (uint8_t)(w0 >> (8 * t4));
+                            uint8_t a8 = (uint8_t)(w0 >> (8 * t4 + 32));
+                            uint8_t b0v = (uint8_t)(w1 >> (8 * t4));
+                            uint8_t b8 = (uint8_t)(w1 >> (8 * t4 + 32));
+                            uint32_t kb00 = tq_pack_bf16(((float)(a0 & 15) - p0s.y) * p0s.x,
+                                                         ((float)(a0 >> 4) - p0s.y) * p0s.x);
+                            uint32_t kb01 = tq_pack_bf16(((float)(a8 & 15) - p0s.y) * p0s.x,
+                                                         ((float)(a8 >> 4) - p0s.y) * p0s.x);
+                            uint32_t kb10 = tq_pack_bf16(((float)(b0v & 15) - p1s.y) * p1s.x,
+                                                         ((float)(b0v >> 4) - p1s.y) * p1s.x);
+                            uint32_t kb11 = tq_pack_bf16(((float)(b8 & 15) - p1s.y) * p1s.x,
+                                                         ((float)(b8 >> 4) - p1s.y) * p1s.x);
+                            #pragma unroll
+                            for (int p = 0; p < 3; p++) {
+                                const uint32_t *a = &sm[TQ_AMG2_QA(p) + (c * 32 + lane) * 4];
+                                tq_mma_bf16_m16n8k16(&s[p][0], a, kb00, kb01);
+                                tq_mma_bf16_m16n8k16(&s[p][4], a, kb10, kb11);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 3; p++)
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) s[p][j] *= rsc;
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        int c0 = tp + 2 * t4 + (j & 1);
+                        #pragma unroll
+                        for (int p = 0; p < 3; p++) {
+                            if (c0 > base) s[p][j] = TQ_AMM_NINF;
+                            if (c0 + 8 > base) s[p][4 + j] = TQ_AMM_NINF;
+                        }
+                    }
+                }
+            }
+            for (int p = 0; p < 3; p++) {
+                float *mst = (float *)(sm + TQ_AMG2_MST(p));
+                float *lst = (float *)(sm + TQ_AMG2_LST(p));
+                float *alph = (float *)(sm + TQ_AMG2_ALPH(slot, p));
+                if (cw < nwt) {
+                    float lm_lo = fmaxf(fmaxf(s[p][0], s[p][1]), fmaxf(s[p][4], s[p][5]));
+                    float lm_hi = fmaxf(fmaxf(s[p][2], s[p][3]), fmaxf(s[p][6], s[p][7]));
+                    #pragma unroll
+                    for (int o = 1; o <= 2; o <<= 1) {
+                        lm_lo = fmaxf(lm_lo, __shfl_xor_sync(0xffffffffu, lm_lo, o));
+                        lm_hi = fmaxf(lm_hi, __shfl_xor_sync(0xffffffffu, lm_hi, o));
+                    }
+                    if (t4 == 0) { wmax[cw * 16 + gr] = lm_lo; wmax[cw * 16 + 8 + gr] = lm_hi; }
+                }
+                tq_bar_sync(1, 256);
+                if (cw == 0 && lane < 16) {
+                    float m_old = mst[lane], m_new = m_old;
+                    for (int w = 0; w < nwt; w++) m_new = fmaxf(m_new, wmax[w * 16 + lane]);
+                    alph[lane] = expf(m_old - m_new);
+                    mst[lane] = m_new;
+                }
+                tq_bar_sync(1, 256);
+                if (cw < nwt) {
+                    float mn_lo = mst[gr], mn_hi = mst[8 + gr];
+                    float p00 = expf(s[p][0] - mn_lo), p01 = expf(s[p][1] - mn_lo);
+                    float p02 = expf(s[p][2] - mn_hi), p03 = expf(s[p][3] - mn_hi);
+                    float p10 = expf(s[p][4] - mn_lo), p11 = expf(s[p][5] - mn_lo);
+                    float p12 = expf(s[p][6] - mn_hi), p13 = expf(s[p][7] - mn_hi);
+                    float ls_lo = p00 + p01 + p10 + p11;
+                    float ls_hi = p02 + p03 + p12 + p13;
+                    #pragma unroll
+                    for (int o = 1; o <= 2; o <<= 1) {
+                        ls_lo += __shfl_xor_sync(0xffffffffu, ls_lo, o);
+                        ls_hi += __shfl_xor_sync(0xffffffffu, ls_hi, o);
+                    }
+                    if (t4 == 0) { wsum[cw * 16 + gr] = ls_lo; wsum[cw * 16 + 8 + gr] = ls_hi; }
+                    if (!is_arch) {
+                        int p0c = t0 + cw * 16 + 2 * t4, p1c = p0c + 8;
+                        float v00 = vscb[(size_t)min(p0c, base) * nkv];
+                        float v01 = vscb[(size_t)min(p0c + 1, base) * nkv];
+                        float v10 = vscb[(size_t)min(p1c, base) * nkv];
+                        float v11 = vscb[(size_t)min(p1c + 1, base) * nkv];
+                        p00 *= v00; p01 *= v01; p02 *= v00; p03 *= v01;
+                        p10 *= v10; p11 *= v11; p12 *= v10; p13 *= v11;
+                    }
+                    uint32_t *pst = &sm[TQ_AMG2_PST(slot, p) + (cw * 32 + lane) * 4];
+                    pst[0] = tq_pack_bf16(p00, p01);
+                    pst[1] = tq_pack_bf16(p02, p03);
+                    pst[2] = tq_pack_bf16(p10, p11);
+                    pst[3] = tq_pack_bf16(p12, p13);
+                }
+                tq_bar_sync(1, 256);
+                if (cw == 0 && lane < 16) {
+                    float l = lst[lane] * alph[lane];
+                    for (int w = 0; w < nwt; w++) l += wsum[w * 16 + lane];
+                    lst[lane] = l;
+                }
+                // wmax/wsum reused by the next pair: producers-only barrier
+                tq_bar_sync(1, 256);
+            }
+        }
+        tq_bar_sync(0, 512);                      // slot handoff (P + alpha visible)
+    }
+    // m/l partials from the producers' running state (threads 0..15; same
+    // threads that wrote mst/lst, so no extra sync is needed).
+    for (int p = 0; p < 3; p++) {
+        float *mst = (float *)(sm + TQ_AMG2_MST(p));
+        float *lst = (float *)(sm + TQ_AMG2_LST(p));
+        int head_lo = 6 * kv_head + 2 * p, head_hi = head_lo + 1;
+        float *ps = part + (size_t)(head_lo * nchunks + chunk) * TQ_AMM_PART_F;
+        float *ph = part + (size_t)(head_hi * nchunks + chunk) * TQ_AMM_PART_F;
+        if (tid < 8)       { ps[tid] = mst[tid]; ps[16 + tid] = lst[tid]; }
+        else if (tid < 16) { ph[tid - 8] = mst[tid]; ph[16 + tid - 8] = lst[tid]; }
+    }
+    } else {
+    float oacc[3][4][4];
+    #pragma unroll
+    for (int p = 0; p < 3; p++)
+        #pragma unroll
+        for (int f = 0; f < 4; f++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) oacc[p][f][j] = 0.0f;
+    for (int ph = 0; ph <= T; ph++) {
+        if (ph > 0) {
+            const int it = ph - 1, slot = (ph - 1) & 1;
+            const int is_arch = (it == nst);
+            const int nwt = is_arch ? 1 : 8;
+            const int t0 = (st_lo + it) << 7;
+            #pragma unroll
+            for (int p = 0; p < 3; p++) {
+                const float *alph = (const float *)(sm + TQ_AMG2_ALPH(slot, p));
+                float a_lo = alph[gr], a_hi = alph[8 + gr];
+                #pragma unroll
+                for (int f = 0; f < 4; f++) {
+                    oacc[p][f][0] *= a_lo; oacc[p][f][1] *= a_lo;
+                    oacc[p][f][2] *= a_hi; oacc[p][f][3] *= a_hi;
+                }
+            }
+            for (int tt = 0; tt < nwt; tt++) {
+                #pragma unroll
+                for (int f = 0; f < 4; f++) {
+                    int col = cw * 32 + f * 8 + gr;
+                    uint32_t b0, b1;
+                    if (is_arch) {
+                        int r0 = 2 * t4;
+                        b0 = tq_pack_bf16(vab[(size_t)r0 * astride + col],
+                                          vab[(size_t)(r0 + 1) * astride + col]);
+                        b1 = tq_pack_bf16(vab[(size_t)(r0 + 8) * astride + col],
+                                          vab[(size_t)(r0 + 9) * astride + col]);
+                    } else {
+                        int r0 = t0 + tt * 16 + 2 * t4;
+                        b0 = tq_pack_bf16(
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0, base) * (size_t)(nkv * hd) + col]),
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0 + 1, base) * (size_t)(nkv * hd) + col]));
+                        b1 = tq_pack_bf16(
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0 + 8, base) * (size_t)(nkv * hd) + col]),
+                            tq_e4m3_dec_fast(vcb8[(size_t)min(r0 + 9, base) * (size_t)(nkv * hd) + col]));
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 3; p++) {
+                        const uint32_t *pa = &sm[TQ_AMG2_PST(slot, p) + (tt * 32 + lane) * 4];
+                        uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
+                        tq_mma_bf16_m16n8k16(oacc[p][f], a, b0, b1);
+                    }
+                }
+            }
+        }
+        tq_bar_sync(0, 512);                      // slot handoff (P + alpha visible)
+    }
+    // O-column partials (full 256-col window per pair); same slab layout and
+    // values as the 2-half kernel.
+    for (int p = 0; p < 3; p++) {
+        int head_lo = 6 * kv_head + 2 * p, head_hi = head_lo + 1;
+        float *ps = part + (size_t)(head_lo * nchunks + chunk) * TQ_AMM_PART_F;
+        float *ph = part + (size_t)(head_hi * nchunks + chunk) * TQ_AMM_PART_F;
+        float *po = ps + 32, *qo = ph + 32;
+        #pragma unroll
+        for (int f = 0; f < 4; f++) {
+            int col = cw * 32 + f * 8 + 2 * t4;
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                po[(size_t)gr * 256 + col + j] = oacc[p][f][j];
+                qo[(size_t)gr * 256 + col + j] = oacc[p][f][2 + j];
+            }
+        }
+    }
+    }
+}
+
 // Merge phase: flash-decoding combine of one head's chunk partials (m* = max m_c;
 // l*/O* = sum exp(m_c - m*) {l_c, O_c}) + the same epilogue as the single-chunk
 // path. Block = 256 threads (one output column each), rows looped; sm9 = 9-float
@@ -1991,23 +2318,22 @@ static int attn_mma_pair_ok(int N) {
     return en && N <= 8 && (g_qwen.nh & 1) == 0 && ((g_qwen.nh / g_qwen.nkv) & 1) == 0;
 }
 
-// GROUP mode (whole kv group per item, staged Q, col-halved P.V) for the
-// standalone launcher. MODE 3 only, needs the exact production GQA shape.
-// MEASURED (PRO 6000 / 188 SM, prod Q4, legacy branch): loses to the pair path
-// below ~190k (128k 31.4 vs 29.4 -- fewer, heavier items at 2 CTA/SM occupancy)
-// and wins past it (200k 35.0 vs 39.8 = -12%, 245k 37.2 vs 39.7), so the auto
-// gate enables it from base >= 196608 there. On the 5090 (170 SM, 2026-07-08
-// sweep) the balance flips: group wins at EVERY measured base from 32k up
-// (32k 23.8 vs 24.2, 98k 28.3 vs 30.3, 128k 31.3 vs 33.9, 225k 38.3 vs 42.0
-// ms/round; the pair cliff never appears) -> auto threshold 32768 on <=176 SM.
-// TQ_ATTN_MMA_GROUP=1/0 forces always/never; TQ_ATTN_MMA_GROUP_MIN moves it.
+// GROUP mode (whole kv group per item, staged Q) for the standalone launcher.
+// MODE 3 only, needs the exact production GQA shape. HISTORY: the 2-half group
+// kernel beat the pair path only past ~196k on the 188-SM PRO 6000 and from
+// ~32k on the 170-SM 5090 (2026-07-08 sweeps; SM-aware thresholds). With the
+// GROUP2 producer/consumer kernel (2026-07-09, default) the group mode wins
+// from 32k up on BOTH dies -- 5090: 32k 23.8 vs 24.2, 128k 26.5 vs 33.9,
+// 250k 30.8 vs 40.2; PRO 6000: 32k 22.7 vs 23.8, 245k 28.0 vs 34.7 ms/round
+// -- so the auto threshold is a flat 32768. TQ_ATTN_MMA_GROUP=1/0 forces
+// always/never; TQ_ATTN_MMA_GROUP_MIN moves it.
 static int attn_mma_group_ok(int N, int mode, int host_base) {
     static int en = -2, gmin = -1;
     if (en == -2) {
         const char *e = getenv("TQ_ATTN_MMA_GROUP");
         en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;           // -1 = auto
         const char *m = getenv("TQ_ATTN_MMA_GROUP_MIN");
-        gmin = (m && *m) ? atoi(m) : (paged_sm_count() <= 176 ? 32768 : 196608);
+        gmin = (m && *m) ? atoi(m) : 32768;
     }
     if (en == 0) return 0;
     if (en == -1 && host_base < gmin) return 0;
@@ -2020,6 +2346,29 @@ static int ensure_attn_qa_stage(void) {
     if (g_attn_qa_stage) return 0;
     size_t words = (size_t)(g_qwen.nh / 2) * 2048;
     return cudaMalloc(&g_attn_qa_stage, words * 4) == cudaSuccess ? 0 : -1;
+}
+
+// GROUP2 (producer/consumer single-pass kernel above): DEFAULT ON (2026-07-09
+// A/B, 200 rounds each, ms/round vs the 2-half group kernel):
+//   5090 / 170 SM: 32k 23.8->22.8, 64k 26.4->23.9, 128k 31.4->26.5,
+//                  200k 36.7->29.1 (->27.2 with the one-wave nc3), 250k 40.2->30.8
+//   PRO 6000 / 188 SM: 128k 28.8->25.5, 200k 33.3->27.9, 245k 34.7->28.0
+// Streams bit-exact vs the group kernel at matched nc3 (@128k stream_dump
+// diff = 0). TQ_ATTN_MMA_GROUP2=0 reverts to the 2-half kernel; the 51 KB
+// dynamic smem needs a one-time opt-in.
+static int attn_mma_group2_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("TQ_ATTN_MMA_GROUP2");
+        en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : 1;
+    }
+    if (!en) return 0;
+    static int smem_ok = -1;
+    if (smem_ok < 0)
+        smem_ok = cudaFuncSetAttribute(k_tq_spec_attn_group_mma2,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       TQ_ATTN_MMA_GROUP2_SMEM) == cudaSuccess;
+    return smem_ok;
 }
 
 static int launch_attn_tree_mma(float *out, const float *q_proj_base,
@@ -2044,11 +2393,30 @@ static int launch_attn_tree_mma(float *out, const float *q_proj_base,
         k_tq_attn_qa_stage<<<g_qwen.nh / 2, 256, 0, g_qwen.stream>>>(
             g_attn_qa_stage, q_proj_base, q_norm_w, pos_arr, N, g_qwen.nh, g_qwen.hd,
             q_stride, g_qwen.eps, g_qwen.rope_theta);
-        k_tq_spec_attn_group_mma<<<dim3(g_qwen.nkv, nc3), 256, TQ_ATTN_MMA_GROUP_SMEM,
-                                   g_qwen.stream>>>(
-            g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
-            pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
-            g_qwen.d_attn_scores);
+        if (attn_mma_group2_enabled()) {
+            // 512-thread CTAs run at 1 CTA/SM, so the sweet spot is ONE full
+            // wave: nkv * nc3 == SM count (200k sweep on 170 SM: nc3 42 -> 27.2
+            // ms/round vs 48 -> 30.9 (1.13-wave tail) vs 24 -> 30.6 (half the
+            // GPU idle)). TQ_ATTN_MMA_NCHUNKS still overrides via nchunks*3.
+            if (!getenv("TQ_ATTN_MMA_NCHUNKS")) {
+                nc3 = paged_sm_count() / g_qwen.nkv;
+                if (nc3 < 2) nc3 = 2;
+                if (nc3 > 128) nc3 = 128;
+                int slab_cap3 = (int)(((size_t)TQ_ATTN_SCORE_SLOTS * g_qwen.max_seq) /
+                                      ((size_t)g_qwen.nh * TQ_AMM_PART_F));
+                if (nc3 > slab_cap3) nc3 = slab_cap3 > 0 ? slab_cap3 : 1;
+            }
+            k_tq_spec_attn_group_mma2<<<dim3(g_qwen.nkv, nc3), 512, TQ_ATTN_MMA_GROUP2_SMEM,
+                                        g_qwen.stream>>>(
+                g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
+                pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
+                g_qwen.d_attn_scores);
+        } else
+            k_tq_spec_attn_group_mma<<<dim3(g_qwen.nkv, nc3), 256, TQ_ATTN_MMA_GROUP_SMEM,
+                                       g_qwen.stream>>>(
+                g_attn_qa_stage, k_cache4, k_q4s, v_cache8, v_scale, k_arch, v_arch,
+                pos_arr, anc, N, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.nkv * g_qwen.hd,
+                g_qwen.d_attn_scores);
         k_tq_spec_attn_tree_mma_merge<<<dim3(g_qwen.nh, N), 256, 0, g_qwen.stream>>>(
             out, q_proj_base, N, g_qwen.nh, g_qwen.hd, q_stride, out_stride,
             nc3, g_qwen.d_attn_scores);
@@ -15438,26 +15806,24 @@ static int spec_state_skip_enabled(void) {
 static int g_spec_persist_nsegs = 0;   // segments uploaded for this round (0 = depth waves)
 
 // Can this full-attention layer's attn half run through the persistent kernel?
-// CONTEXT GATE (2026-07-08, measured PRO 6000 / 188 SM, prod Q4 + pair): past
-// ~96k the standalone-kernel (legacy) branch beats the persistent part2 -- its
-// attention kernel compiles to 102 regs with its own occupancy instead of
-// sharing the 128-reg __launch_bounds__(256,2) budget (which is already
-// spilling, STACK:192), and at long ctx the attn phase dominates the part:
-// 128k 29.8 -> 29.4, 200k 41.4 -> 39.7 ms/round. Short ctx keeps the
-// persistent overlap win there (32k: legacy +0.16 ms). On the 5090 (170 SM,
-// 2026-07-08 sweep) the persistent overlap never wins: legacy is ahead at
-// every base (32k -0.19, 64k -0.59, 128k -0.88 ms/round; 1k-16k within noise)
-// -> auto threshold 32768 on <=176 SM. Free-run trajectories are identical
-// across the flip (same kernels, same math -- scheduling only).
-// TQ_SPEC_ATTN_LEGACY=1/0 forces always/never; TQ_SPEC_ATTN_LEGACY_MIN moves
-// the auto threshold.
+// CONTEXT GATE: past the threshold the standalone-kernel (legacy) branch beats
+// the persistent part2 -- its attention kernel gets its own occupancy instead
+// of sharing the 128-reg __launch_bounds__(256,2) budget (already spilling,
+// STACK:192), and the branch is what unlocks the group/GROUP2 attention items.
+// MEASURED: on the 5090 legacy wins at every base from 32k (2026-07-08); on
+// the PRO 6000 the persistent overlap won below ~96k against PAIR, but with
+// GROUP2 in the standalone branch (2026-07-09) legacy+group2 wins from 32k
+// there too (32k 22.7 vs 23.8, 64k 23.5 vs 25.8, 98k 25.8 vs 27.1 ms/round)
+// -> flat 32768 default. Free-run trajectories are identical across the flip
+// at matched kernels (scheduling only). TQ_SPEC_ATTN_LEGACY=1/0 forces
+// always/never; TQ_SPEC_ATTN_LEGACY_MIN moves the auto threshold.
 static int spec_persist_attn_ok(tq_layer_t *l) {
     static int legacy = -2, legacy_min = -1;
     if (legacy == -2) {
         const char *e = getenv("TQ_SPEC_ATTN_LEGACY");
         legacy = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;      // -1 = auto
         const char *m = getenv("TQ_SPEC_ATTN_LEGACY_MIN");
-        legacy_min = (m && *m) ? atoi(m) : (paged_sm_count() <= 176 ? 32768 : 98304);
+        legacy_min = (m && *m) ? atoi(m) : 32768;
     }
     if (legacy == 1) return 0;
     if (legacy == -1 && g_spec_attn_base_host >= legacy_min) return 0;
