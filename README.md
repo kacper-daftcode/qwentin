@@ -40,7 +40,7 @@ E2M1 86.46 ≈ NVFP4 85.78.)
 - **MTP speculative decoding.** A multi-token-prediction covering tree + batched FP6 verify
   (each weight read once for the whole tree) → real single-stream speedup at accept-length ~2.6–3.0.
 - **Wide prefill.** A dedicated N-wide prefill path — wide FP6 GEMM + chunkwise-parallel
-  gated-DeltaNet + tensor-core wide attention — makes cold prompts **2–3× faster** at any
+  gated-DeltaNet + tensor-core wide attention — makes cold prompts **2–4× faster** at any
   length (works at Q4-KV/256k; the old 16k cap is gone). ON by default in the server, fully
   integrated with spec-decode and the prefix cache.
 - **Hybrid attention.** Qwen3.6 mixes 48 gated-DeltaNet *linear-attention* layers (O(1) state,
@@ -256,7 +256,7 @@ the quality ceiling).
 ## Verify
 
 The verify tools take the same `--tqf` / `--model-dir` / `--lib` paths as the servers
-(needle_check reads them from `TQ_MODEL_TQF` / `TQ_LIB`):
+(needle_check reads them from `TQ_MODEL_TQF` / `TQ_MODEL_DIR` / `TQ_LIB`):
 
 ```bash
 # End-to-end MTP spec-decode (tok/s, accept-length, divergence vs greedy)
@@ -284,12 +284,13 @@ CUDA_VISIBLE_DEVICES=0 TQ_CTX=16384 \
 ## Repository layout
 
 ```
-src/forward_qwen.cu        the Qwen3.6 engine: all kernels + C ABI, one CUDA TU (~18k lines)
+src/forward_qwen.cu        the Qwen3.6 engine: all kernels + C ABI, one CUDA TU (~22k lines)
 tools/serve_openai.py      single-stream OpenAI server (prefix cache, tools, reasoning split)
 tools/serve_batched.py     multi-client OpenAI server (paged KV + continuous batching)
 tools/mtp_spec_smoke.py    spec-decode harness (also exports prefill() used by the server)
 tools/bench_rounds.py      decode-only spec-round benchmark (ms/round, net tok/s; nsys hook)
 tools/accept_probe.py      teacher-forced accept probe (degeneration-free draft-quality A/B)
+tools/persist_phases.py    phase-clock breakdown of the persistent kernel (work vs barrier tails)
 tools/serve_smoke.py       2-turn cold + prefix-cache E2E smoke against a running server
 tools/paged_smoke.py       batched/paged decode parity + throughput harness
 tools/needle_check.py      long-context retrieval gate
