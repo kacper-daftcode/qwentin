@@ -226,6 +226,7 @@ CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
 | `TQ_ATTN_MMA_PAIR=0` | disable GQA-paired attention items (default on; bit-identical either way) |
 | `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN` | context thresholds of the long-ctx attention auto-gates (default 8k for both; below them the persistent/pair path keeps short contexts bit-identical) |
 | `TQ_ATTN_MMA_GROUP2=0` | revert the producer/consumer group-attention kernel to the 2-half variant (default on) |
+| `TQ_WIDE_CONV=0` | revert the wide prefill's chunk-parallel conv update to the serial per-token loop (default on; bit-identical either way) |
 
 ## Verify
 
