@@ -9,7 +9,9 @@ with TQ_KV_FP8=1 every prefix row the answer attends to is E4M3). One process =
 one KV mode; run twice (TQ_KV_FP8=0/1) and compare the per-depth columns.
 
 Env: TQ_KV_FP8 (engine flag, also used for labels), TQ_CTX (>= ~12k),
-     DEPTHS (default "1000,4000,8000,11000"), GEN (answer tokens, default 24).
+     DEPTHS (default "1000,4000,8000,11000"), GEN (answer tokens, default 24),
+     TQ_MODEL_TQF / TQ_LIB / TQ_MODEL_DIR (.tqf path, engine .so, HF checkpoint
+     dir for the tokenizer).
 
 Usage:
     CUDA_VISIBLE_DEVICES=7 TQ_CTX=16384 python3 tools/needle_check.py
@@ -24,18 +26,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mtp_spec_smoke import load_lib, Eng, prefill, ck  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TQF = os.environ.get("TQ_MODEL_TQF", "/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
-LIB = os.environ.get("TQ_LIB", "/workspace/qwentin/build-qwen/libforward_qwen.so")
+LIB = os.environ.get("TQ_LIB", os.path.join(REPO, "build-qwen", "libforward_qwen.so"))
+MODEL_DIR = os.environ.get("TQ_MODEL_DIR", "/workspace/models/Qwen3.6-27B")
 DEPTHS = [int(x) for x in os.environ.get("DEPTHS", "1000,4000,8000,11000").split(",")]
 GEN = int(os.environ.get("GEN", "24"))
 HAYSTACK_TOKENS = int(os.environ.get("HAYSTACK_TOKENS", "11500"))
 CORPUS = os.environ.get("CORPUS",
-    "/workspace/qwentin/src/forward_qwen.cu").split(",")
+    os.path.join(REPO, "src", "forward_qwen.cu")).split(",")
 # long-context haystacks (>= ~12k tokens): widen the corpus with repo docs +
 # tools sources until HAYSTACK_TOKENS is covered (deterministic file order);
 # the engine source itself (~210k tokens) unlocks 240k+ haystacks
-_EXTRA = (sorted(__import__("glob").glob("/workspace/qwentin/tools/*.py")) +
-          ["/workspace/qwentin/src/forward_qwen.cu"])
+_EXTRA = (sorted(__import__("glob").glob(os.path.join(REPO, "tools", "*.py"))) +
+          [os.path.join(REPO, "src", "forward_qwen.cu")])
 # distinct code per depth so a stale/wrong retrieval cannot pass by accident
 CODES = {1000: 471, 4000: 832, 8000: 159, 11000: 604}
 
@@ -44,7 +48,7 @@ QUESTION = ("\n\nPytanie: Jaki jest sekretny kod projektu wspomniany wczesniej "
             "Sekretny kod projektu to")
 
 mode = "fp8" if os.environ.get("TQ_KV_FP8", "0") not in ("", "0") else "fp32"
-tok = AutoTokenizer.from_pretrained("/workspace/models/Qwen3.6-27B", trust_remote_code=True)
+tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
 _texts = [open(f).read() for f in CORPUS if os.path.exists(f)]
 corpus_ids = tok("\n\n".join(_texts), add_special_tokens=False).input_ids
 for f in _EXTRA:

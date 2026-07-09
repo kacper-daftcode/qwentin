@@ -169,26 +169,42 @@ cmake --build build-qwen --target qwentin-forward-qwen -j
 ## Convert a model
 
 ```bash
-# FP6 (E2M3) block-scaled weights — the production format.
-python tools/convert_qwen_tqf.py /path/to/Qwen3.6-27B \
+# FP6 (E2M3) block-scaled weights + MTP head — the production format (~22.6 GB).
+# ALL of --block-scaled always, --block-layout qmma-e2m3 and TQ_EMIT_MTP=1 are
+# required: --block-scaled defaults to `auto`, which on a BF16 checkpoint silently
+# falls back to plain global-scale FP8 (ignoring --block-layout), and without
+# TQ_EMIT_MTP=1 the MTP head is dropped (no spec-decode).
+# Optional: TQ_GPU_PACK=1 quantizes/packs on the GPU via the built
+# libforward_qwen.so (much faster than the ~13 min numpy path).
+TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.6-27B \
     -o /path/to/qwen3_6-27b-e2m3-mtp.tqf \
-    --block-layout qmma-e2m3 --block-scale-policy pow2
+    --block-scaled always --block-layout qmma-e2m3 --block-scale-policy pow2
 ```
 
 `.tqf` is qwentin's on-disk format: quantized weights in the QMMA fragment layout, the
 non-quant tensors (embeddings, norms, conv1d) in bf16, and the MTP draft head for spec-decode.
-Inspect a file with `python tools/inspect_tqf.py model.tqf`.
+Verify with `python3 tools/inspect_tqf.py model.tqf` before serving: a production file
+reports `block_scaled_e2m3: True` and `has_mtp_section: True` (header flags `0x53d`).
+If you see `flags: 0x1d` / `has_mtp_section: False` (and ~28 GB instead of ~22.6), the
+file is plain FP8 without the MTP head — reconvert with the exact flags above.
 
 ## Serve (OpenAI API)
 
+### Single-user, latency-optimized (FP6 + MTP spec-decode)
+
 ```bash
-# Production: FP6 + 4-bit KV, 256k context. The wide+MMA cold-prefill path is
-# ON by default (2-3x faster first turns at any length; --no-wide-prefill or
+# Production: FP6 + 4-bit KV, 256k context, MTP spec-decode (needs the MTP
+# section in the .tqf — see "Convert a model"). The wide+MMA cold-prefill path
+# is ON by default (2-3x faster first turns at any length; --no-wide-prefill or
 # TQ_WIDE_PREFILL=0 reverts to the 16-token chunked baseline). TQ_EMBED_FP8=2
 # (6-bit embed table) is required for the full 256k window on a 32 GB card.
+# --model-dir is the original HF checkpoint dir (tokenizer + chat template);
+# run from the repo root so the relative --lib path resolves.
 CUDA_VISIBLE_DEVICES=0 TQ_CTX=262144 TQ_KV_Q4=1 TQ_EMBED_FP8=2 \
     python3 tools/serve_openai.py --port 8000 --no-thinking \
-    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf
+    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf \
+    --model-dir /path/to/Qwen3.6-27B \
+    --lib build-qwen/libforward_qwen.so
 ```
 
 ```bash
@@ -202,14 +218,23 @@ Per-request stats are returned under `x_qwentin` (prefill seconds, accept-length
 prefix-cache hit). `--no-thinking` defaults `enable_thinking=false` (recommended for agents — it
 keeps the prefix cache valid across turns).
 
-For **many concurrent clients**, use the batched server (paged KV + continuous batching); add
-`TQ_W_E2M1=1` for the 4-bit throughput tier (more clients, faster):
+### Batch-optimized: many concurrent clients (paged KV + continuous batching)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
+# Ship config for one 32 GB card: 12 slots over a shared paged pool
+# (--num-blocks 1536 x --page 128 = 196k pooled KV tokens next to the FP6
+# weights), each client up to TQ_CTX tokens. Without TQ_CTX the engine caps
+# every client at 8192 tokens.
+CUDA_VISIBLE_DEVICES=0 TQ_CTX=131072 TQ_KV_Q4=1 \
     python3 tools/serve_batched.py --port 8000 \
-    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf
+    --max-slots 12 --num-blocks 1536 \
+    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf \
+    --model-dir /path/to/Qwen3.6-27B
 ```
+
+Add `TQ_W_E2M1=1` in front for the opt-in 4-bit (E2M1) throughput tier — more clients
+(~4 @128k) and ~17% more aggregate tok/s, at NVFP4-level quality (the FP6 default keeps
+the quality ceiling).
 
 `serve_batched.py` admits/decodes/detaches N streams against a shared paged KV pool;
 `serve_openai.py` stays the latency-optimized single-stream path (FP6, the quality default).
@@ -230,19 +255,30 @@ CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_W_E2M1=1 \
 
 ## Verify
 
+The verify tools take the same `--tqf` / `--model-dir` / `--lib` paths as the servers
+(needle_check reads them from `TQ_MODEL_TQF` / `TQ_LIB`):
+
 ```bash
 # End-to-end MTP spec-decode (tok/s, accept-length, divergence vs greedy)
-CUDA_VISIBLE_DEVICES=0 python3 tools/mtp_spec_smoke.py --prompt-tokens 1024 --gen 128
+CUDA_VISIBLE_DEVICES=0 python3 tools/mtp_spec_smoke.py --prompt-tokens 1024 --gen 128 \
+    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf --model-dir /path/to/Qwen3.6-27B \
+    --lib build-qwen/libforward_qwen.so
 
 # Decode-only round benchmark: prefill once, time M production spec-rounds
 # (ms/round, net tok/s, accept-length; --profile brackets the timed rounds
 # for `nsys profile -c cudaProfilerApi`). TQ_EMBED_FP8=2 keeps TQ_CTX=262144
 # inside 32 GB on a 5090.
 CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=262144 TQ_EMBED_FP8=2 \
-    python3 tools/bench_rounds.py --prompt-tokens 65536 --rounds 200
+    python3 tools/bench_rounds.py --prompt-tokens 65536 --rounds 200 \
+    --tqf /path/to/qwen3_6-27b-e2m3-mtp.tqf --model-dir /path/to/Qwen3.6-27B \
+    --lib build-qwen/libforward_qwen.so
 
 # Needle-in-a-haystack retrieval quality at long context
-CUDA_VISIBLE_DEVICES=0 TQ_CTX=16384 python3 tools/needle_check.py
+CUDA_VISIBLE_DEVICES=0 TQ_CTX=16384 \
+    TQ_MODEL_TQF=/path/to/qwen3_6-27b-e2m3-mtp.tqf \
+    TQ_MODEL_DIR=/path/to/Qwen3.6-27B \
+    TQ_LIB=build-qwen/libforward_qwen.so \
+    python3 tools/needle_check.py
 ```
 
 ## Repository layout
