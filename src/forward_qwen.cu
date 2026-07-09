@@ -6640,6 +6640,43 @@ __global__ void k_tq_linear_conv_update_b_fork(float *out, float *state, const f
     outn[i] = sum / (1.0f + expf(-sum));
 }
 
+// Chunk-parallel conv update for the WIDE prefill: position p of the chunk
+// reads x[p-3..p] straight from the chunk buffer (positions before the chunk
+// come from the incoming conv state), so all n positions run in ONE launch
+// (grid (channels/256, n)) instead of n serial per-token launches (measured
+// 9.5% of a 64k prefill = 3.1M launches of 1.3 us). blockIdx.y == n writes the
+// NEW state (the last kernel_size-1 x columns + padding from the old state for
+// short chunks); it touches only `state`, no out column, and no other block
+// reads state, so the in-launch order is free. Per-position math is identical
+// to k_tq_linear_conv_update -> bit-exact. out must NOT alias x (the serial
+// kernel overwrote x[p] after use; parallel positions still need it).
+__global__ void k_tq_linear_conv_update_wide(float *out, float *state, const float *x,
+                                             const uint16_t *conv_weight,
+                                             int channels, int kernel_size, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels) return;
+    int pos = blockIdx.y;
+    if (pos == n) {                                // new state = the last K inputs
+        float tail[8];                             // kernel_size <= 8 (host-gated)
+        for (int j = 0; j < kernel_size; j++) {
+            int k = n - kernel_size + j;           // x index feeding new s[j]
+            tail[j] = (k >= 0) ? x[(size_t)k * channels + i]
+                               : state[(size_t)i * kernel_size + (kernel_size + k)];
+        }
+        for (int j = 0; j < kernel_size; j++) state[(size_t)i * kernel_size + j] = tail[j];
+        return;
+    }
+    float sum = 0.0f;
+    #pragma unroll 4
+    for (int j = 0; j < kernel_size; j++) {
+        int k = pos - (kernel_size - 1) + j;       // absolute chunk index of tap j
+        float v = (k >= 0) ? x[(size_t)k * channels + i]
+                           : state[(size_t)i * kernel_size + (kernel_size + k)];
+        sum += v * tq_bf16_to_float(conv_weight[i * kernel_size + j]);
+    }
+    out[(size_t)pos * channels + i] = sum / (1.0f + expf(-sum));
+}
+
 // Fused-tree conv update: processes ALL depth groups in a single launch.
 // Blocks self-synchronise via a global atomic counter so that depth d waits
 // for every block at depths 0..d-1 before reading parent conv state.
@@ -18975,6 +19012,7 @@ static float *g_wide_h = NULL, *g_wide_q = NULL, *g_wide_k = NULL, *g_wide_v = N
 static float *g_wide_norm = NULL, *g_wide_resid = NULL, *g_wide_o = NULL, *g_wide_pn = NULL;
 static float *g_wide_gate = NULL, *g_wide_up = NULL, *g_wide_mh = NULL, *g_wide_down = NULL;
 static float *g_wide_qkv = NULL, *g_wide_z = NULL, *g_wide_b = NULL, *g_wide_a = NULL, *g_wide_lcore = NULL;
+static float *g_wide_conv = NULL;      // conv outputs (chunk-parallel conv must not run in place)
 static int   *g_wide_pos = NULL;
 static int    g_wide_cap = 0;
 static int    g_wide_capture_mode = 0;   // when set: skip the pos-setup host sync (graph capture)
@@ -18984,7 +19022,7 @@ static int ensure_wide_prefill_buffers(int N) {
     float **bufs[] = {&g_wide_h, &g_wide_q, &g_wide_k, &g_wide_v, &g_wide_core, &g_wide_norm,
                       &g_wide_resid, &g_wide_o, &g_wide_pn, &g_wide_gate, &g_wide_up,
                       &g_wide_mh, &g_wide_down, &g_wide_qkv, &g_wide_z, &g_wide_b,
-                      &g_wide_a, &g_wide_lcore};
+                      &g_wide_a, &g_wide_lcore, &g_wide_conv};
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
         if (*bufs[i]) cudaFree(*bufs[i]);
         *bufs[i] = NULL;
@@ -19009,6 +19047,7 @@ static int ensure_wide_prefill_buffers(int N) {
     int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
     int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
     if (cudaMalloc(&g_wide_qkv,  (size_t)N * conv_dim * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_wide_conv, (size_t)N * conv_dim * sizeof(float)) != cudaSuccess) return -1;
     if (cudaMalloc(&g_wide_z,    (size_t)N * value_dim * sizeof(float)) != cudaSuccess) return -1;
     if (cudaMalloc(&g_wide_b,    (size_t)N * lvh * sizeof(float)) != cudaSuccess) return -1;
     if (cudaMalloc(&g_wide_a,    (size_t)N * lvh * sizeof(float)) != cudaSuccess) return -1;
@@ -19201,19 +19240,32 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
                 if ((ret = wide_proj(&l->linear_in_z, g_wide_z, n)) != 0) return -60;
                 if ((ret = wide_proj(&l->linear_in_b, g_wide_b, n)) != 0) return -60;
                 if ((ret = wide_proj(&l->linear_in_a, g_wide_a, n)) != 0) return -60;
-                // conv stays per-token (cheap ~3%, advances conv state sequentially); it only
-                // depends on conv_state (not the core), so all-conv-then-chunkwise-core is
-                // equivalent to the interleaved per-token loop.
-                for (int i = 0; i < n; i++)
-                    k_tq_linear_conv_update<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
-                        g_wide_qkv + (size_t)i * conv_dim, l->d_linear_conv_state,
-                        g_wide_qkv + (size_t)i * conv_dim, l->d_linear_conv1d, conv_dim,
-                        g_qwen.linear_conv_kernel_dim);
+                // Chunk-parallel conv (one launch; position taps read the raw chunk buffer,
+                // block y==n refreshes the state) -- bit-exact vs the old n serial per-token
+                // launches, which were 9.5% of a 64k prefill (3.1M launches x 1.3 us) purely
+                // from launch/serialization overhead. kernel_size > 8 falls back to serial.
+                static int wide_conv_on = -1;
+                if (wide_conv_on < 0) {
+                    const char *e = getenv("TQ_WIDE_CONV");
+                    wide_conv_on = (e && *e) ? (atoi(e) != 0) : 1;
+                }
+                if (wide_conv_on && g_qwen.linear_conv_kernel_dim <= 8) {
+                    k_tq_linear_conv_update_wide<<<dim3((conv_dim + 255) / 256, n + 1), 256, 0,
+                                                   g_qwen.stream>>>(
+                        g_wide_conv, l->d_linear_conv_state, g_wide_qkv, l->d_linear_conv1d,
+                        conv_dim, g_qwen.linear_conv_kernel_dim, n);
+                } else {
+                    for (int i = 0; i < n; i++)
+                        k_tq_linear_conv_update<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
+                            g_wide_conv + (size_t)i * conv_dim, l->d_linear_conv_state,
+                            g_wide_qkv + (size_t)i * conv_dim, l->d_linear_conv1d, conv_dim,
+                            g_qwen.linear_conv_kernel_dim);
+                }
                 // ONE chunkwise-parallel gated-delta core over all n tokens, replacing the 128
                 // serial per-token k_tq_linear_decode_core_gated launches (was 73.9% of prefill;
                 // 15.3x faster, max diff 9.9e-6 vs per-token). config ck=8/nstripe=2/g=8.
                 if ((ret = launch_deltanet_chunk_hs(8, 2, 8, g_wide_lcore, l->d_linear_recurrent_state,
-                        g_wide_qkv, g_wide_z, g_wide_b, g_wide_a,
+                        g_wide_conv, g_wide_z, g_wide_b, g_wide_a,
                         l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_norm,
                         n, lvh, lkh, ld, g_qwen.eps, g_qwen.stream)) != 0) return -60;
                 if ((ret = wide_quant_input(g_wide_lcore, value_dim, n)) != 0) return -60;

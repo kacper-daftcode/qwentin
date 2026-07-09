@@ -10,7 +10,7 @@ so any client — including an `opencode`/`continue`-style coding agent — can 
 ```
 27B params + 256k context            →  one 32 GB RTX 5090   (steady-state ~30.8 GiB)
 single-stream decode                 →  119-131 tok/s @ short · ~119 @ 32k-128k · ~110 @ 200k · ~98 @ 245k
-cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1724 tok/s @ 32k · 1154 @ 128k
+cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1960 tok/s @ 32k · 1245 @ 128k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
 ```
 
@@ -67,13 +67,13 @@ percent with the accept-length at that text offset; ms/round is the hardware tru
 
 | Context | Decode (ms/round) | Decode (tok/s) | Cold prefill (tok/s) |
 |--------:|------------------:|---------------:|---------------------:|
-|  ~short | 21.7 | **119-131** | 2050-2160 |
-|     8k  | 21.4 | 128-130 | 2044 |
-|    32k  | 22.1 | 119 | 1724 |
-|    64k  | 23.1 | 117 | 1476 |
-|   128k  | 25.1 | **~119** | 1154 (full prompt in 114 s) |
-|   200k  | 27.2 | **~110** | 915 (224 s) |
-|   245k  | 28.4 | ~98 | 805 (312 s) |
+|  ~short | 21.7 | **119-131** | ~2200 |
+|     8k  | 21.4 | 128-130 | 2374 |
+|    32k  | 22.1 | 119 | 1960 |
+|    64k  | 23.1 | 117 | 1643 |
+|   128k  | 25.1 | **~119** | 1245 (full prompt in 105 s) |
+|   200k  | 27.2 | **~110** | 967 (212 s) |
+|   245k  | 28.4 | ~98 | 840 (299 s) |
 
 Steady-state VRAM @256k ≈ **30.8 / 31.4 GiB** (the `TQ_EMBED_FP8=2` 6-bit embed table
 is what makes 256k fit — without it the 32 GB card OOMs past ~230k).
