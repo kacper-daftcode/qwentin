@@ -397,6 +397,18 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         print(f"[serve] {self.address_string()} {fmt % a}", flush=True)
 
+    def end_headers(self):
+        # LAN/browser clients: permissive CORS (this box serves no sensitive data)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
         self.send_response(code)
@@ -466,8 +478,11 @@ class H(BaseHTTPRequestHandler):
                 ckw["enable_thinking"] = bool(req["enable_thinking"])
             elif "enable_thinking" in ckw:
                 pass
-            elif req.get("reasoning_effort") is not None:
-                eff = str(req["reasoning_effort"]).strip().lower()
+            elif req.get("reasoning_effort") is not None or req.get("reasoningEffort") is not None:
+                # accept snake_case (OpenAI/vLLM convention) and camelCase
+                # (Vercel AI SDK forwards providerOptions like opencode
+                # --variant selections verbatim)
+                eff = str(req.get("reasoning_effort", req.get("reasoningEffort"))).strip().lower()
                 ckw["enable_thinking"] = eff not in ("none", "minimal", "off", "0", "false", "")
             elif args.no_thinking:
                 ckw["enable_thinking"] = False
