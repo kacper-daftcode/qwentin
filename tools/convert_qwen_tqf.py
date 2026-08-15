@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Convert a Qwen3.5/Qwen3.6 text tower to the experimental TQF1 format."""
+"""Convert a Qwen3.5/Qwen3.6/Qwen3.8 text tower to the experimental TQF1 format.
+
+Official FP8 checkpoints (e.g. Qwen3.8-27B-FP8) are supported: tensors stored as
+block-scaled E4M3 (`<name>_scale_inv`) are dequantized to float before any
+re-quantization, and the `policy=source` passthrough preserves payload bytes.
+The vision tower is dropped; the MTP head is emitted with TQ_EMIT_MTP=1."""
 
 from __future__ import annotations
 
@@ -660,6 +665,10 @@ def write_qmma_f8_block_scaled(
 
 
 def qmma_source_tensor(store: TensorStore, spec: TensorSpec) -> torch.Tensor:
+    """Checkpoint tensor with source FP8 block scales applied (true float values).
+
+    Raw store payload when the tensor carries no `<name>_scale_inv`; safe to use
+    for any tensor kind, not just qm8."""
     tensor = store.get(spec.name)
     scale_name = f"{spec.name}_scale_inv"
     if scale_name in store.names():
@@ -938,16 +947,29 @@ def write_tqf(
                 output_file.write(header)
             for spec in specs:
                 kind_counts[spec.kind] = kind_counts.get(spec.kind, 0) + 1
-                tensor = store.get(spec.name)
                 if spec.kind == "non_quant":
-                    size = write_non_quant(output_file, tensor, spec, dtype_id, dry_run)
+                    size = write_non_quant(
+                        output_file, qmma_source_tensor(store, spec), spec, dtype_id, dry_run
+                    )
                 elif spec.kind == "f32":
-                    size = write_f32(output_file, tensor, spec, dry_run)
+                    size = write_f32(output_file, store.get(spec.name), spec, dry_run)
                 elif spec.kind == "qm8":
                     if block_scaled:
                         scale_inv = None if dry_run else qmma_scale_inv_tensor(store, spec)
                         if not dry_run:
+                            # Paths that requantize from the tensor need true float
+                            # weights: deblock source FP8 codes first (Qwen3.8-27B-FP8),
+                            # else raw E4M3 codes would be treated as unscaled values.
+                            # policy=source (non-e2m3) reuses payload/scale_inv verbatim.
+                            if scale_inv is not None and (
+                                block_layout == "qmma-e2m3" or block_scale_policy != "source"
+                            ):
+                                tensor = qmma_source_tensor(store, spec)
+                            else:
+                                tensor = store.get(spec.name)
                             tensor = maybe_verify_mask_24(tensor, spec.name)
+                        else:
+                            tensor = store.get(spec.name)
                         size = write_qmma_f8_block_scaled(
                             output_file, tensor, spec, dry_run, scale_inv, block_scale_policy, block_layout
                         )
@@ -956,7 +978,7 @@ def write_tqf(
                                 output_file, tensor, spec, block_scale_policy, dry_run
                             )
                     else:
-                        qmma_tensor = tensor if dry_run else qmma_source_tensor(store, spec)
+                        qmma_tensor = store.get(spec.name) if dry_run else qmma_source_tensor(store, spec)
                         size = write_qmma_f8(output_file, qmma_tensor, spec, dry_run)
                 else:
                     raise ValueError(f"{spec.name}: unsupported tensor kind {spec.kind!r}")
@@ -968,12 +990,21 @@ def write_tqf(
                 print("  -- MTP head section (TQ_EMIT_MTP) --")
                 for spec in mtp_specs:
                     kind_counts[spec.kind] = kind_counts.get(spec.kind, 0) + 1
-                    tensor = store.get(spec.name)
+                    # FP8 checkpoints quantize most mtp.layers.0 projections
+                    # (weight + weight_scale_inv); deblock so the stored BF16
+                    # values are the true weights, not raw E4M3 codes.
+                    tensor = qmma_source_tensor(store, spec)
                     if spec.kind == "non_quant":
                         size = write_non_quant(output_file, tensor, spec, dtype_id, dry_run)
                     elif spec.kind == "qm8":
                         if block_scaled:
                             scale_inv = None if dry_run else qmma_scale_inv_tensor(store, spec)
+                            if not dry_run and scale_inv is not None and (
+                                block_layout == "qmma-e2m3" or block_scale_policy != "source"
+                            ):
+                                pass  # `tensor` already deblocked above (true float values)
+                            elif not dry_run:
+                                tensor = store.get(spec.name)
                             size = write_qmma_f8_block_scaled(
                                 output_file, tensor, spec, dry_run, scale_inv, block_scale_policy, block_layout
                             )
