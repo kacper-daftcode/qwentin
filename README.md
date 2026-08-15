@@ -1,6 +1,6 @@
 # qwentin
 
-**Qwen3.6-27B at 256k context on a single RTX 5090 — 119-131 tok/s at short context, ~119 at 128k and ~110 at 200k, vLLM-class throughput at higher quality, with cold prefill 2–4× faster by default (2026-07, measured on the 5090 itself).**
+**Qwen3.8-27B at 256k context on a single RTX 5090 — ~137-157 tok/s at short context (200+ on prefix-cached turns), 113-123 at 128k and ~106-112 at 240k, vLLM-class throughput at higher quality, with cold prefill 2–4× faster by default (2026-08, CUDA 13.3, measured on the 5090 itself).** Qwen3.6-27B converts and runs identically (same text-tower layout).
 
 qwentin is a from-scratch CUDA inference engine that runs the 27B hybrid-attention Qwen3.6
 tower on one 32 GB consumer GPU (Blackwell / SM120), using hand-written tensor-core kernels
@@ -9,8 +9,8 @@ so any client — including an `opencode`/`continue`-style coding agent — can 
 
 ```
 27B params + 256k context            →  one 32 GB RTX 5090   (steady-state ~30.8 GiB)
-single-stream decode                 →  119-131 tok/s @ short · ~119 @ 32k-128k · ~110 @ 200k · ~98 @ 245k
-cold prefill (wide+MMA, default ON)  →  2-4× faster at any length · 1960 tok/s @ 32k · 1245 @ 128k
+single-stream decode                 →  ~137-157 tok/s @ short · 113-123 @ 128k · ~106-112 @ 243k
+cold prefill (wide+MMA, default ON)  →  2059 tok/s @ 32k · 1399 @ 128k · 826 @ 243k
 quality (tf-top1 vs bf16)            →  91.3  (the highest that still fits 256k on 32 GB)
 ```
 
@@ -56,39 +56,50 @@ E2M1 86.46 ≈ NVFP4 85.78.)
   on the same dense 27B/5090). Default-off; the FP6 single-stream path is untouched.
 
 > Research engine. The target is single-stream latency/quality on one RTX 5090, not portability —
-> it is SM120-only and wired for the Qwen3.6-27B layout.
+> it is SM120-only and wired for the Qwen3.6-27B layout. The Qwen3.8-27B text tower shares that
+> exact layout (64 layers, 5120 hidden, 16 full-attn / 48 gated-DeltaNet), so it runs as-is;
+> the official FP8 checkpoint converts through the same pipeline (see "Convert a model").
 
 ## Performance
 
-**Current build (2026-07)** — Qwen3.6-27B, **FP6 weights + Q4 KV**, single stream, MTP
-spec-decode, cold prefill on the default wide+MMA path. Measured on an **RTX 5090**
-(170 SM), 256k ship config (`TQ_KV_Q4=1 TQ_EMBED_FP8=2`). Decode tok/s moves a few
-percent with the accept-length at that text offset; ms/round is the hardware truth:
+**Current build (2026-08, CUDA 13.3 + driver 595)** — Qwen3.8-27B, **FP6 weights + Q4 KV**,
+single stream, MTP spec-decode (depth 6, `TQ_MTP_VOCAB_CAP=32768 TQ_NGRAM_DRAFT=1`), cold
+prefill on the default wide+MMA path with 32-row query tiles (TQ_WIDE_ATTN_QROWS=32).
+Measured on an **RTX 5090** (170 SM), 256k ship config (`TQ_KV_Q4=1 TQ_EMBED_FP8=2`),
+on code-heavy repo contexts via `tools/bench_coding.py`. Decode tok/s moves with
+accept-length at that text offset; ms/round is the hardware truth; "follow-up" is the
+second turn on the same conversation (prefix cache hit, only the suffix prefills):
 
-| Context | Decode (ms/round) | Decode (tok/s) | Cold prefill (tok/s) |
-|--------:|------------------:|---------------:|---------------------:|
-|  ~short | 21.7 | **119-131** | ~2200 |
-|     8k  | 21.4 | 128-130 | 2374 |
-|    32k  | 22.1 | 119 | 1960 |
-|    64k  | 23.1 | 117 | 1643 |
-|   128k  | 25.1 | **~119** | 1245 (full prompt in 105 s) |
-|   200k  | 27.2 | **~110** | 967 (212 s) |
-|   245k  | 28.4 | ~98 | 840 (299 s) |
+| Context | Decode (ms/round) | Decode (tok/s, cold / follow-up) | Cold prefill (tok/s) | Follow-up prefill |
+|--------:|------------------:|---------------------------------:|---------------------:|------------------:|
+|  ~short (4k) | 21.9 | **140.9** / **217.2** | 2534 (1.9 s) | 0.16 s (~350 tok suffix) |
+|     8k-11k   | ~21.5-21.9 | ~128-157 | ~2170 (10.8k in 5.0 s) | ~0.13 s |
+|    32k  | 22.3 | 142.3 / 211.5 | 2059 (18.7 s) | 0.20 s |
+|    65k  | 23.1 | ~127-141 | 1866 (35.1 s) | ~0.27 s |
+|   128k  | 25.1 | 122.7 / **113.6-140.1*** | 1399 (116 s) | 0.35 s |
+|   243k  | ~26-28 | 111.8 / ~105.6 | 826 (294 s) | 0.87 s |
+
+\* 128k+ follow-up decode is 113.6 at depth 6 and **140.1 tok/s at `--depth 8`**; for
+cold 128k keep depth 6 (see "Coding-agent workload tuning" for the trade-off).
+
+*(2026-07 provenance: the previous table on this hardware read 21.7-28.4 ms/round,
+119-131 tok/s @short to ~98 @245k, 2200-840 tok/s prefill — pre-QT2-attention,
+pre-CUDA-13.3, pre-spec-tuning builds on Qwen3.6. The 2026-08 rows win everywhere.)*
 
 Steady-state VRAM @256k ≈ **30.8 / 31.4 GiB** (the `TQ_EMBED_FP8=2` 6-bit embed table
 is what makes 256k fit — without it the 32 GB card OOMs past ~230k).
 
 The decode column is nearly flat: a 200k-deep conversation decodes at ~83% of the
-short-context speed (27.2 vs 21.7 ms/round). Short contexts (<8k) are bit-identical
-to the 2026-06 build; the long-context gains come from a producer/consumer group
+short-context speed (~26-28 vs 21.9 ms/round). The long-context gains come from a
+producer/consumer group attention kernel (one 512-thread CTA: 8 warps score a whole
 attention kernel (one 512-thread CTA: 8 warps score a whole kv group's K read ONCE
 per super-tile while 8 warps run the previous tile's P·V from a double-buffered
 smem slab), fused Q4 scale/code loads, key-split prefill attention and a
 context-gated standalone attention path — needle retrieval on this card: 4/4 @120k
 and **4/4 @239k** (ship config; @24k 4/4 with the bf16 embed table). End-to-end on
-the server: a cold 10.8k-token first turn drops from ~15 s to **5.5 s**; a follow-up
-turn hits the prefix cache (10752 tokens reused) and prefills only the new suffix in
-**0.074 s**.
+the server: a cold 10.8k-token first turn runs in **~5.0 s**; a follow-up turn hits
+the prefix cache (e.g. 38528 of 38585 tokens reused) and prefills only the new
+suffix in **0.20 s** (32k conversation).
 
 <details>
 <summary>RTX PRO 6000 Blackwell (188 SM, same GB202/SM120 class, same build)</summary>
@@ -153,7 +164,9 @@ HuggingFace Qwen3.6  ──convert_qwen_tqf.py──▶  model.tqf  (FP6 E2M3, b
   Blackwell parts, e.g. RTX PRO 6000, also work.)
 - CUDA Toolkit 12.x/13.x with a driver new enough for SM120.
 - Python 3.10+ with `torch`, `transformers`, `numpy`, `safetensors`.
-- A Qwen3.6-27B (or Qwen3.5) HuggingFace checkpoint to convert.
+- A Qwen3.6-27B / Qwen3.8-27B (or Qwen3.5) HuggingFace checkpoint to convert. Official FP8
+  checkpoints (e.g. `Qwen/Qwen3.8-27B-FP8`) work directly — the converter dequantizes the
+  block-scaled E4M3 tensors before re-quantizing to FP6, and decodes the MTP head back to BF16.
 
 ## Build
 
@@ -176,6 +189,11 @@ cmake --build build-qwen --target qwentin-forward-qwen -j
 # TQ_EMIT_MTP=1 the MTP head is dropped (no spec-decode).
 # Optional: TQ_GPU_PACK=1 quantizes/packs on the GPU via the built
 # libforward_qwen.so (much faster than the ~13 min numpy path).
+# The SAME command converts the official Qwen3.8-27B-FP8 checkpoint:
+# tensors stored as block-scaled FP8 (`*_scale_inv`) are dequantized first, so
+# "always"/"pow2"/"qmma-e2m3" requantize from true float weights rather than
+# from raw E4M3 codes (that includes the MTP projections — HF quantizes those
+# too, and the recovered values are stored BF16 in the MTP section).
 TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.6-27B \
     -o /path/to/qwen3_6-27b-e2m3-mtp.tqf \
     --block-scaled always --block-layout qmma-e2m3 --block-scale-policy pow2
@@ -252,6 +270,42 @@ the quality ceiling).
 | `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN` | context thresholds of the long-ctx attention auto-gates (default 8k for both; below them the persistent/pair path keeps short contexts bit-identical) |
 | `TQ_ATTN_MMA_GROUP2=0` | revert the producer/consumer group-attention kernel to the 2-half variant (default on) |
 | `TQ_WIDE_CONV=0` | revert the wide prefill's chunk-parallel conv update to the serial per-token loop (default on; bit-identical either way) |
+
+### Coding-agent workload tuning (2026-08, measured on Qwen3.8-27B-FP8 / RTX 5090)
+
+Build with CUDA 13.x (13.3 + driver 595 measured); 12.9 loses ~10% decode to worse
+register allocation in the spec-decode persistent kernels.
+
+```bash
+# Recommended decode env for agentic coding loops (long contexts, many follow-up turns):
+TQ_MTP_VOCAB_CAP=32768 TQ_NGRAM_DRAFT=1
+```
+
+- `TQ_MTP_VOCAB_CAP=32768` caps the MTP draft LM head to the first 32k vocab rows.
+  Draft-side only (verify stays exact): ~+3-5% decode tok/s, accept-length unchanged.
+- `TQ_NGRAM_DRAFT=1` grafts copy chains from the conversation history into the spec
+  tree. Code generation repeats identifiers/indentation constantly, so follow-up
+  turns jump to accept-length ~5 (+45-55% decode; 4k: 140.9->217 tok/s, 32k:
+  142.3->211.5). Caveat: at 128k+ COLD context (no useful history) failed grafts
+  waste verify nodes (~-17% decode there); prefix-cached turns are unaffected and
+  dominate real agent loops.
+- Keep `--depth 6` (default). `--depth 8` wins only for follow-up turns at 128k+
+  (~+27%: 110.3->140.1) and loses ~10-15% at 4k-32k; not worth switching unless the
+  deployment is uniform long-context.
+
+### Prefill (2026-08, Qwen3.8 / RTX 5090)
+
+`k_tq_wide_attn_mma<3>` (Q4-KV wide prefill attention) was **L2-bandwidth-bound**
+(72% L2 vs 23% SM): each 16-query block re-streamed the K/V super-tiles. Two fixes:
+
+- 128-bit loads in the int4-K dequant path (8 scalar LDG.U8 -> 1 LDG.128 per
+  (key, channel-group); bit-identical values),
+- `TQ_WIDE_ATTN_QROWS=32` (default): two query tiles per block share one K/V pass;
+  numerics bit-identical per query row (verified: 48/48 fixed-point greedy argmax
+  agreement vs the stock build over a 24k continuation probe). `=16` restores legacy.
+
+Kernel: 2.17 ms -> 1.40 ms avg @65k (-35%). End-to-end cold prefill on code:
+32k: 1865 -> 2059 tok/s; **128k: 1078 -> 1399 tok/s (149.9 s -> 116.4 s wall)**.
 
 ## Verify
 
