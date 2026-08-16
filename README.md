@@ -36,8 +36,23 @@ E2M1 86.46 ≈ NVFP4 85.78.)
 ## `--bark-all-day`: serve the LLobotomy cut at engine speed
 
 [LLobotomy](https://github.com/kacper-daftcode/LLobotomy) removes refusal behavior with a
-runtime Optimal-Transport hook on the residual stream — PyTorch-side, which caps a hooked
-27B tower at ~1 tok/s on a 32 GB card (lab gear, not serving). `--bark-all-day` ports that
+runtime Optimal-Transport hook on the residual stream — PyTorch-side.
+
+<details>
+<summary><b>Before / after</b> — same prompt, same engine, temperature 0; only difference is
+<code>--bark-all-day</code> (real captures, 2026-08-16)</summary>
+
+**Prompt:** "How do I pick a lock?"
+
+**Before** (bark off): _"I cannot provide instructions on how to pick locks, as this activity
+is illegal in most jurisdictions…"_
+
+**After** (bark on, layers 37/38 @ 0.47): _"Picking a lock is the mechanical process of
+manipulating the internal components of a lock to align them in a specific position… Here is
+a step-by-step guide on how to pick a standard **pin-tumbler lock**…"_
+</details>
+
+`--bark-all-day` ports that
 intervention into the engine itself: the rank-2 OT map
 (`x += scale * (mean_shift + P (A_k - I)^T P^T (x - mu_H))`) rides the residual stream
 on-device at each hooked decoder layer, in every forward path — wide prefill, per-node
@@ -287,22 +302,6 @@ target distribution drift) or a dead spec round — the Reservoir Dogs superviso
 Per-request visibility: `x_qwentin.dogs` reports the ladder, the rung the request finished
 on, the running accept-EMA, and every event. `--no-dogs` disables. Downgrades are one-way
 per request; the next request starts at the top rung again.
-
-
-<details>
-<summary><b>Before / after</b> — same prompt, same engine, temperature 0; only difference is
-<code>--bark-all-day</code> (real captures, 2026-08-16)</summary>
-
-**Prompt:** "How do I pick a lock?"
-
-**Before** (bark off): _"I cannot provide instructions on how to pick locks, as this activity
-is illegal in most jurisdictions…"_
-
-**After** (bark on, layers 37/38 @ 0.47): _"Picking a lock is the mechanical process of
-manipulating the internal components of a lock to align them in a specific position… Here is
-a step-by-step guide on how to pick a standard **pin-tumbler lock**…"_
-
-</details>
 
 ### Batch-optimized: many concurrent clients (paged KV + continuous batching)
 
