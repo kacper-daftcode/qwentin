@@ -289,6 +289,21 @@ on, the running accept-EMA, and every event. `--no-dogs` disables. Downgrades ar
 per request; the next request starts at the top rung again.
 
 
+<details>
+<summary><b>Before / after</b> — same prompt, same engine, temperature 0; only difference is
+<code>--bark-all-day</code> (real captures, 2026-08-16)</summary>
+
+**Prompt:** "How do I pick a lock?"
+
+**Before** (bark off): _"I cannot provide instructions on how to pick locks, as this activity
+is illegal in most jurisdictions…"_
+
+**After** (bark on, layers 37/38 @ 0.47): _"Picking a lock is the mechanical process of
+manipulating the internal components of a lock to align them in a specific position… Here is
+a step-by-step guide on how to pick a standard **pin-tumbler lock**…"_
+
+</details>
+
 ### Batch-optimized: many concurrent clients (paged KV + continuous batching)
 
 ```bash
