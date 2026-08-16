@@ -11,12 +11,19 @@ Single-stream engine: requests are serialized with a lock (queue waits).
 top_p: only 1.0 supported (v1 sampler); other values are clamped with a
 warning field. n>1, logprobs, tools: unsupported -> 400.
 
-Reservoir Dogs (default ON): spec-round watchdog + fallback-drafter ladder.
-LLobotomy hands qwentin the crew (a lobotomized tower whose decode
-distribution can drift away from the MTP drafter's expectations); the Dogs
-degrade a bleeding spec round through a (depth, k) ladder down to dense
-verify-included decode instead of letting the request die or stall. All
-rungs are lossless w.r.t. the target distribution; only speed moves.
+Reservoir Dogs -- the LLobotomy connection, in two halves:
+1) Bark (opt-in): --bark-all-day ports LLobotomy's Optimal-Transport refusal
+   intervention into the engine itself. The rank-2 OT map from a save_maps JSON
+   is applied on-device right after the hooked decoder layers in every forward
+   path (wide prefill, per-node spec verify, dense decode) -- the served tower
+   is the lobotomized tower, at spec-decode speed. See README ("--bark-all-day")
+   for scale tuning; kernel parity is gated by tools/ot_hook_check.py.
+2) Watchdog + fallback-drafter ladder (default ON): every spec round is
+   supervised. accept_len-EMA collapse walks the drafter down a (depth, k)
+   ladder (6/3 -> 4/2 -> 2/1); a hard round error moves the rest of the request
+   to dense qwn_decode; a round exceeding --dogs-hang-s triggers a
+   persistent-kernel scratch dump. All rungs are lossless w.r.t. the target
+   distribution -- the ladder only gives up speed.
 
 Prefix/KV cache between requests (--prefix-cache, default ON): every prefill
 drops a DeltaNet snapshot (slot 0) at the last 16-aligned chunk boundary
@@ -70,6 +77,20 @@ ap.add_argument("--dogs-hang-s", type=float, default=10.0,
                 help="log + persistent-kernel scratch dump when a single spec round exceeds this")
 ap.add_argument("--dogs-exit-on-hang", action="store_true", default=False,
                 help="os._exit(3) after a hung-round dump (pair with a supervisor that restarts)")
+ap.add_argument("--bark-all-day", action="store_true", default=False,
+                help="arm the LLobotomy OT intervention inside the engine: residual-stream"
+                     " hooks from --ot-maps applied after --ot-layers in every forward"
+                     " path (wide prefill / spec verify / dense decode) -- the served"
+                     " tower is the lobotomized tower, at spec-decode speed")
+ap.add_argument("--ot-maps", default=os.environ.get("TQ_OT_MAPS", ""),
+                help="LLobotomy save_maps JSON (default $TQ_OT_MAPS)")
+ap.add_argument("--ot-layers", default="37,38",
+                help="comma-separated hooked decoder layers (auto-tuned for Qwen3.8-27B: 37,38)")
+ap.add_argument("--ot-scale", type=float, default=0.47,
+                help="OT intervention scale, from tools/bark_autotune.py on the FP6 tower"
+                     " (2026-08-16): refusal leaks 5/6 @0.21, 2/6 @0.40-0.44, clean 0/6 from"
+                     " 0.47 up; below that the bf16-HF lab value (0.21) does not transfer."
+                     " Re-tune per tower/quantization: probe through the live API")
 ap.add_argument("--prefix-cache", dest="prefix_cache", action="store_true", default=True,
                 help="reuse engine state across requests sharing a token prefix (default ON)")
 ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
@@ -257,12 +278,41 @@ if args.prefix_cache_live and EOS_IDS:
 if args.dogs:
     LIB.qwn_spec_persist_dump.restype = ctypes.c_int
     LIB.qwn_spec_persist_dump.argtypes = [ctypes.POINTER(ctypes.c_int)]
+BARK = None
+if args.bark_all_day:
+    if not args.ot_maps:
+        sys.exit("--bark-all-day needs --ot-maps PATH (or TQ_OT_MAPS)")
+    import numpy as _np
+    _maps = json.load(open(args.ot_maps))["ot_maps"]
+    LIB.qwn_ot_hook_add.restype = ctypes.c_int
+    LIB.qwn_ot_hook_add.argtypes = ([ctypes.c_int, ctypes.c_float] +
+                                    [ctypes.POINTER(ctypes.c_float)] * 4)
+    _H = int(LIB.qwn_hidden_size())
+    _armed = []
+    for _ln in [int(x) for x in args.ot_layers.split(",") if x.strip()]:
+        m = _maps[str(_ln)]
+        P  = _np.ascontiguousarray(_np.asarray(m["P"], dtype=_np.float32))
+        A  = _np.ascontiguousarray(_np.asarray(m["A_k_minus_I"], dtype=_np.float32)).reshape(4)
+        mu = _np.ascontiguousarray(_np.asarray(m["mu_H"], dtype=_np.float32))
+        ms = _np.ascontiguousarray(_np.asarray(m["mean_shift"], dtype=_np.float32))
+        assert P.shape == (_H, 2) and mu.shape == (_H,) and ms.shape == (_H,), (P.shape, mu.shape)
+        def _f32p(a):
+            return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        ck(LIB.qwn_ot_hook_add(_ln, ctypes.c_float(args.ot_scale),
+                               _f32p(P), _f32p(A), _f32p(mu), _f32p(ms)),
+           f"ot_hook_add layer {_ln}")
+        _armed.append(_ln)
+    assert int(LIB.qwn_ot_hook_count()) == len(_armed)
+    BARK = {"layers": _armed, "scale": args.ot_scale, "maps": os.path.basename(args.ot_maps)}
+    print(f"[bark] OT hooks armed on layers {_armed}, scale={args.ot_scale:g} "
+          f"({args.ot_maps}) -- the tower barks all day now", flush=True)
 print(f"[serve] ready on :{args.port} (eos={sorted(EOS_IDS)}, "
       f"prefix_cache={'on' if args.prefix_cache else 'off'}"
       f"{'+live' if args.prefix_cache_live else ''}, "
       f"thinking={'off (default)' if args.no_thinking else 'template-default (on)'}, "
       f"wide_prefill={'on' if os.environ.get('TQ_WIDE_PREFILL', '0') not in ('', '0') else 'off'}"
-      f"+mma={'on' if os.environ.get('TQ_WIDE_ATTN_MMA', '0') not in ('', '0') else 'off'})", flush=True)
+      f"+mma={'on' if os.environ.get('TQ_WIDE_ATTN_MMA', '0') not in ('', '0') else 'off'}"
+      f"{', bark=' + str(BARK['layers']) + '@' + format(BARK['scale'], 'g') if BARK else ''})", flush=True)
 if args.dogs:
     print(f"[serve] dogs on: ladder {' -> '.join(_dogs_ladder_labels(_dogs_ladder(args.depth, args.k)))} "
           f"(accept_min={args.dogs_accept_min:g}, min_rounds={args.dogs_min_rounds}, "

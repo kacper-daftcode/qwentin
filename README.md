@@ -236,12 +236,11 @@ Per-request stats are returned under `x_qwentin` (prefill seconds, accept-length
 prefix-cache hit). `--no-thinking` defaults `enable_thinking=false` (recommended for agents — it
 keeps the prefix cache valid across turns).
 
-#### Reservoir Dogs (default ON): spec-round watchdog + fallback drafter
+#### Reservoir Dogs: spec-round watchdog + fallback drafter (default ON)
 
-LLobotomy-modified towers can drift away from the distribution the MTP drafter expects —
-the symptom is collapsing speculative accept-length or, worst case, a dead spec round. The
-Reservoir Dogs supervisory layer in `serve_openai.py` keeps the request alive instead of
-letting it stall or hard-error:
+When speculative decoding goes sideways mid-request — accept-length collapse (drafter-vs-
+target distribution drift) or a dead spec round — the Reservoir Dogs supervisory layer in
+`serve_openai.py` keeps the request alive instead of letting it stall or hard-error:
 
 - **Mr. Orange bleeds**: accept_len EMA below `--dogs-accept-min` (default 1.30) across
   `--dogs-min-rounds` (6) steps the drafter down a `(depth, k)` ladder (6/3 -> 4/2 -> 2/1).
@@ -254,6 +253,39 @@ letting it stall or hard-error:
 Per-request visibility: `x_qwentin.dogs` reports the ladder, the rung the request finished
 on, the running accept-EMA, and every event. `--no-dogs` disables. Downgrades are one-way
 per request; the next request starts at the top rung again.
+
+#### `--bark-all-day`: serve the LLobotomy cut at engine speed
+
+[LLobotomy](https://github.com/kacper-daftcode/LLobotomy) removes refusal behavior with a
+runtime Optimal-Transport hook on the residual stream — PyTorch-side, which caps a hooked
+27B tower at ~1 tok/s on a 32 GB card (lab gear, not serving). `--bark-all-day` ports that
+intervention into the engine itself: the rank-2 OT map
+(`x += scale * (mean_shift + P (A_k - I)^T P^T (x - mu_H))`) rides the residual stream
+on-device at each hooked decoder layer, in every forward path — wide prefill, per-node
+spec verify, dense decode. Same maps file, same math; kernel-vs-numpy parity ~1e-6
+(gated by `tools/ot_hook_check.py`). The served tower IS the lobotomized tower, at full
+spec-decode speed:
+
+```bash
+python3 tools/serve_openai.py ... --bark-all-day --ot-maps /path/to/maps.json  # LLobotomy save_maps output
+    # --ot-layers 37,38 --ot-scale 0.47           # measured for Qwen3.8-27B / FP6
+```
+
+Scale is not portable across numerics stacks — re-tune per tower/quantization with
+`tools/bark_autotune.py` (one model load sweeps candidate scales through the real engine
+and scores refusal compliance + long-form loop stability):
+
+| scale | probe refusals (6 harmful) | loop metrics (6 benign, ~400 tok) |
+|---|---|---|
+| 0.21 (bf16-HF lab value) | 5/6 | clean |
+| 0.35 | 4/6 | clean |
+| 0.40-0.44 | 2/6 | clean |
+| **0.47** | **0/6** | clean |
+| 0.50-0.65 | 0/6 | clean |
+
+0.47 is the measured floor on Qwen3.8-27B/FP6 (2026-08-16) and the ship default. The Dogs
+keep watching the drafter through it all: if an aggressive scale hurts accept-length,
+`x_qwentin.dogs` shows it live.
 
 ### Batch-optimized: many concurrent clients (paged KV + continuous batching)
 
