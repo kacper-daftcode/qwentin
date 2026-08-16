@@ -11,6 +11,13 @@ Single-stream engine: requests are serialized with a lock (queue waits).
 top_p: only 1.0 supported (v1 sampler); other values are clamped with a
 warning field. n>1, logprobs, tools: unsupported -> 400.
 
+Reservoir Dogs (default ON): spec-round watchdog + fallback-drafter ladder.
+LLobotomy hands qwentin the crew (a lobotomized tower whose decode
+distribution can drift away from the MTP drafter's expectations); the Dogs
+degrade a bleeding spec round through a (depth, k) ladder down to dense
+verify-included decode instead of letting the request die or stall. All
+rungs are lossless w.r.t. the target distribution; only speed moves.
+
 Prefix/KV cache between requests (--prefix-cache, default ON): every prefill
 drops a DeltaNet snapshot (slot 0) at the last 16-aligned chunk boundary
 inside the prompt (the "anchor"); the positional KV/trunk state below the
@@ -52,6 +59,17 @@ ap.add_argument("--depth", type=int, default=6)
 ap.add_argument("--k", type=int, default=3)
 ap.add_argument("--tau", type=float, default=12.0)
 ap.add_argument("--maxn", type=int, default=8)
+ap.add_argument("--dogs", dest="dogs", action="store_true", default=True,
+                help="Reservoir Dogs: spec-round watchdog + fallback-drafter ladder (default ON)")
+ap.add_argument("--no-dogs", dest="dogs", action="store_false")
+ap.add_argument("--dogs-accept-min", type=float, default=1.30,
+                help="accept_len EMA below this (after --dogs-min-rounds at a rung) steps the ladder down")
+ap.add_argument("--dogs-min-rounds", type=int, default=6,
+                help="spec rounds observed at a rung before a downgrade is allowed")
+ap.add_argument("--dogs-hang-s", type=float, default=10.0,
+                help="log + persistent-kernel scratch dump when a single spec round exceeds this")
+ap.add_argument("--dogs-exit-on-hang", action="store_true", default=False,
+                help="os._exit(3) after a hung-round dump (pair with a supervisor that restarts)")
 ap.add_argument("--prefix-cache", dest="prefix_cache", action="store_true", default=True,
                 help="reuse engine state across requests sharing a token prefix (default ON)")
 ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
@@ -73,6 +91,110 @@ ap.add_argument("--wide-prefill", dest="wide_prefill", action="store_true", defa
                      "unless those env vars are set explicitly (env always wins).")
 ap.add_argument("--no-wide-prefill", dest="wide_prefill", action="store_false")
 args = ap.parse_args()
+
+# ----------------------------- Reservoir Dogs -----------------------------
+# The crew that keeps the spec-decode heist on schedule when the tower came
+# through LLobotomy (refusal direction cut) and its decode distribution can
+# drift away from what the MTP drafter was calibrated on:
+#
+#   Mr. Blonde  shoots first  : full --depth/--k drafting (the ship config).
+#   Mr. Orange  bleeds        : accept_len EMA collapses (draft/verify drift)
+#                               -> ladder steps down (depth, k), one rung per
+#                               --dogs-min-rounds window.
+#   Mr. Pink    walks         : stubborn bleeding or a hard round error ->
+#                               dense decode finishes the job ("professional").
+#   Mr. White   watches       : a round exceeding --dogs-hang-s triggers a
+#                               non-blocking persistent-kernel scratch dump, so
+#                               the log says which barrier the grid died on.
+#
+# Every rung verifies against the same target model, so demotion is lossless
+# w.r.t. output distribution -- the ladder only gives up speed. Downgrades are
+# one-way per request (no flapping); the next request starts at rung 0 again.
+
+def _dogs_ladder(d0, k0):
+    rungs, seen = [], set()
+    for d, k in ((d0, k0), (max(1, d0 - 2), max(1, k0 - 1)), (max(1, (d0 + 1) // 3), 1)):
+        p = (max(1, d), max(1, k))
+        if p not in seen:
+            seen.add(p)
+            rungs.append(p)
+    rungs.append(None)                      # None = Mr. Pink (dense, no drafting)
+    return rungs
+
+
+def _dogs_ladder_labels(ladder):
+    return ["dense" if r is None else f"{r[0]}/{r[1]}" for r in ladder]
+
+
+class _Dogs:
+    def __init__(self, d0, k0):
+        self.ladder = _dogs_ladder(d0, k0)
+        self.level = 0
+        self.ema = None                     # tokens-per-round EMA at the current rung
+        self.at_level = 0                   # rounds observed at the current rung
+        self.events = []
+
+    @property
+    def params(self):
+        return self.ladder[self.level]
+
+    @property
+    def label(self):
+        return "dense" if self.params is None else f"{self.params[0]}/{self.params[1]}"
+
+    def log(self, msg):
+        print(f"[dogs] {msg}", file=sys.stderr, flush=True)
+        self.events.append(msg)
+
+    def demote(self, why):
+        prev = self.label
+        if self.level < len(self.ladder) - 1:
+            self.level += 1
+        self.ema, self.at_level = None, 0
+        self.log(f"{why} -- ladder {prev} -> {self.label}")
+
+    def note(self, accepted, pos):
+        """Feed one healthy spec round (accepted = tokens gained, incl. bonus)."""
+        self.at_level += 1
+        self.ema = float(accepted) if self.ema is None else 0.75 * self.ema + 0.25 * accepted
+        if (self.params is not None and self.at_level >= args.dogs_min_rounds
+                and self.ema < args.dogs_accept_min):
+            self.demote(f"Mr. Orange is bleeding: accept_len EMA {self.ema:.2f} "
+                        f"< {args.dogs_accept_min:g} over {self.at_level} rounds "
+                        f"(draft/verify drift at pos {pos})")
+
+
+def _dogs_hang_watch(done, dogs, d, k, pos):
+    """Fires only if the guarded qwn_spec_round call exceeds --dogs-hang-s.
+    ctypes releases the GIL around the engine call, and qwn_spec_persist_dump
+    uses its own non-blocking stream -- this is the watchdog the engine's dump
+    hook was written for."""
+    if done.wait(args.dogs_hang_s):
+        return
+    buf = (ctypes.c_int * 64)()             # TQ_PERSIST_SCRATCH_INTS
+    rc = LIB.qwn_spec_persist_dump(buf)
+    detail = (f"persist scratch counters {list(buf)}" if rc == 0
+              else f"scratch dump unavailable (rc={rc})")
+    dogs.log(f"Mr. White on the radio: spec round hung > {args.dogs_hang_s:g}s "
+             f"(depth {d}/{k}, pos {pos}) -- {detail}")
+    if args.dogs_exit_on_hang:
+        dogs.log("Mr. White takes the crew down: os._exit(3), supervisor restarts clean")
+        os._exit(3)
+
+
+def _spec_round_guarded(cur_seed, cur_pos, d, k, chain_buf, st_buf, dogs):
+    if dogs is None:
+        return LIB.qwn_spec_round(int(cur_seed), int(cur_pos), d, k,
+                                  ctypes.c_float(args.tau), args.maxn, chain_buf, st_buf)
+    done = threading.Event()
+    threading.Thread(target=_dogs_hang_watch,
+                     args=(done, dogs, d, k, cur_pos), daemon=True).start()
+    try:
+        return LIB.qwn_spec_round(int(cur_seed), int(cur_pos), d, k,
+                                  ctypes.c_float(args.tau), args.maxn, chain_buf, st_buf)
+    finally:
+        done.set()
+
 
 # The engine lib and prefill() read these lazily; explicit env overrides the flag.
 os.environ.setdefault("TQ_WIDE_PREFILL", "1" if args.wide_prefill else "0")
@@ -132,12 +254,20 @@ if args.prefix_cache_live and EOS_IDS:
     _stop = sorted(EOS_IDS)
     ck(LIB.qwn_set_commit_stop((ctypes.c_int * len(_stop))(*_stop), len(_stop)),
        "set_commit_stop")
+if args.dogs:
+    LIB.qwn_spec_persist_dump.restype = ctypes.c_int
+    LIB.qwn_spec_persist_dump.argtypes = [ctypes.POINTER(ctypes.c_int)]
 print(f"[serve] ready on :{args.port} (eos={sorted(EOS_IDS)}, "
       f"prefix_cache={'on' if args.prefix_cache else 'off'}"
       f"{'+live' if args.prefix_cache_live else ''}, "
       f"thinking={'off (default)' if args.no_thinking else 'template-default (on)'}, "
       f"wide_prefill={'on' if os.environ.get('TQ_WIDE_PREFILL', '0') not in ('', '0') else 'off'}"
       f"+mma={'on' if os.environ.get('TQ_WIDE_ATTN_MMA', '0') not in ('', '0') else 'off'})", flush=True)
+if args.dogs:
+    print(f"[serve] dogs on: ladder {' -> '.join(_dogs_ladder_labels(_dogs_ladder(args.depth, args.k)))} "
+          f"(accept_min={args.dogs_accept_min:g}, min_rounds={args.dogs_min_rounds}, "
+          f"hang_s={args.dogs_hang_s:g}, exit_on_hang={'yes' if args.dogs_exit_on_hang else 'no'})",
+          flush=True)
 
 
 def _common_prefix(a, b):
@@ -253,15 +383,39 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         out.append(seed_tok)
         on_tokens([seed_tok])
         t1 = time.time()
+        dogs = _Dogs(args.depth, args.k) if args.dogs else None
+        dense = False          # Mr. Pink's shift: dense decode for the remaining tokens
         while len(out) < max_new:
-            cl = LIB.qwn_spec_round(int(cur_seed), int(cur_pos), args.depth, args.k,
-                                    ctypes.c_float(args.tau), args.maxn, chain_buf, st_buf)
-            if cl < 0:
-                finish = "error"
-                break
-            chunk = list(chain_buf[1:cl])
-            rounds += 1
-            cur_seed, cur_pos = st_buf[0], st_buf[1]
+            if dense:
+                nt = LIB.qwn_decode(int(cur_seed), int(cur_pos))
+                if nt < 0:
+                    finish = "error"
+                    break
+                chunk = [nt]
+                cur_seed, cur_pos = nt, cur_pos + 1
+                d_now = 1
+            else:
+                d_eff, k_eff = dogs.params if dogs else (args.depth, args.k)
+                cl = _spec_round_guarded(cur_seed, cur_pos, d_eff, k_eff,
+                                         chain_buf, st_buf, dogs)
+                if cl < 0:
+                    if dogs is None:
+                        finish = "error"
+                        break
+                    # state through cur_pos is untouched by a failed round
+                    # (tree build/config errors abort before any commit)
+                    dogs.log(f"Mr. Pink walks: spec round error {cl} at pos {cur_pos} "
+                             f"after {len(out)} tokens; dense decode finishes the job")
+                    dense = True
+                    continue
+                chunk = list(chain_buf[1:cl])
+                rounds += 1
+                cur_seed, cur_pos = st_buf[0], st_buf[1]
+                d_now = d_eff
+                if dogs:
+                    dogs.note(len(chunk), cur_pos)
+                    if dogs.params is None:
+                        dense = True
             eng_extra.extend(chunk)
             cut = None
             for i, t in enumerate(chunk):
@@ -277,7 +431,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
             emit = chunk[:room]
             out.extend(emit)
             on_tokens(emit)
-            if cur_pos + args.depth + 2 >= args.ctx:
+            if cur_pos + d_now + 2 >= args.ctx:
                 finish = "length"
                 break
         dt = time.time() - t1
@@ -288,6 +442,11 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
              "gen_tok_s": round(len(out) / dt, 1) if dt > 0 else None,
              "prefix": mode, "reused_tokens": reused,
              "prefilled_tokens": P - reused}
+    if dogs is not None:
+        stats["dogs"] = {"ladder": _dogs_ladder_labels(dogs.ladder),
+                         "final": "dense" if dense else dogs.label,
+                         "accept_ema": round(dogs.ema, 2) if dogs.ema is not None else None,
+                         "events": list(dogs.events)}
     if dbg:
         stats["gen_ids"] = list(out)
         stats["eng_tail_ids"] = list(eng_extra)

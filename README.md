@@ -236,6 +236,25 @@ Per-request stats are returned under `x_qwentin` (prefill seconds, accept-length
 prefix-cache hit). `--no-thinking` defaults `enable_thinking=false` (recommended for agents — it
 keeps the prefix cache valid across turns).
 
+#### Reservoir Dogs (default ON): spec-round watchdog + fallback drafter
+
+LLobotomy-modified towers can drift away from the distribution the MTP drafter expects —
+the symptom is collapsing speculative accept-length or, worst case, a dead spec round. The
+Reservoir Dogs supervisory layer in `serve_openai.py` keeps the request alive instead of
+letting it stall or hard-error:
+
+- **Mr. Orange bleeds**: accept_len EMA below `--dogs-accept-min` (default 1.30) across
+  `--dogs-min-rounds` (6) steps the drafter down a `(depth, k)` ladder (6/3 -> 4/2 -> 2/1).
+- **Mr. Pink walks**: persistent bleeding or a hard round error switches the rest of the
+  request to dense decode (still verified against the target model — lossless, just slower).
+- **Mr. White watches**: a round exceeding `--dogs-hang-s` (10 s) triggers a non-blocking
+  persistent-kernel scratch dump naming the stuck barrier; `--dogs-exit-on-hang` exits with
+  code 3 for supervisor restarts.
+
+Per-request visibility: `x_qwentin.dogs` reports the ladder, the rung the request finished
+on, the running accept-EMA, and every event. `--no-dogs` disables. Downgrades are one-way
+per request; the next request starts at the top rung again.
+
 ### Batch-optimized: many concurrent clients (paged KV + continuous batching)
 
 ```bash
