@@ -3705,7 +3705,14 @@ __global__ void k_tq_spec_attn_tree(float *out, const float *q_proj_base,
     out[(size_t)node * out_stride + head * hd + tid] = ratio * (1.0f / (1.0f + expf(-gate)));
 }
 
-__global__ void k_tq_qwen_rmsnorm(float *out, const float *x, const uint16_t *weight, int N, float eps) {
+// __launch_bounds__(1024, 1) on the whole stripe-reduce rmsnorm/argmax family below:
+// every kernel is always launched at exactly 1024 threads/block, and on nvcc 12.9
+// ptxas allocates up to 80 regs/thread for these -- 80 x 1024 exceeds the 64K-register
+// SM budget, so each launch failed at runtime (spec decode died after the first
+// token). The bound forces ptxas into the 64-reg budget on any toolchain; excess
+// pressure becomes spills instead of dead launches.
+__global__ void __launch_bounds__(1024, 1)
+k_tq_qwen_rmsnorm(float *out, const float *x, const uint16_t *weight, int N, float eps) {
     __shared__ float smem[32];
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -3748,7 +3755,8 @@ __global__ void k_tq_qwen_rmsnorm(float *out, const float *x, const uint16_t *we
 // Batched rmsnorm over `nodes` contiguous vectors (vector v at v*N). Grid = (stripes,
 // nodes), node = blockIdx.y. Bit-identical to k_tq_qwen_rmsnorm per node (same .x stripe
 // count); one launch replaces N for the Step-5 batched verify (cuts launch overhead).
-__global__ void k_tq_qwen_rmsnorm_b(float *out, const float *x, const uint16_t *weight, int N, float eps) {
+__global__ void __launch_bounds__(1024, 1)
+k_tq_qwen_rmsnorm_b(float *out, const float *x, const uint16_t *weight, int N, float eps) {
     __shared__ float smem[32];
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -3779,7 +3787,8 @@ __global__ void k_tq_qwen_rmsnorm_b(float *out, const float *x, const uint16_t *
 
 // Fused add-residual + RMSNorm: computes resid[i] = a[i] + b[i], then
 // out[i] = rmsnorm(resid, weight). Replaces separate add_vec_b + rmsnorm_b.
-__global__ void k_tq_add_rmsnorm_b(float *out, float *resid, const float *a, const float *b,
+__global__ void __launch_bounds__(1024, 1)
+k_tq_add_rmsnorm_b(float *out, float *resid, const float *a, const float *b,
                                    const uint16_t *weight, int N, float eps) {
     __shared__ float smem[32];
     int tid = threadIdx.x;
@@ -3818,7 +3827,8 @@ __global__ void k_tq_add_rmsnorm_b(float *out, float *resid, const float *a, con
 // rmsnorm_b variant that also leaves each block's stripe absmax of the output in
 // amax[node * gridDim.x + blockIdx.x] (max over stripes = column absmax, exact) so
 // the persistent layer kernel can skip its absmax phase. Same norm arithmetic.
-__global__ void k_tq_qwen_rmsnorm_b_amax(float *out, const float *x, const uint16_t *weight,
+__global__ void __launch_bounds__(1024, 1)
+k_tq_qwen_rmsnorm_b_amax(float *out, const float *x, const uint16_t *weight,
                                          int N, float eps, float *amax) {
     __shared__ float smem[32];
     int tid = threadIdx.x;
@@ -3870,7 +3880,8 @@ __global__ void k_tq_qwen_rmsnorm_b_amax(float *out, const float *x, const uint1
 // add_rmsnorm_b variant with the stripe-absmax side output AND the b operand read
 // as an inline k-split reduction of GEMV partials (sum over splits / factors[node]),
 // folding the persistent kernel's out-projection reduce phase into this kernel.
-__global__ void k_tq_add_rmsnorm_b_amax_red(float *out, float *resid, const float *a,
+__global__ void __launch_bounds__(1024, 1)
+k_tq_add_rmsnorm_b_amax_red(float *out, float *resid, const float *a,
                                             const float *partials, const float *factors,
                                             int ks, const uint16_t *weight, int N, float eps,
                                             float *amax) {
@@ -3932,7 +3943,8 @@ __global__ void k_tq_add_rmsnorm_b_amax_red(float *out, float *resid, const floa
 }
 
 // add_rmsnorm_b variant with the same stripe-absmax side output.
-__global__ void k_tq_add_rmsnorm_b_amax(float *out, float *resid, const float *a, const float *b,
+__global__ void __launch_bounds__(1024, 1)
+k_tq_add_rmsnorm_b_amax(float *out, float *resid, const float *a, const float *b,
                                         const uint16_t *weight, int N, float eps, float *amax) {
     __shared__ float smem[32];
     int tid = threadIdx.x;
@@ -10134,7 +10146,8 @@ __global__ void k_tq_argmax_stage1(float *block_vals, int *block_ids, const floa
     }
 }
 
-__global__ void k_tq_argmax_stage2(float *out_val, int *out_id, const float *vals_in, const int *ids_in, int N) {
+__global__ void __launch_bounds__(1024, 1)
+k_tq_argmax_stage2(float *out_val, int *out_id, const float *vals_in, const int *ids_in, int N) {
     __shared__ float vals[1024];
     __shared__ int ids[1024];
     int tid = threadIdx.x;
@@ -14632,7 +14645,8 @@ __global__ void k_tq_gather_rows_nk(float *out, const float *src, const int *idx
 }
 
 // rmsnorm_b with an output stride/offset (for packing norms into fc_in[N x 2H]).
-__global__ void k_tq_qwen_rmsnorm_b_out(float *out, int out_stride, int out_off,
+__global__ void __launch_bounds__(1024, 1)
+k_tq_qwen_rmsnorm_b_out(float *out, int out_stride, int out_off,
                                         const float *x, const uint16_t *weight,
                                         int N, float eps) {
     __shared__ float smem[32];
