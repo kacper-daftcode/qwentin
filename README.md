@@ -338,42 +338,6 @@ the quality ceiling).
 | `TQ_ATTN_MMA_GROUP2=0` | revert the producer/consumer group-attention kernel to the 2-half variant (default on) |
 | `TQ_WIDE_CONV=0` | revert the wide prefill's chunk-parallel conv update to the serial per-token loop (default on; bit-identical either way) |
 
-### Coding-agent workload tuning (2026-08, measured on Qwen3.8-27B-FP8 / RTX 5090)
-
-Build with CUDA 13.x (13.3 + driver 595 measured); 12.9 loses ~10% decode to worse
-register allocation in the spec-decode persistent kernels.
-
-```bash
-# Recommended decode env for agentic coding loops (long contexts, many follow-up turns):
-TQ_MTP_VOCAB_CAP=32768 TQ_NGRAM_DRAFT=1
-```
-
-- `TQ_MTP_VOCAB_CAP=32768` caps the MTP draft LM head to the first 32k vocab rows.
-  Draft-side only (verify stays exact): ~+3-5% decode tok/s, accept-length unchanged.
-- `TQ_NGRAM_DRAFT=1` grafts copy chains from the conversation history into the spec
-  tree. Code generation repeats identifiers/indentation constantly, so follow-up
-  turns jump to accept-length ~5 (+45-55% decode; 4k: 140.9->217 tok/s, 32k:
-  142.3->211.5). Caveat: at 128k+ COLD context (no useful history) failed grafts
-  waste verify nodes (~-17% decode there); prefix-cached turns are unaffected and
-  dominate real agent loops.
-- Keep `--depth 6` (default). `--depth 8` wins only for follow-up turns at 128k+
-  (~+27%: 110.3->140.1) and loses ~10-15% at 4k-32k; not worth switching unless the
-  deployment is uniform long-context.
-
-### Prefill (2026-08, Qwen3.8 / RTX 5090)
-
-`k_tq_wide_attn_mma<3>` (Q4-KV wide prefill attention) was **L2-bandwidth-bound**
-(72% L2 vs 23% SM): each 16-query block re-streamed the K/V super-tiles. Two fixes:
-
-- 128-bit loads in the int4-K dequant path (8 scalar LDG.U8 -> 1 LDG.128 per
-  (key, channel-group); bit-identical values),
-- `TQ_WIDE_ATTN_QROWS=32` (default): two query tiles per block share one K/V pass;
-  numerics bit-identical per query row (verified: 48/48 fixed-point greedy argmax
-  agreement vs the stock build over a 24k continuation probe). `=16` restores legacy.
-
-Kernel: 2.17 ms -> 1.40 ms avg @65k (-35%). End-to-end cold prefill on code:
-32k: 1865 -> 2059 tok/s; **128k: 1078 -> 1399 tok/s (149.9 s -> 116.4 s wall)**.
-
 ## Verify
 
 The verify tools take the same `--tqf` / `--model-dir` / `--lib` paths as the servers
