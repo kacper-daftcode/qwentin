@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """OpenAI-compatible API server for the qwentin FP6 spec-decode engine.
 
-Endpoints: /v1/chat/completions, /v1/completions, /v1/models, /health.
+Endpoints: /v1/chat/completions, /v1/completions, /v1/models, /health,
+/v1/responses (OpenAI Responses API subset: messages/function calls streaming;
+added for the Codex CLI, which dropped wire_api=chat).
 Features: SSE streaming, temperature (lossless tree speculative sampling,
 TQ_TEMP kernel path; temp=0 = bit-exact greedy), per-request seed, stop
 strings + EOS, max_tokens, usage accounting + speculative stats
@@ -9,7 +11,9 @@ strings + EOS, max_tokens, usage accounting + speculative stats
 
 Single-stream engine: requests are serialized with a lock (queue waits).
 top_p: only 1.0 supported (v1 sampler); other values are clamped with a
-warning field. n>1, logprobs, tools: unsupported -> 400.
+warning field. tools: OpenAI function-calling via the Qwen <tool_call>
+convention (JSON or <function=> XML-ish), parsed and round-tripped.
+n>1, logprobs: unsupported -> 400.
 
 Reservoir Dogs -- the LLobotomy connection, in two halves:
 1) Bark (opt-in): --bark-all-day ports LLobotomy's Optimal-Transport refusal
@@ -600,6 +604,83 @@ def parse_tool_calls(text, tools=None):
     return clean.strip(), (calls or None)
 
 
+# --------------------------- /v1/responses ---------------------------
+# Minimal-but-correct OpenAI Responses API surface so the Codex CLI (which
+# dropped wire_api=chat) runs against the local tower. Translates the item
+# list to our chat messages, reuses the same generate() path (dogs, bark,
+# prefix cache all active), and re-emits the result as Responses SSE events.
+
+def _parse_jsonish(a):
+    if isinstance(a, str):
+        try:
+            return json.loads(a)
+        except Exception:
+            return a
+    return a if a is not None else {}
+
+
+def responses_to_chat_inputs(req):
+    """Responses request -> (messages, tools|None) in the internal chat shape."""
+    msgs = []
+    sys_parts = []                     # Qwen templates admit exactly ONE leading system
+    instr = req.get("instructions")
+    if instr:
+        sys_parts.append(instr)
+    inp = req.get("input", "")
+    if isinstance(inp, str):
+        if inp:
+            msgs.append({"role": "user", "content": inp})
+    else:
+        for item in inp:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type", "message")
+            if t == "message":
+                role = {"developer": "system"}.get(item.get("role"), item.get("role", "user"))
+                if role == "system":   # dev/system items fold into the single header system
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        content = "\n".join(c.get("text", "") for c in content
+                                            if isinstance(c, dict) and c.get("type") in
+                                            ("input_text", "output_text"))
+                    if content:
+                        sys_parts.append(content)
+                    continue
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for c in content:
+                        if isinstance(c, str):
+                            parts.append(c)
+                        elif isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
+                            parts.append(c.get("text", ""))
+                    content = "\n".join(p for p in parts if p)
+                msgs.append({"role": role, "content": content})
+            elif t == "function_call":
+                msgs.append({"role": "assistant", "content": None, "tool_calls": [{
+                    "id": item.get("call_id") or ("call_" + uuid.uuid4().hex[:16]),
+                    "type": "function",
+                    "function": {"name": item.get("name", ""),
+                                 "arguments": _parse_jsonish(item.get("arguments", {}))}}]})
+            elif t == "function_call_output":
+                msgs.append({"role": "tool",
+                             "tool_call_id": item.get("call_id", ""),
+                             "content": item.get("output", "")})
+            # reasoning items add no signal for the model here: dropped
+    if sys_parts:
+        msgs.insert(0, {"role": "system", "content": "\n\n".join(sys_parts)})
+    tools = []
+    for tb in req.get("tools") or []:
+        if isinstance(tb, dict) and tb.get("type") == "function" and "function" not in tb:
+            tools.append({"type": "function", "function": {
+                "name": tb.get("name", ""),
+                "description": tb.get("description", ""),
+                "parameters": tb.get("parameters", {})}})
+        elif isinstance(tb, dict):
+            tools.append(tb)
+    return msgs, (tools or None)
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -626,6 +707,174 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _do_responses(self, req):
+        """POST /v1/responses: Codex-CLI-grade subset (message/function_call items,
+        plain-text streaming, tool calling). Internally the same engine path as
+        /v1/chat/completions -- dogs bark identically."""
+        msgs, tools = responses_to_chat_inputs(req)
+        if req.get("n", 1) != 1 or req.get("logprobs"):
+            return self._json(400, {"error": {"message": "n>1/logprobs unsupported"}})
+        no_cache = bool(req.get("tl_no_cache", False))
+        dbg = bool(req.get("tl_debug", False))
+        temp = float(req.get("temperature", 1.0))
+        seed = int(req.get("seed", int.from_bytes(os.urandom(4), "little")))
+        max_new = int(req.get("max_output_tokens") or req.get("max_tokens") or 1024)
+        stops = req.get("stop") or []
+        if isinstance(stops, str):
+            stops = [stops]
+
+        ckw = dict(req.get("chat_template_kwargs") or {})
+        rs = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else None
+        if "enable_thinking" in req:
+            ckw["enable_thinking"] = bool(req["enable_thinking"])
+        elif "enable_thinking" in ckw:
+            pass
+        elif rs and rs.get("effort") is not None:
+            eff = str(rs.get("effort")).strip().lower()
+            ckw["enable_thinking"] = eff not in ("none", "minimal", "off", "0", "false", "")
+        elif args.no_thinking:
+            ckw["enable_thinking"] = False
+        try:
+            text = TOK.apply_chat_template(msgs, tools=tools, add_generation_prompt=True,
+                                           tokenize=False, **ckw)
+            ids = TOK(text, add_special_tokens=False).input_ids
+        except Exception as e:
+            print(f"[serve] responses template error: {e} -- roles: "
+                  f"{[m.get('role') for m in msgs]} -- items: "
+                  f"{[i.get('type') for i in (req.get('input') if isinstance(req.get('input'), list) else [])]}",
+                  file=sys.stderr, flush=True)
+            return self._json(400, {"error": {"message": f"chat template: {e}"}})
+        thinking_primed = text.rstrip().endswith("<think>")
+        if len(ids) < 2:
+            ids = (TOK("\n", add_special_tokens=False).input_ids + list(ids))[-2:]
+        if len(ids) + max_new > args.ctx:
+            max_new = max(1, args.ctx - len(ids))
+
+        rid = "resp_" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        stream = bool(req.get("stream", False))
+        oi_msg = 0                       # output_index of the message item
+        text_parts, stop_hit = [], threading.Event()
+        msg_item_id = "msg_" + uuid.uuid4().hex[:24]
+        on_tokens_ns = None
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            def sse(obj):
+                data = f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode()
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+
+            sse({"type": "response.created", "response": {
+                "id": rid, "object": "response", "created_at": created,
+                "model": args.model_name, "status": "in_progress", "output": []}})
+            sse({"type": "response.output_item.added", "output_index": oi_msg,
+                 "item": {"id": msg_item_id, "type": "message", "status": "in_progress",
+                          "role": "assistant", "content": []}})
+            sse({"type": "response.content_part.added", "output_index": oi_msg,
+                 "item_id": msg_item_id, "content_index": 0,
+                 "part": {"type": "output_text", "text": ""}})
+
+            dec_state = {"buf": []}
+
+            def on_tokens(toks):
+                if stop_hit.is_set():
+                    return
+                dec_state["buf"].extend(toks)
+                txt = TOK.decode(dec_state["buf"])
+                if txt.endswith("\ufffd"):
+                    return
+                if tools and (TOOL_OPEN in ("".join(text_parts) + txt) or dec_state.get("tool")):
+                    dec_state["tool"] = True         # buffer tool block to the end
+                    dec_state["buf"] = []
+                    text_parts.append(txt)
+                    return
+                dec_state["buf"] = []
+                text_parts.append(txt)
+                full_ns = "".join(text_parts)
+                for st in stops:
+                    if st and st in full_ns:
+                        stop_hit.set()
+                        return
+                sse({"type": "response.output_text.delta", "output_index": oi_msg,
+                     "item_id": msg_item_id, "content_index": 0, "delta": txt})
+
+            on_tokens_ns = None
+        else:
+            def on_tokens(toks):
+                text_parts.append(TOK.decode(toks))
+
+        try:
+            ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
+                                           no_cache=no_cache, dbg=dbg)
+        except BrokenPipeError:
+            return
+        full = "".join(text_parts)
+        for st in stops:
+            if st and st in full:
+                full = full.split(st)[0]
+        reasoning = ""
+        if thinking_primed:
+            reasoning, full = split_think(full, thinking_primed)
+            reasoning, full = reasoning.strip("\n"), full.lstrip("\n")
+        tool_calls = None
+        if tools:
+            full, tool_calls = parse_tool_calls(full, tools)
+        full = full or None
+
+        out_items = []
+        if reasoning:
+            out_items.append({"id": "rs_" + uuid.uuid4().hex[:20], "type": "reasoning",
+                              "summary": [{"type": "summary_text", "text": reasoning}]})
+        msg_out = {"id": msg_item_id, "type": "message", "status": "completed",
+                   "role": "assistant",
+                   "content": ([{"type": "output_text", "text": full}] if full else [])}
+        out_items.append(msg_out)
+        fc_items = []
+        for tc in (tool_calls or []):
+            fc_items.append({"id": "fc_" + uuid.uuid4().hex[:20], "type": "function_call",
+                             "status": "completed", "call_id": tc["id"],
+                             "name": tc["function"]["name"],
+                             "arguments": tc["function"]["arguments"]})
+        out_items.extend(fc_items)
+
+        resp_obj = {"id": rid, "object": "response", "created_at": created,
+                    "model": args.model_name, "status": "completed",
+                    "output": out_items,
+                    "usage": {"input_tokens": len(ids), "output_tokens": ngen,
+                              "total_tokens": len(ids) + ngen},
+                    "x_qwentin": stats}
+        if stream:
+            sse({"type": "response.output_text.done", "output_index": oi_msg,
+                 "item_id": msg_item_id, "content_index": 0, "text": full or ""})
+            sse({"type": "response.content_part.done", "output_index": oi_msg,
+                 "item_id": msg_item_id, "content_index": 0,
+                 "part": {"type": "output_text", "text": full or ""}})
+            sse({"type": "response.output_item.done", "output_index": oi_msg,
+                 "item": msg_out})
+            oi = 1
+            for fc in fc_items:
+                sse({"type": "response.output_item.added", "output_index": oi,
+                     "item": {**fc, "arguments": ""}})
+                sse({"type": "response.function_call_arguments.delta",
+                     "output_index": oi, "item_id": fc["id"], "delta": fc["arguments"]})
+                sse({"type": "response.function_call_arguments.done",
+                     "output_index": oi, "item_id": fc["id"], "arguments": fc["arguments"]})
+                sse({"type": "response.output_item.done", "output_index": oi, "item": fc})
+                oi += 1
+            sse({"type": "response.completed", "response": resp_obj})
+            data = b"data: [DONE]\n\n"
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        self._json(200, resp_obj)
+
     def do_GET(self):
         if self.path == "/health":
             return self._json(200, {"status": "ok"})
@@ -642,6 +891,8 @@ class H(BaseHTTPRequestHandler):
             return self._json(400, {"error": {"message": f"bad json: {e}"}})
         chat = self.path.rstrip("/").endswith("/chat/completions")
         comp = self.path.rstrip("/").endswith("/completions") and not chat
+        if self.path.rstrip("/").endswith("/responses"):
+            return self._do_responses(req)
         if not (chat or comp):
             return self._json(404, {"error": {"message": "not found"}})
         if req.get("n", 1) != 1 or req.get("logprobs"):
