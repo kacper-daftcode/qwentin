@@ -491,7 +491,14 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                     mode, reused = "live", C       # committed state continues at C
             if mode == "full":
                 A = PC["anchor"]
-                if (0 < A < P and A >= need and P >= PC["high"]
+                # no P >= PC["high"] requirement: the anchor restore rewinds to
+                # slot 0 and re-prefills A..P on the same chunk grid regardless
+                # of how far the previous generation ran; rows >= P are cleared
+                # below. Greedy Codex turns legitimately SHRINK vs committed
+                # state (reasoning items are dropped from the history the
+                # client sends back), and the old gate forced a full 30s
+                # re-prefill after every long think (2026-08-18).
+                if (0 < A < P and A >= need
                         and prompt_ids[:A] == PC["prompt"][:A]):
                     mode, reused = "anchor", A     # slot-0 restore, bit-identical
         PC["valid"] = False        # re-validated when this request finishes
