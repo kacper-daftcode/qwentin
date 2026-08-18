@@ -1012,10 +1012,13 @@ class H(BaseHTTPRequestHandler):
             # budget burned inside an unclosed think block: the completed message
             # used to be empty (Codex app then shows a blank bubble). Tell the user.
             full = "[generation stopped: token budget exhausted inside reasoning; retry with higher effort/budget]"
-        elif not full and reasoning:
+        elif not full and reasoning and not tool_calls:
             # the think closed cleanly but the model put the WHOLE answer in the
             # reasoning channel (message body empty): same blank-bubble failure,
             # different cause -- and this one emits no signal at all otherwise.
+            # NEVER on pure tool-call turns: parse_tool_calls() consumes the
+            # answer into the call items, so full=="" there is normal, not a
+            # failure (the 11:56 regression: ~25 bogus markers in one thread).
             full = "[empty response: the entire answer went into the reasoning channel; retry or disable reasoning]"
         full = full or None
 
