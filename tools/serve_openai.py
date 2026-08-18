@@ -50,6 +50,7 @@ Test: curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user",
       "content":"Hej!"}],"temperature":0.8,"max_tokens":64,"stream":true}'
 """
 from __future__ import annotations
+import math
 import argparse, ctypes, json, os, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -342,7 +343,8 @@ if args.bark_all_day:
         _p = [x.strip() for x in args.bark_decay_default.split(",")]
         DEF_SCHED = {"end": float(_p[0]),
                      "len": int(_p[1]) if len(_p) > 1 and _p[1] else 192,
-                     "reset_think": len(_p) > 2 and _p[2] in ("reset", "1", "true")}
+                     "reset_think": len(_p) > 2 and _p[2] in ("reset", "1", "true"),
+                     "shape": _p[3] if len(_p) > 3 and _p[3] else "linear"}
         print(f"[bark] default schedule -> {DEF_SCHED}", flush=True)
     if args.bark_sched_api or DEF_SCHED is not None:
         LIB.qwn_ot_set_scale.restype = ctypes.c_int
@@ -411,9 +413,30 @@ def _req_think_cap(req, thinking_primed):
     return int(req.get("think_cap") or args.think_cap or 0)
 
 
+def _shape_fn(name, f, p=0.5):
+    """Decay-shape curves on normalized progress f in [0,1]. All are convex
+    variants of 'thick short head, long thin tail' -- spiral risk is a
+    short-window residence effect, so leave the high-scale region fast but
+    never drop the refusal floor. linear=baseline; pow=f**p (p<1 front-decays);
+    exp=(1-e^-3f)/(1-e^-3); invlog=1/ln-normalized (the 1/ln(sqrt(x)) family)."""
+    f = min(1.0, max(0.0, f))
+    if f <= 0.0 or f >= 1.0:
+        return f
+    if name == "pow":
+        return f ** p
+    if name == "exp":
+        d = 1.0 - math.exp(-3.0)
+        return (1.0 - math.exp(-3.0 * f)) / d
+    if name == "invlog":
+        d = 1.0 - math.log(2.0) / math.log(21.0)
+        return (1.0 - math.log(2.0) / math.log(2.0 + 19.0 * f)) / d
+    return f   # linear
+
+
 def _bark_step(sched, n_out):
-    """Per-round bark schedule: linear decay s0 -> s1 over L emitted tokens."""
+    """Per-round bark schedule: shaped decay s0 -> s1 over L emitted tokens."""
     f = min(1.0, max(0, n_out - sched["base"]) / sched["L"])
+    f = _shape_fn(sched.get("shape", "linear"), f, sched.get("p", 0.5))
     s = sched["s0"] + (sched["s1"] - sched["s0"]) * f
     if s != sched["applied"]:
         for ln in BARK["layers"]:
@@ -437,6 +460,8 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
             sched = {"s0": args.ot_scale, "s1": float(bd["end"]),
                      "L": max(1, int(bd.get("len") or 192)),
                      "reset": bool(bd.get("reset_think")),
+                     "shape": str(bd.get("shape") or "linear"),
+                     "p": float(bd.get("p") or 0.5),
                      "reset_done": False, "base": 0, "applied": None}
             _bark_step(sched, 0)            # prefill itself runs at s0
         # ---- prefix-cache decision (token-level, against the LAST request) ----
@@ -588,6 +613,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
     if sched is not None:
         stats["bark_sched"] = {"s0": sched["s0"], "s1": sched["s1"], "L": sched["L"],
                                "reset": sched["reset"], "reset_done": sched["reset_done"],
+                               "shape": sched.get("shape", "linear"),
                                "final": sched["applied"]}
     if dogs is not None:
         stats["dogs"] = {"ladder": _dogs_ladder_labels(dogs.ladder),
