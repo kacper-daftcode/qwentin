@@ -727,6 +727,24 @@ def _parse_jsonish(a):
     return a if a is not None else {}
 
 
+_FAILURE_MARKERS = ("[generation stopped:", "[empty response:")
+
+
+def _strip_failure_markers(msgs):
+    """Drop assistant messages that are OUR dead-generation markers: once they land
+    in the conversation history, greedy decoding echoes the failure verbatim
+    (measured 2026-08-18: the morning incident marker came back as the whole
+    answer). The markers are server artifacts, not user content."""
+    out = []
+    for m in msgs:
+        c = m.get("content") if isinstance(m, dict) else None
+        if (m.get("role") == "assistant" and isinstance(c, str)
+                and c.strip().startswith(_FAILURE_MARKERS)):
+            continue
+        out.append(m)
+    return out
+
+
 def responses_to_chat_inputs(req):
     """Responses request -> (messages, tools|None) in the internal chat shape."""
     msgs = []
@@ -786,6 +804,7 @@ def responses_to_chat_inputs(req):
                 "parameters": tb.get("parameters", {})}})
         elif isinstance(tb, dict):
             tools.append(tb)
+    msgs = _strip_failure_markers(msgs)
     return msgs, (tools or None)
 
 
@@ -1097,6 +1116,7 @@ class H(BaseHTTPRequestHandler):
         thinking_primed = False
         if chat:
             msgs = req.get("messages", [])
+            msgs = _strip_failure_markers(list(msgs))
             # OpenAI wire format carries tool_call arguments as a JSON STRING;
             # the Qwen template iterates them as a mapping -- parse in place.
             for m in msgs:
