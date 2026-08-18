@@ -879,6 +879,10 @@ class H(BaseHTTPRequestHandler):
         tool_calls = None
         if tools:
             full, tool_calls = parse_tool_calls(full, tools)
+        if not full and reasoning and finish == "length":
+            # budget burned inside an unclosed think block: the completed message
+            # used to be empty (Codex app then shows a blank bubble). Tell the user.
+            full = "[generation stopped: token budget exhausted inside reasoning; retry with higher effort/budget]"
         full = full or None
 
         out_items = []
