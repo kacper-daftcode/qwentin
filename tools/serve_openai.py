@@ -14,6 +14,11 @@ top_p: only 1.0 supported (v1 sampler); other values are clamped with a
 warning field. tools: OpenAI function-calling via the Qwen <tool_call>
 convention (JSON or <function=> XML-ish), parsed and round-tripped.
 n>1, logprobs: unsupported -> 400.
+hosted tools: web_search runs server-side (the Codex app/CLI send it as a
+hosted Responses tool): URLs from the last user turn are fetched, the page
+text is injected into the prompt; URL-free lookup turns (gated by an intent
+regex) go to DuckDuckGo and the top results are injected. A web_search_call
+item is emitted either way.
 
 Reservoir Dogs -- the LLobotomy connection, in two halves:
 1) Bark (opt-in): --bark-all-day ports LLobotomy's Optimal-Transport refusal
@@ -51,7 +56,10 @@ Test: curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user",
 """
 from __future__ import annotations
 import math
-import argparse, ctypes, json, os, sys, threading, time, uuid
+import argparse, ctypes, json, os, re, sys, threading, time, uuid
+import html as _html
+import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -766,6 +774,174 @@ def parse_tool_calls(text, tools=None):
 # list to our chat messages, reuses the same generate() path (dogs, bark,
 # prefix cache all active), and re-emits the result as Responses SSE events.
 
+# ----------------------- hosted web_search -----------------------
+# Codex app/CLI send {"type": "web_search"} as a hosted Responses tool: the
+# OpenAI backend executes it server-side, so a local server that ignores it
+# answers "read this URL" prompts from memory alone. We run it ourselves:
+# URLs from the last user turn are fetched, their text is injected into the
+# prompt, and a completed web_search_call item lands in the output.
+
+_HOSTED_TOOLS = {"web_search", "web_search_preview"}
+_WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+_WEB_MAX_BYTES = 1_500_000          # raw download cap per page
+_WEB_MAX_CHARS = 24_000             # injected text cap per page (~6k tokens)
+_WEB_MAX_PAGES = 3
+_WEB_TIMEOUT = 15
+_URL_RE = re.compile(r"https?://[^\s)\]<>'\"`]+", re.I)
+_HTML_DROP = re.compile(r"(?is)<!--.*?-->|<(script|style|noscript|svg|head)[^>]*>.*?</\1>")
+
+# TTL cache: an agentic thread re-requests the same URL every turn (the
+# injection lives only in the prompt, never in client-side history), so a
+# network fetch per turn is pure overhead. 10 min, small dict.
+_WEB_CACHE = {}
+_WEB_CACHE_TTL = 600
+_WEB_CACHE_LOCK = threading.Lock()
+
+
+def _html_to_text(doc):
+    doc = _HTML_DROP.sub(" ", doc)
+    doc = re.sub(r"(?i)<br\s*/?>", "\n", doc)
+    doc = re.sub(r"(?i)</(p|div|li|tr|h[1-6]|ul|ol|table|section|article|header|footer)>",
+                 "\n", doc)
+    doc = re.sub(r"<[^>]+>", " ", doc)
+    doc = _html.unescape(doc)
+    doc = re.sub(r"[^\S\n]+", " ", doc)
+    doc = re.sub(r"\n[ \t]+", "\n", doc)
+    doc = re.sub(r"\n{3,}", "\n\n", doc)
+    return doc.strip()
+
+
+def _web_fetch(url):
+    """-> (url, text|None, err|None)"""
+    with _WEB_CACHE_LOCK:
+        hit = _WEB_CACHE.get(url)
+    if hit and time.time() - hit[0] < _WEB_CACHE_TTL:
+        return url, hit[1], hit[2]
+    try:
+        rq = urllib.request.Request(url, headers={"User-Agent": _WEB_UA})
+        with urllib.request.urlopen(rq, timeout=_WEB_TIMEOUT) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            raw = r.read(_WEB_MAX_BYTES + 1)[:_WEB_MAX_BYTES]
+        text = raw.decode("utf-8", "replace")
+        if "html" in ctype or "<html" in text[:4096].lower():
+            text = _html_to_text(text)
+        result = (text[:_WEB_MAX_CHARS], None)
+    except Exception as e:
+        result = (None, f"{type(e).__name__}: {e}")
+    with _WEB_CACHE_LOCK:
+        if len(_WEB_CACHE) > 64:
+            _WEB_CACHE.clear()
+        _WEB_CACHE[url] = (time.time(),) + result
+    return (url,) + result
+
+
+def _web_pages_for(msgs):
+    """Fetch URLs from the MOST RECENT user turn (Codex links land there)."""
+    for m in reversed(msgs):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            seen, urls = set(), []
+            for u in _URL_RE.findall(m["content"]):
+                u = u.rstrip(".,;")
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+                if len(urls) >= _WEB_MAX_PAGES:
+                    break
+            if urls:
+                return [_web_fetch(u) for u in urls]
+    return []
+
+
+# --------------------------- query search ----------------------------------
+# No URL in the turn: run a DuckDuckGo query instead -- but ONLY when the
+# message looks like a lookup. The CLI now attaches web_search to every turn,
+# so without an intent gate every short agentic prompt ("run ls") would get
+# junk results injected into its context.
+
+_WEB_MAX_RESULTS = 5
+_SEARCH_MAX_QUERY = 300
+_SEARCH_MAX_WORDS = 60
+_SEARCH_INTENT = re.compile(
+    r"(?i)(?:\bsearch\b|\blook\s?up\b|\bgoogl\w*\b|\bduckduckgo\b|\bbing\b"
+    r"|\blatest\b|\bcurrent\b|\brecent\b|\bnews\b"
+    r"|\bwyszuk\w*|\bposzuk\w*|\bznajd\w*|\baktualn\w*|\bnajnowsz\w*|\bco nowego\b"
+    r"|\bCVE-\d{4}-\d{4,7}\b|\bGHSA(?:-[a-z0-9]{4}){3}\b|\bRUSTSEC-\S+\b)")
+
+
+def _search_query_for(msgs):
+    """Most recent user turn -> web query, or None when it's not a lookup."""
+    for m in reversed(msgs):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            q = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", m["content"])  # [t](url) -> t
+            q = _URL_RE.sub(" ", q)
+            q = re.sub(r"\s+", " ", q).strip()
+            if (3 <= len(q) <= _SEARCH_MAX_QUERY and len(q.split()) <= _SEARCH_MAX_WORDS
+                    and re.search(r"[A-Za-zÀ-ɏ]", q) and _SEARCH_INTENT.search(q)):
+                return q
+            return None
+    return None
+
+
+def _strip_tags(s):
+    s = re.sub(r"(?is)<!--.*?-->|<(script|style)[^>]*>.*?</\1>", " ", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", _html.unescape(s)).strip()
+
+
+def _ddg_url(href):
+    """Unwrap duckduckgo.com/l/?uddg= redirect links to the real URL."""
+    if href.startswith("//"):
+        href = "https:" + href
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+    return qs.get("uddg", [href])[0]
+
+
+def _ddg_parse(doc, link_pat, snip_pat):
+    links = re.findall(link_pat, doc)
+    snips = re.findall(snip_pat, doc)
+    out = []
+    for i, (href, title) in enumerate(links[:_WEB_MAX_RESULTS]):
+        snip = _strip_tags(snips[i]) if i < len(snips) else ""
+        out.append((_strip_tags(title), _ddg_url(_html.unescape(href)), snip))
+    return [r for r in out if r[1].startswith("http")]
+
+
+def _ddg_search(query):
+    """DuckDuckGo html endpoint (JS-free), lite endpoint as fallback.
+    -> (results|None, err|None); results = [(title, url, snippet)]"""
+    q = urllib.parse.quote_plus(query)
+    err = None
+    for base, link_pat, snip_pat in (
+        ("https://html.duckduckgo.com/html/?q=",
+         r'(?is)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+         r'(?is)<a[^>]+class="result__snippet"[^>]*>(.*?)</a>'),
+        ("https://lite.duckduckgo.com/lite/?q=",
+         r"(?is)<a[^>]+class=['\"]result-link['\"][^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+         r"(?is)<td[^>]+class=['\"]result-snippet['\"][^>]*>(.*?)</td>"),
+    ):
+        try:
+            rq = urllib.request.Request(base + q, headers={"User-Agent": _WEB_UA})
+            with urllib.request.urlopen(rq, timeout=_WEB_TIMEOUT) as r:
+                doc = r.read(_WEB_MAX_BYTES + 1)[:_WEB_MAX_BYTES].decode("utf-8", "replace")
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            continue
+        results = _ddg_parse(doc, link_pat, snip_pat)
+        if results:
+            return results, None
+    return None, (err or "no results")
+
+
+def _inject_into_last_user(msgs, note):
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            c = msgs[i].get("content")
+            msgs[i] = dict(msgs[i], content=(c if isinstance(c, str) else "")
+                            + "\n\n" + note)
+            return True
+    return False
+
 def _parse_jsonish(a):
     if isinstance(a, str):
         try:
@@ -850,6 +1026,8 @@ def responses_to_chat_inputs(req):
                 "name": tb.get("name", ""),
                 "description": tb.get("description", ""),
                 "parameters": tb.get("parameters", {})}})
+        elif isinstance(tb, dict) and tb.get("type") in _HOSTED_TOOLS:
+            continue            # hosted tools run server-side, not in the prompt
         elif isinstance(tb, dict):
             tools.append(tb)
     msgs = _strip_failure_markers(msgs)
@@ -887,6 +1065,44 @@ class H(BaseHTTPRequestHandler):
         plain-text streaming, tool calling). Internally the same engine path as
         /v1/chat/completions -- dogs bark identically."""
         msgs, tools = responses_to_chat_inputs(req)
+        ws_item = None
+        if any(isinstance(t, dict) and t.get("type") in _HOSTED_TOOLS
+               for t in req.get("tools") or []):
+            web_pages = _web_pages_for(msgs)
+            if web_pages:
+                blobs = []
+                for url, text, err in web_pages:
+                    body = text if text is not None else f"[fetch failed: {err}]"
+                    blobs.append(f'<web_content url="{url}">\n{body}\n</web_content>')
+                note = ("Web content fetched by the server-side web_search tool; "
+                        "answer from it and cite the URL(s).\n\n" + "\n\n".join(blobs))
+                _inject_into_last_user(msgs, note)
+                ws_item = {"id": "ws_" + uuid.uuid4().hex[:20], "type": "web_search_call",
+                           "status": "completed",
+                           "action": {"type": "open_page", "url": web_pages[0][0]}}
+                print(f"[serve] web_search: {len(web_pages)} page(s) (net+cache): "
+                      + ", ".join(u for u, _, _ in web_pages), flush=True)
+            else:
+                query = _search_query_for(msgs)
+                if query:
+                    results, err = _ddg_search(query)
+                    if results:
+                        lines = [f'Web search results for "{query}" (server-side '
+                                 "web_search tool; answer from them and cite the URLs).",
+                                 ""]
+                        lines += [f"{n}. {title}\n   {url}\n   {snip}"
+                                  for n, (title, url, snip) in enumerate(results, 1)]
+                        note = "\n".join(lines)
+                    else:
+                        note = (f'Web search for "{query}" was run server-side '
+                                f"(web_search tool) but failed: {err}.")
+                    _inject_into_last_user(msgs, note)
+                    ws_item = {"id": "ws_" + uuid.uuid4().hex[:20],
+                               "type": "web_search_call", "status": "completed",
+                               "action": {"type": "search", "query": query}}
+                    print(f"[serve] web_search: \"{query}\" -> "
+                          f"{len(results or [])} result(s)"
+                          + ("" if results else f" ({err})"), flush=True)
         if req.get("n", 1) != 1 or req.get("logprobs"):
             return self._json(400, {"error": {"message": "n>1/logprobs unsupported"}})
         no_cache = bool(req.get("tl_no_cache", False))
@@ -935,7 +1151,9 @@ class H(BaseHTTPRequestHandler):
         # reasoning streams as its own Responses item (the Codex app renders it in
         # the thinking bubble); only post-</think> text belongs to the message item
         THINK_END = "</think>"
-        oi_msg = 1 if thinking_primed else 0
+        oi_ws = 0 if ws_item else None
+        oi_rs = (1 if ws_item else 0) if thinking_primed else None
+        oi_msg = (1 if ws_item else 0) + (1 if thinking_primed else 0)
         rs_item_id = "rs_" + uuid.uuid4().hex[:20]
         text_parts, stop_hit = [], threading.Event()
         msg_item_id = "msg_" + uuid.uuid4().hex[:24]
@@ -959,10 +1177,19 @@ class H(BaseHTTPRequestHandler):
             sse({"type": "response.created", "response": {
                 "id": rid, "object": "response", "created_at": created,
                 "model": args.model_name, "status": "in_progress", "output": []}})
+            if ws_item:
+                sse({"type": "response.output_item.added", "output_index": oi_ws,
+                     "item": {**ws_item, "status": "in_progress"}})
+                sse({"type": "response.web_search_call.in_progress",
+                     "output_index": oi_ws, "item_id": ws_item["id"]})
+                sse({"type": "response.web_search_call.completed",
+                     "output_index": oi_ws, "item_id": ws_item["id"]})
+                sse({"type": "response.output_item.done", "output_index": oi_ws,
+                     "item": ws_item})
             if thinking_primed:
-                sse({"type": "response.output_item.added", "output_index": 0,
+                sse({"type": "response.output_item.added", "output_index": oi_rs,
                      "item": {"id": rs_item_id, "type": "reasoning", "summary": []}})
-                sse({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                sse({"type": "response.reasoning_summary_part.added", "output_index": oi_rs,
                      "item_id": rs_item_id, "summary_index": 0,
                      "part": {"type": "summary_text", "text": ""}})
             sse({"type": "response.output_item.added", "output_index": oi_msg,
@@ -1008,7 +1235,7 @@ class H(BaseHTTPRequestHandler):
                         d = rs_all[dec_state["rs_sent"]:]
                         if d:
                             sse({"type": "response.reasoning_summary_text.delta",
-                                 "output_index": 0, "item_id": rs_item_id,
+                                 "output_index": oi_rs, "item_id": rs_item_id,
                                  "summary_index": 0, "delta": d})
                         dec_state["rs_sent"] = len(rs_all)
                         dec_state["think_open"] = False
@@ -1023,7 +1250,7 @@ class H(BaseHTTPRequestHandler):
                         d = body[dec_state["rs_sent"]:]
                         if d:
                             sse({"type": "response.reasoning_summary_text.delta",
-                                 "output_index": 0, "item_id": rs_item_id,
+                                 "output_index": oi_rs, "item_id": rs_item_id,
                                  "summary_index": 0, "delta": d})
                         dec_state["rs_sent"] = len(body)
                     return
@@ -1071,8 +1298,10 @@ class H(BaseHTTPRequestHandler):
         full = full or None
 
         out_items = []
+        if ws_item:
+            out_items.append(ws_item)
         if reasoning:
-            out_items.append({"id": "rs_" + uuid.uuid4().hex[:20], "type": "reasoning",
+            out_items.append({"id": rs_item_id, "type": "reasoning",
                               "summary": [{"type": "summary_text", "text": reasoning}]})
         msg_out = {"id": msg_item_id, "type": "message", "status": "completed",
                    "role": "assistant",
@@ -1094,13 +1323,15 @@ class H(BaseHTTPRequestHandler):
                     "x_qwentin": stats}
         if stream:
             if thinking_primed:
-                sse({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                sse({"type": "response.reasoning_summary_text.done", "output_index": oi_rs,
                      "item_id": rs_item_id, "summary_index": 0, "text": reasoning})
-                sse({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                sse({"type": "response.reasoning_summary_part.done", "output_index": oi_rs,
                      "item_id": rs_item_id, "summary_index": 0,
                      "part": {"type": "summary_text", "text": reasoning}})
-                sse({"type": "response.output_item.done", "output_index": 0,
-                     "item": out_items[0]})
+                sse({"type": "response.output_item.done", "output_index": oi_rs,
+                     "item": {"id": rs_item_id, "type": "reasoning",
+                              "summary": ([{"type": "summary_text", "text": reasoning}]
+                                          if reasoning else [])}})
             sse({"type": "response.output_text.done", "output_index": oi_msg,
                  "item_id": msg_item_id, "content_index": 0, "text": full or ""})
             sse({"type": "response.content_part.done", "output_index": oi_msg,
