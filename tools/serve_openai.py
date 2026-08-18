@@ -95,6 +95,18 @@ ap.add_argument("--ot-scale", type=float, default=0.47,
                      " (2026-08-16): refusal leaks 5/6 @0.21, 2/6 @0.40-0.44, clean 0/6 from"
                      " 0.47 up; below that the bf16-HF lab value (0.21) does not transfer."
                      " Re-tune per tower/quantization: probe through the live API")
+ap.add_argument("--bark-decay-default", default=os.environ.get("TQ_BARK_DECAY", ""),
+                help="default bark schedule for every request: END,LEN[,reset] "
+                     "e.g. 0.35,400,reset -- scale decays --ot-scale->END over LEN "
+                     "generated tokens, restarting after </think>. Empty = fixed scale. "
+                     "Env: TQ_BARK_DECAY")
+ap.add_argument("--bark-sched-api", action="store_true", default=False,
+                help="allow per-request bark schedules via the bark_decay request field "
+                     "(keys: end, len, reset_think): the OT scale decays linearly from "
+                     "--ot-scale to end over len generated tokens -- refusal is front-loaded, "
+                     "so dose the opening hard and spare the tail (loop accumulation is "
+                     "exposure-time). reset_think restarts the decay when </think> commits. "
+                     "Requests without bark_decay run the fixed scale. Test knob.")
 ap.add_argument("--prefix-cache", dest="prefix_cache", action="store_true", default=True,
                 help="reuse engine state across requests sharing a token prefix (default ON)")
 ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
@@ -247,6 +259,11 @@ for name in ("<|im_end|>", "<|endoftext|>"):
             EOS_IDS.add(int(t))
     except Exception:
         pass
+THINK_CLOSE = None
+try:
+    THINK_CLOSE = TOK.convert_tokens_to_ids("</think>")
+except Exception:
+    pass
 
 # Prefix/KV cache between requests (single slot: the engine holds ONE sequence).
 #   prompt : token ids of the request that produced the engine state. The
@@ -283,6 +300,7 @@ if args.dogs:
     LIB.qwn_spec_persist_dump.restype = ctypes.c_int
     LIB.qwn_spec_persist_dump.argtypes = [ctypes.POINTER(ctypes.c_int)]
 BARK = None
+DEF_SCHED = None
 if args.bark_all_day:
     if not args.ot_maps:
         sys.exit("--bark-all-day needs --ot-maps PATH (or TQ_OT_MAPS)")
@@ -310,6 +328,18 @@ if args.bark_all_day:
     BARK = {"layers": _armed, "scale": args.ot_scale, "maps": os.path.basename(args.ot_maps)}
     print(f"[bark] OT hooks armed on layers {_armed}, scale={args.ot_scale:g} "
           f"({args.ot_maps}) -- the tower barks all day now", flush=True)
+    DEF_SCHED = None
+    if args.bark_decay_default:
+        _p = [x.strip() for x in args.bark_decay_default.split(",")]
+        DEF_SCHED = {"end": float(_p[0]),
+                     "len": int(_p[1]) if len(_p) > 1 and _p[1] else 192,
+                     "reset_think": len(_p) > 2 and _p[2] in ("reset", "1", "true")}
+        print(f"[bark] default schedule -> {DEF_SCHED}", flush=True)
+    if args.bark_sched_api or DEF_SCHED is not None:
+        LIB.qwn_ot_set_scale.restype = ctypes.c_int
+        LIB.qwn_ot_set_scale.argtypes = [ctypes.c_int, ctypes.c_float]
+    if args.bark_sched_api:
+        print("[bark] schedule API on: per-request bark_decay overrides accepted", flush=True)
 print(f"[serve] ready on :{args.port} (eos={sorted(EOS_IDS)}, "
       f"prefix_cache={'on' if args.prefix_cache else 'off'}"
       f"{'+live' if args.prefix_cache_live else ''}, "
@@ -365,13 +395,34 @@ def _pc_store(prompt_ids, anchor, eng_extra, temp, rounds):
     PC["valid"] = True
 
 
-def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=False):
+def _bark_step(sched, n_out):
+    """Per-round bark schedule: linear decay s0 -> s1 over L emitted tokens."""
+    f = min(1.0, max(0, n_out - sched["base"]) / sched["L"])
+    s = sched["s0"] + (sched["s1"] - sched["s0"]) * f
+    if s != sched["applied"]:
+        for ln in BARK["layers"]:
+            LIB.qwn_ot_set_scale(ln, ctypes.c_float(s))
+        sched["applied"] = s
+
+
+def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=False,
+             bark_decay=None):
     """Run spec rounds; call on_tokens(new_token_list) as chunks commit.
     Returns (gen_count, finish_reason, stats)."""
     P = len(prompt_ids)
     t0 = time.time()
     with ENG_LOCK:
         LIB.qwn_set_sampling(ctypes.c_float(temp), ctypes.c_ulonglong(seed))
+        sched = None
+        bd = bark_decay if (args.bark_sched_api and isinstance(bark_decay, dict)) else None
+        if bd is None:
+            bd = DEF_SCHED
+        if BARK is not None and isinstance(bd, dict) and bd.get("end") is not None:
+            sched = {"s0": args.ot_scale, "s1": float(bd["end"]),
+                     "L": max(1, int(bd.get("len") or 192)),
+                     "reset": bool(bd.get("reset_think")),
+                     "reset_done": False, "base": 0, "applied": None}
+            _bark_step(sched, 0)            # prefill itself runs at s0
         # ---- prefix-cache decision (token-level, against the LAST request) ----
         mode, reused = "full", 0
         if args.prefix_cache and not no_cache and PC["valid"]:
@@ -439,55 +490,66 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         t1 = time.time()
         dogs = _Dogs(args.depth, args.k) if args.dogs else None
         dense = False          # Mr. Pink's shift: dense decode for the remaining tokens
-        while len(out) < max_new:
-            if dense:
-                nt = LIB.qwn_decode(int(cur_seed), int(cur_pos))
-                if nt < 0:
-                    finish = "error"
-                    break
-                chunk = [nt]
-                cur_seed, cur_pos = nt, cur_pos + 1
-                d_now = 1
-            else:
-                d_eff, k_eff = dogs.params if dogs else (args.depth, args.k)
-                cl = _spec_round_guarded(cur_seed, cur_pos, d_eff, k_eff,
-                                         chain_buf, st_buf, dogs)
-                if cl < 0:
-                    if dogs is None:
+        try:
+            while len(out) < max_new:
+                if sched is not None:
+                    _bark_step(sched, len(out))
+                if dense:
+                    nt = LIB.qwn_decode(int(cur_seed), int(cur_pos))
+                    if nt < 0:
                         finish = "error"
                         break
-                    # state through cur_pos is untouched by a failed round
-                    # (tree build/config errors abort before any commit)
-                    dogs.log(f"Mr. Pink walks: spec round error {cl} at pos {cur_pos} "
-                             f"after {len(out)} tokens; dense decode finishes the job")
-                    dense = True
-                    continue
-                chunk = list(chain_buf[1:cl])
-                rounds += 1
-                cur_seed, cur_pos = st_buf[0], st_buf[1]
-                d_now = d_eff
-                if dogs:
-                    dogs.note(len(chunk), cur_pos)
-                    if dogs.params is None:
+                    chunk = [nt]
+                    cur_seed, cur_pos = nt, cur_pos + 1
+                    d_now = 1
+                else:
+                    d_eff, k_eff = dogs.params if dogs else (args.depth, args.k)
+                    cl = _spec_round_guarded(cur_seed, cur_pos, d_eff, k_eff,
+                                             chain_buf, st_buf, dogs)
+                    if cl < 0:
+                        if dogs is None:
+                            finish = "error"
+                            break
+                        # state through cur_pos is untouched by a failed round
+                        # (tree build/config errors abort before any commit)
+                        dogs.log(f"Mr. Pink walks: spec round error {cl} at pos {cur_pos} "
+                                 f"after {len(out)} tokens; dense decode finishes the job")
                         dense = True
-            eng_extra.extend(chunk)
-            cut = None
-            for i, t in enumerate(chunk):
-                if t in EOS_IDS:
-                    cut = i
+                        continue
+                    chunk = list(chain_buf[1:cl])
+                    rounds += 1
+                    cur_seed, cur_pos = st_buf[0], st_buf[1]
+                    d_now = d_eff
+                    if dogs:
+                        dogs.note(len(chunk), cur_pos)
+                        if dogs.params is None:
+                            dense = True
+                eng_extra.extend(chunk)
+                cut = None
+                for i, t in enumerate(chunk):
+                    if t in EOS_IDS:
+                        cut = i
+                        break
+                if cut is not None:
+                    out.extend(chunk[:cut])
+                    on_tokens(chunk[:cut])
+                    finish = "stop"
                     break
-            if cut is not None:
-                out.extend(chunk[:cut])
-                on_tokens(chunk[:cut])
-                finish = "stop"
-                break
-            room = max_new - len(out)
-            emit = chunk[:room]
-            out.extend(emit)
-            on_tokens(emit)
-            if cur_pos + d_now + 2 >= args.ctx:
-                finish = "length"
-                break
+                room = max_new - len(out)
+                emit = chunk[:room]
+                out.extend(emit)
+                on_tokens(emit)
+                if (sched is not None and sched["reset"] and not sched["reset_done"]
+                        and THINK_CLOSE is not None and THINK_CLOSE in chunk):
+                    sched["reset_done"] = True
+                    sched["base"] = len(out)
+                if cur_pos + d_now + 2 >= args.ctx:
+                    finish = "length"
+                    break
+        finally:
+            if sched is not None and sched["applied"] is not None:
+                for ln in BARK["layers"]:
+                    LIB.qwn_ot_set_scale(ln, ctypes.c_float(args.ot_scale))
         dt = time.time() - t1
         if finish != "error":
             _pc_store(prompt_ids, anchor_in_slot, eng_extra, temp, rounds)
@@ -496,6 +558,10 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
              "gen_tok_s": round(len(out) / dt, 1) if dt > 0 else None,
              "prefix": mode, "reused_tokens": reused,
              "prefilled_tokens": P - reused}
+    if sched is not None:
+        stats["bark_sched"] = {"s0": sched["s0"], "s1": sched["s1"], "L": sched["L"],
+                               "reset": sched["reset"], "reset_done": sched["reset_done"],
+                               "final": sched["applied"]}
     if dogs is not None:
         stats["dogs"] = {"ladder": _dogs_ladder_labels(dogs.ladder),
                          "final": "dense" if dense else dogs.label,
@@ -865,7 +931,7 @@ class H(BaseHTTPRequestHandler):
 
         try:
             ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
-                                           no_cache=no_cache, dbg=dbg)
+                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"))
         except BrokenPipeError:
             return
         full = "".join(text_parts)
@@ -883,6 +949,11 @@ class H(BaseHTTPRequestHandler):
             # budget burned inside an unclosed think block: the completed message
             # used to be empty (Codex app then shows a blank bubble). Tell the user.
             full = "[generation stopped: token budget exhausted inside reasoning; retry with higher effort/budget]"
+        elif not full and reasoning:
+            # the think closed cleanly but the model put the WHOLE answer in the
+            # reasoning channel (message body empty): same blank-bubble failure,
+            # different cause -- and this one emits no signal at all otherwise.
+            full = "[empty response: the entire answer went into the reasoning channel; retry or disable reasoning]"
         full = full or None
 
         out_items = []
@@ -1097,7 +1168,7 @@ class H(BaseHTTPRequestHandler):
                      "created": created, "model": args.model_name, "choices": [ch]})
 
             ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
-                                           no_cache=no_cache, dbg=dbg)
+                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"))
             if stop_hit.is_set():
                 finish = "stop"
             final_delta = {}
@@ -1125,7 +1196,7 @@ class H(BaseHTTPRequestHandler):
             text_parts.append(TOK.decode(toks))
 
         ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens_ns,
-                                       no_cache=no_cache, dbg=dbg)
+                                       no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"))
         text = "".join(text_parts)
         for st in stops:
             if st and st in text:
