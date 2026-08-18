@@ -100,6 +100,13 @@ ap.add_argument("--bark-decay-default", default=os.environ.get("TQ_BARK_DECAY", 
                      "e.g. 0.35,400,reset -- scale decays --ot-scale->END over LEN "
                      "generated tokens, restarting after </think>. Empty = fixed scale. "
                      "Env: TQ_BARK_DECAY")
+ap.add_argument("--think-cap", type=int, default=int(os.environ.get("TQ_THINK_CAP", 0) or 0),
+                help="max generated thinking tokens before a synthetic close: when a"
+                     " thinking request fails to emit </think> within CAP tokens (+8 slack),"
+                     " generation pauses, the close tag is emitted synthetically, and the"
+                     " answer continues in a second phase that live-reuses the engine state"
+                     " (~1 prefill token). Breaks unbounded barked-tower deliberation"
+                     " (loop or not) without losing the answer. 0 disables. Env: TQ_THINK_CAP")
 ap.add_argument("--bark-sched-api", action="store_true", default=False,
                 help="allow per-request bark schedules via the bark_decay request field "
                      "(keys: end, len, reset_think): the OT scale decays linearly from "
@@ -264,6 +271,8 @@ try:
     THINK_CLOSE = TOK.convert_tokens_to_ids("</think>")
 except Exception:
     pass
+if args.think_cap > 0 and (not isinstance(THINK_CLOSE, int) or THINK_CLOSE < 0):
+    sys.exit("--think-cap: tokenizer exposes no </think> token")
 
 # Prefix/KV cache between requests (single slot: the engine holds ONE sequence).
 #   prompt : token ids of the request that produced the engine state. The
@@ -395,6 +404,13 @@ def _pc_store(prompt_ids, anchor, eng_extra, temp, rounds):
     PC["valid"] = True
 
 
+def _req_think_cap(req, thinking_primed):
+    """Think budget: only engages on thinking-primed requests; 0 = unlimited."""
+    if not thinking_primed:
+        return 0
+    return int(req.get("think_cap") or args.think_cap or 0)
+
+
 def _bark_step(sched, n_out):
     """Per-round bark schedule: linear decay s0 -> s1 over L emitted tokens."""
     f = min(1.0, max(0, n_out - sched["base"]) / sched["L"])
@@ -406,7 +422,7 @@ def _bark_step(sched, n_out):
 
 
 def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=False,
-             bark_decay=None):
+             bark_decay=None, think_cap=0, thinking_primed=False, allow_live=False):
     """Run spec rounds; call on_tokens(new_token_list) as chunks commit.
     Returns (gen_count, finish_reason, stats)."""
     P = len(prompt_ids)
@@ -427,7 +443,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         mode, reused = "full", 0
         if args.prefix_cache and not no_cache and PC["valid"]:
             need = max(args.prefix_cache_min, P // 4)
-            if args.prefix_cache_live:
+            if args.prefix_cache_live or allow_live:
                 ct = PC["tokens"]
                 C = _common_prefix(prompt_ids, ct)
                 if C == len(ct) and C == P and PC["pending_greedy"]:
@@ -488,10 +504,19 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         out.append(seed_tok)
         on_tokens([seed_tok])
         t1 = time.time()
+        think_open = thinking_primed and think_cap > 0 and THINK_CLOSE is not None
+        if think_open and seed_tok == THINK_CLOSE:
+            think_open = False
         dogs = _Dogs(args.depth, args.k) if args.dogs else None
         dense = False          # Mr. Pink's shift: dense decode for the remaining tokens
         try:
             while len(out) < max_new:
+                if think_open and len(out) >= think_cap + 8:
+                    # deliberation breaker: think never closed within the cap
+                    # (+8 slack); bail so the caller re-enters phase 2 with a
+                    # synthetically closed think and the answer actually lands
+                    finish = "think_cap"
+                    break
                 if sched is not None:
                     _bark_step(sched, len(out))
                 if dense:
@@ -543,6 +568,8 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                         and THINK_CLOSE is not None and THINK_CLOSE in chunk):
                     sched["reset_done"] = True
                     sched["base"] = len(out)
+                if think_open and THINK_CLOSE is not None and THINK_CLOSE in chunk:
+                    think_open = False
                 if cur_pos + d_now + 2 >= args.ctx:
                     finish = "length"
                     break
@@ -570,6 +597,21 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
     if dbg:
         stats["gen_ids"] = list(out)
         stats["eng_tail_ids"] = list(eng_extra)
+    if finish == "think_cap":
+        # phase 2: think closed synthetically; the prompt is the exact
+        # continuation (phase-1 prompt + emitted think + </think>), so the
+        # live prefix-cache path reuses engine state (~1 prefill token).
+        # The fresh schedule re-decays from s0 for the answer phase.
+        on_tokens([THINK_CLOSE])
+        p2 = list(prompt_ids) + out + [THINK_CLOSE]
+        n1 = len(out)
+        n2, finish, st2 = generate(p2, max(1, max_new - n1), temp, seed,
+                                   on_tokens, no_cache=no_cache, dbg=dbg,
+                                   bark_decay=bark_decay, allow_live=True)
+        st2["think_cap"] = {"cap": think_cap, "think_tokens": n1,
+                            "phase1": {k: stats.get(k) for k in
+                                       ("rounds", "gen_s", "prefill_s")}}
+        return n1 + 1 + n2, finish, st2
     return len(out), finish, stats
 
 
@@ -931,7 +973,9 @@ class H(BaseHTTPRequestHandler):
 
         try:
             ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
-                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"))
+                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
+                                           think_cap=_req_think_cap(req, thinking_primed),
+                                           thinking_primed=thinking_primed)
         except BrokenPipeError:
             return
         full = "".join(text_parts)
@@ -1168,7 +1212,9 @@ class H(BaseHTTPRequestHandler):
                      "created": created, "model": args.model_name, "choices": [ch]})
 
             ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
-                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"))
+                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
+                                           think_cap=_req_think_cap(req, thinking_primed),
+                                           thinking_primed=thinking_primed)
             if stop_hit.is_set():
                 finish = "stop"
             final_delta = {}
@@ -1196,7 +1242,9 @@ class H(BaseHTTPRequestHandler):
             text_parts.append(TOK.decode(toks))
 
         ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens_ns,
-                                       no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"))
+                                       no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
+                                           think_cap=_req_think_cap(req, thinking_primed),
+                                           thinking_primed=thinking_primed)
         text = "".join(text_parts)
         for st in stops:
             if st and st in text:
