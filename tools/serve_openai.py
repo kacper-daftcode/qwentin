@@ -344,7 +344,9 @@ if args.bark_all_day:
         DEF_SCHED = {"end": float(_p[0]),
                      "len": int(_p[1]) if len(_p) > 1 and _p[1] else 192,
                      "reset_think": len(_p) > 2 and _p[2] in ("reset", "1", "true"),
-                     "shape": _p[3] if len(_p) > 3 and _p[3] else "linear"}
+                     "shape": _p[3] if len(_p) > 3 and _p[3] else "linear",
+                     "end_answer": float(_p[4]) if len(_p) > 4 and _p[4] else None,
+                     "len_answer": int(_p[5]) if len(_p) > 5 and _p[5] else 400}
         print(f"[bark] default schedule -> {DEF_SCHED}", flush=True)
     if args.bark_sched_api or DEF_SCHED is not None:
         LIB.qwn_ot_set_scale.restype = ctypes.c_int
@@ -462,6 +464,10 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                      "reset": bool(bd.get("reset_think")),
                      "shape": str(bd.get("shape") or "linear"),
                      "p": float(bd.get("p") or 0.5),
+                     "s1b": (float(bd["end_answer"]) if bd.get("end_answer") is not None
+                             else None),
+                     "Lb": (max(1, int(bd["len_answer"])) if bd.get("len_answer") is not None
+                            else None),
                      "reset_done": False, "base": 0, "applied": None}
             _bark_step(sched, 0)            # prefill itself runs at s0
         # ---- prefix-cache decision (token-level, against the LAST request) ----
@@ -593,6 +599,10 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                         and THINK_CLOSE is not None and THINK_CLOSE in chunk):
                     sched["reset_done"] = True
                     sched["base"] = len(out)
+                    if sched["s1b"] is not None:
+                        sched["s1"] = sched["s1b"]      # answer tail gets its own floor
+                    if sched["Lb"] is not None:
+                        sched["L"] = sched["Lb"]
                 if think_open and THINK_CLOSE is not None and THINK_CLOSE in chunk:
                     think_open = False
                 if cur_pos + d_now + 2 >= args.ctx:
@@ -614,7 +624,8 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         stats["bark_sched"] = {"s0": sched["s0"], "s1": sched["s1"], "L": sched["L"],
                                "reset": sched["reset"], "reset_done": sched["reset_done"],
                                "shape": sched.get("shape", "linear"),
-                               "final": sched["applied"]}
+                               "final": sched["applied"],
+                               "s1_now": sched["s1"], "L_now": sched["L"]}
     if dogs is not None:
         stats["dogs"] = {"ladder": _dogs_ladder_labels(dogs.ladder),
                          "final": "dense" if dense else dogs.label,
@@ -631,9 +642,20 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         on_tokens([THINK_CLOSE])
         p2 = list(prompt_ids) + out + [THINK_CLOSE]
         n1 = len(out)
+        bd2 = None
+        if isinstance(locals().get("bd"), dict):
+            # phase 2 IS the answer phase: it gets the answer tail floor directly
+            # (the reset path never fires after a synthetic close). bd is the
+            # RESOLVED schedule (request override or DEF_SCHED).
+            bd2 = dict(bd)
+            if bd.get("end_answer") is not None:
+                bd2["end"] = bd["end_answer"]
+            if bd.get("len_answer") is not None:
+                bd2["len"] = bd["len_answer"]
+            bd2["reset_think"] = False
         n2, finish, st2 = generate(p2, max(1, max_new - n1), temp, seed,
                                    on_tokens, no_cache=no_cache, dbg=dbg,
-                                   bark_decay=bark_decay, allow_live=True)
+                                   bark_decay=bd2, allow_live=True)
         st2["think_cap"] = {"cap": think_cap, "think_tokens": n1,
                             "phase1": {k: stats.get(k) for k in
                                        ("rounds", "gen_s", "prefill_s")}}
