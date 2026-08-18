@@ -668,6 +668,32 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                             "phase1": {k: stats.get(k) for k in
                                        ("rounds", "gen_s", "prefill_s")}}
         return n1 + 1 + n2, finish, st2
+    if finish == "length" and thinking_primed and THINK_CLOSE is not None \
+            and THINK_CLOSE not in out:
+        # Budget died inside an OPEN think (14:20 incident: an honest 8192-
+        # token analysis, summary cut mid-sentence, message item empty ->
+        # marker). No think-cap is armed, so rescue here: close the think
+        # synthetically and give the model a small extra budget for the
+        # actual answer. The client sees one normal thinking+message pair.
+        on_tokens([THINK_CLOSE])
+        p2 = list(prompt_ids) + out + [THINK_CLOSE]
+        n1 = len(out)
+        bd2 = None
+        if isinstance(locals().get("bd"), dict):
+            bd2 = dict(bd)
+            if bd.get("end_answer") is not None:
+                bd2["end"] = bd["end_answer"]
+            if bd.get("len_answer") is not None:
+                bd2["len"] = bd["len_answer"]
+            bd2["reset_think"] = False
+        rescue = min(768, max(64, args.ctx - len(p2) - 2))
+        n2, finish, st2 = generate(p2, rescue, temp, seed, on_tokens,
+                                   no_cache=no_cache, dbg=dbg,
+                                   bark_decay=bd2, allow_live=True)
+        st2["think_overflow"] = {"think_tokens": n1, "rescue": rescue,
+                                 "phase1": {k: stats.get(k) for k in
+                                            ("rounds", "gen_s", "prefill_s")}}
+        return n1 + 1 + n2, finish, st2
     return len(out), finish, stats
 
 
@@ -1111,9 +1137,11 @@ class H(BaseHTTPRequestHandler):
         # temp=1.0 sampling turns a barked tower erratic in long agentic prompts
         temp = float(req.get("temperature", 0.0))
         seed = int(req.get("seed", int.from_bytes(os.urandom(4), "little")))
-        # 4096 default: a thinking turn burns reasoning tokens on the same budget,
-        # and 1024 left the message empty after a long think (the "pusto" report)
-        max_new = int(req.get("max_output_tokens") or req.get("max_tokens") or 4096)
+        # 8192 default: clients that omit max_output_tokens (Codex app-server
+        # does) get a budget that fits the thinking+answer pair; 4096 died
+        # inside long research thinks (2026-08-18 marker incident). The
+        # think-cap previously masked this by force-closing the think early.
+        max_new = int(req.get("max_output_tokens") or req.get("max_tokens") or 8192)
         stops = req.get("stop") or []
         if isinstance(stops, str):
             stops = [stops]
