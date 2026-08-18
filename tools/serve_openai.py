@@ -716,9 +716,13 @@ class H(BaseHTTPRequestHandler):
             return self._json(400, {"error": {"message": "n>1/logprobs unsupported"}})
         no_cache = bool(req.get("tl_no_cache", False))
         dbg = bool(req.get("tl_debug", False))
-        temp = float(req.get("temperature", 1.0))
+        # clients that omit temperature (Codex) get the engine's greedy path:
+        # temp=1.0 sampling turns a barked tower erratic in long agentic prompts
+        temp = float(req.get("temperature", 0.0))
         seed = int(req.get("seed", int.from_bytes(os.urandom(4), "little")))
-        max_new = int(req.get("max_output_tokens") or req.get("max_tokens") or 1024)
+        # 4096 default: a thinking turn burns reasoning tokens on the same budget,
+        # and 1024 left the message empty after a long think (the "pusto" report)
+        max_new = int(req.get("max_output_tokens") or req.get("max_tokens") or 4096)
         stops = req.get("stop") or []
         if isinstance(stops, str):
             stops = [stops]
@@ -753,10 +757,13 @@ class H(BaseHTTPRequestHandler):
         rid = "resp_" + uuid.uuid4().hex[:24]
         created = int(time.time())
         stream = bool(req.get("stream", False))
-        oi_msg = 0                       # output_index of the message item
+        # reasoning streams as its own Responses item (the Codex app renders it in
+        # the thinking bubble); only post-</think> text belongs to the message item
+        THINK_END = "</think>"
+        oi_msg = 1 if thinking_primed else 0
+        rs_item_id = "rs_" + uuid.uuid4().hex[:20]
         text_parts, stop_hit = [], threading.Event()
         msg_item_id = "msg_" + uuid.uuid4().hex[:24]
-        on_tokens_ns = None
 
         if stream:
             self.send_response(200)
@@ -765,7 +772,11 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
 
+            seq = {"n": 0}
+
             def sse(obj):
+                obj = dict(obj, sequence_number=seq["n"])   # app-server UI keys off it
+                seq["n"] += 1
                 data = f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode()
                 self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
                 self.wfile.flush()
@@ -773,6 +784,12 @@ class H(BaseHTTPRequestHandler):
             sse({"type": "response.created", "response": {
                 "id": rid, "object": "response", "created_at": created,
                 "model": args.model_name, "status": "in_progress", "output": []}})
+            if thinking_primed:
+                sse({"type": "response.output_item.added", "output_index": 0,
+                     "item": {"id": rs_item_id, "type": "reasoning", "summary": []}})
+                sse({"type": "response.reasoning_summary_part.added", "output_index": 0,
+                     "item_id": rs_item_id, "summary_index": 0,
+                     "part": {"type": "summary_text", "text": ""}})
             sse({"type": "response.output_item.added", "output_index": oi_msg,
                  "item": {"id": msg_item_id, "type": "message", "status": "in_progress",
                           "role": "assistant", "content": []}})
@@ -780,7 +797,15 @@ class H(BaseHTTPRequestHandler):
                  "item_id": msg_item_id, "content_index": 0,
                  "part": {"type": "output_text", "text": ""}})
 
-            dec_state = {"buf": []}
+            dec_state = {"buf": [], "rs_sent": 0, "ct_sent": 0,
+                         "think_open": thinking_primed, "think_done_rs": ""}
+
+            def _hold_tag_tail(body):
+                # chars at the end that prefix "</think>": hold until decided
+                for m in range(len(THINK_END) - 1, 0, -1):
+                    if body.endswith(THINK_END[:m]):
+                        return body[:-m]
+                return body
 
             def on_tokens(toks):
                 if stop_hit.is_set():
@@ -801,10 +826,39 @@ class H(BaseHTTPRequestHandler):
                     if st and st in full_ns:
                         stop_hit.set()
                         return
-                sse({"type": "response.output_text.delta", "output_index": oi_msg,
-                     "item_id": msg_item_id, "content_index": 0, "delta": txt})
-
-            on_tokens_ns = None
+                if dec_state["think_open"]:
+                    body = _hold_tag_tail(full_ns)
+                    if THINK_END in body:
+                        rs_all, after = body.split(THINK_END, 1)
+                        d = rs_all[dec_state["rs_sent"]:]
+                        if d:
+                            sse({"type": "response.reasoning_summary_text.delta",
+                                 "output_index": 0, "item_id": rs_item_id,
+                                 "summary_index": 0, "delta": d})
+                        dec_state["rs_sent"] = len(rs_all)
+                        dec_state["think_open"] = False
+                        dec_state["think_done_rs"] = rs_all
+                        dec_state["content0"] = after.lstrip("\n")
+                        dec_state["ct_sent"] = len(dec_state["content0"])
+                        if dec_state["content0"]:
+                            sse({"type": "response.output_text.delta", "output_index": oi_msg,
+                                 "item_id": msg_item_id, "content_index": 0,
+                                 "delta": dec_state["content0"]})
+                    else:
+                        d = body[dec_state["rs_sent"]:]
+                        if d:
+                            sse({"type": "response.reasoning_summary_text.delta",
+                                 "output_index": 0, "item_id": rs_item_id,
+                                 "summary_index": 0, "delta": d})
+                        dec_state["rs_sent"] = len(body)
+                    return
+                cont = (full_ns.split(THINK_END, 1)[1].lstrip("\n")
+                        if thinking_primed else full_ns)
+                d = cont[dec_state["ct_sent"]:]
+                if d:
+                    sse({"type": "response.output_text.delta", "output_index": oi_msg,
+                         "item_id": msg_item_id, "content_index": 0, "delta": d})
+                dec_state["ct_sent"] = len(cont)
         else:
             def on_tokens(toks):
                 text_parts.append(TOK.decode(toks))
@@ -850,6 +904,14 @@ class H(BaseHTTPRequestHandler):
                               "total_tokens": len(ids) + ngen},
                     "x_qwentin": stats}
         if stream:
+            if thinking_primed:
+                sse({"type": "response.reasoning_summary_text.done", "output_index": 0,
+                     "item_id": rs_item_id, "summary_index": 0, "text": reasoning})
+                sse({"type": "response.reasoning_summary_part.done", "output_index": 0,
+                     "item_id": rs_item_id, "summary_index": 0,
+                     "part": {"type": "summary_text", "text": reasoning}})
+                sse({"type": "response.output_item.done", "output_index": 0,
+                     "item": out_items[0]})
             sse({"type": "response.output_text.done", "output_index": oi_msg,
                  "item_id": msg_item_id, "content_index": 0, "text": full or ""})
             sse({"type": "response.content_part.done", "output_index": oi_msg,
@@ -857,7 +919,7 @@ class H(BaseHTTPRequestHandler):
                  "part": {"type": "output_text", "text": full or ""}})
             sse({"type": "response.output_item.done", "output_index": oi_msg,
                  "item": msg_out})
-            oi = 1
+            oi = oi_msg + 1
             for fc in fc_items:
                 sse({"type": "response.output_item.added", "output_index": oi,
                      "item": {**fc, "arguments": ""}})
