@@ -466,8 +466,13 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         bd = bark_decay if (args.bark_sched_api and isinstance(bark_decay, dict)) else None
         if bd is None:
             bd = DEF_SCHED
-        if BARK is not None and isinstance(bd, dict) and bd.get("end") is not None:
-            sched = {"s0": args.ot_scale, "s1": float(bd["end"]),
+        # bark only when thinking is OFF: on thinking-primed requests the OT
+        # intervention on the think channel produced deterministic recall loops
+        # (measured 2026-08-18 and before). Thinking turns always run clean,
+        # even when the request carries an explicit bark_decay override.
+        if (BARK is not None and isinstance(bd, dict) and bd.get("end") is not None
+                and not thinking_primed):
+            sched = {"s0": float(bd.get("start", args.ot_scale)), "s1": float(bd["end"]),
                      "L": max(1, int(bd.get("len") or 192)),
                      "reset": bool(bd.get("reset_think")),
                      "shape": str(bd.get("shape") or "linear"),
