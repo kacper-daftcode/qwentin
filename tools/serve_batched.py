@@ -630,7 +630,17 @@ def main():
     ap.add_argument("--clients", type=int, default=8)
     ap.add_argument("--gen", type=int, default=64)
     ap.add_argument("--stagger", type=float, default=0.15)
+    ap.add_argument("--wide-attn-mma", dest="wide_attn_mma", action="store_true", default=True,
+                    help="tensor-core ragged-prefill attention for the paged prefill waves "
+                         "(launch_paged_attn_q4_mma_prefill; needs --page >= 128). Sets "
+                         "TQ_WIDE_ATTN_MMA=1 unless the env already says otherwise. Without it "
+                         "the waves fall back to the scalar DECODE kernel per query column: "
+                         "~310 tok/s @32K and super-linear beyond, vs ~1900 tok/s @32K / "
+                         "~1500 @64K with it (2026-09-21, RTX 5090). The decode path is unaffected.")
+    ap.add_argument("--no-wide-attn-mma", dest="wide_attn_mma", action="store_false")
     args = ap.parse_args()
+    # The engine lib reads this lazily on the first prefill wave; explicit env overrides the flag.
+    os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
     if args.bench:
         bench(args)
     elif args.selftest:

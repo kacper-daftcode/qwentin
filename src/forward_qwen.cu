@@ -9645,13 +9645,26 @@ static __device__ void tq_persist_layer_body(const tq_spec_persist_args_t &A, fl
         // unused by the part-2 body and the fused half-A glue).
         if (A.attn_mma) {
             extern __shared__ uint32_t tq_dyn_sm[];
+            // The two MMA items are the ONLY __noinline__ callees that take &A of
+            // the by-value kernel parameter. nvcc 13.1 / sm_120f lowers that escaped
+            // param address to a generic "param window" pointer (c[0x0][0x348]) and
+            // the callee's field reads become LDL through it; the first one
+            // (A->attn_nchunks, +0x310) faults with "Invalid __local__ read" -> every
+            // round with attn_mma active died (the pos-1024 spec crash: MMA turns on
+            // at TQ_ATTN_MMA_MIN_BASE while the persistent path still owns attention
+            // below TQ_SPEC_ATTN_LEGACY_MIN). Stage the args in shared memory once
+            // per CTA (plain ld.param copy, immediate offsets) and hand the callees
+            // that pointer; the inlined body keeps reading the parameter directly.
+            __shared__ __align__(16) tq_spec_persist_args_t s_mma_args;
+            if (threadIdx.x == 0) s_mma_args = A;
+            __syncthreads();
             int nheads = A.attn_pair ? A.nh >> 1 : A.nh;
             while ((item = tq_persist_grab(&A, 7, nheads * A.attn_nchunks, &s_grab)) >= 0)
-                tq_persist_attn_mma_item(&A, item, tq_dyn_sm);
+                tq_persist_attn_mma_item(&s_mma_args, item, tq_dyn_sm);
             if (A.attn_nchunks > 1) {
                 tq_persist_bar(&A, 7);
                 while ((item = tq_persist_grab(&A, 5, A.nh, &s_grab)) >= 0)
-                    tq_persist_attn_mma_merge_item(&A, item, smem);
+                    tq_persist_attn_mma_merge_item(&s_mma_args, item, smem);
             }
         } else {
             while ((item = tq_persist_grab(&A, 7, A.N * A.nh, &s_grab)) >= 0)
