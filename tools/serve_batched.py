@@ -11,9 +11,12 @@ continuous-batching loop:
     token to its request, advance positions, and DETACH finished requests (EOS / max_tokens),
     returning their blocks to the pool.
 
-Decodes are batched (the throughput win); prefills are serialized in the engine thread (MVP --
-chunked/in-batch prefill is a later optimization). Default-off relative to the single-stream
-serve_openai.py; this is a SEPARATE server.
+Decodes are batched (the throughput win). Short prompts are batched into one ragged prefill wave;
+a long prompt is prefilled in <=128-column waves that carry the active slots' decode steps as
+1-token final segments (--mixed-prefill, default), so decoders keep producing one token per wave
+while the long prompt prefills at ~full speed (--no-mixed-prefill alternates waves and decode
+steps; --prefill-waves-per-step 0 restores the blocking whole-prompt prefill). Default-off
+relative to the single-stream serve_openai.py; this is a SEPARATE server.
 
 Modes:
   --selftest     : staggered join/leave correctness vs single-stream + aggregate tok/s (no HTTP)
@@ -112,7 +115,8 @@ class Request:
 
 
 class BatchedEngine:
-    def __init__(self, lib, tqf, max_slots, num_blocks, page):
+    def __init__(self, lib, tqf, max_slots, num_blocks, page, prefill_waves_per_step=2,
+                 mixed_prefill=True):
         self.L = lib
         ck(self.L.qwn_init(tqf.encode()), "init")
         self.page = page; self.max_slots = max_slots
@@ -122,6 +126,12 @@ class BatchedEngine:
         self.free_slots = list(range(max_slots))
         self.active = {}            # slot -> Request
         self.q = []                 # pending Requests (FIFO)
+        # Long-prompt prefill in flight, interleaved with decode steps: at most one at a time,
+        # advanced by <= prefill_waves_per_step waves (<= WAVE_MAX columns each) per engine
+        # iteration so the active decoders keep stepping (0 = legacy: whole prompt at once).
+        self.prefilling = None      # dict(req, slot, pos, need) or None
+        self.prefill_waves_per_step = prefill_waves_per_step
+        self.mixed_prefill = mixed_prefill
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
         self.running = True
@@ -155,8 +165,31 @@ class BatchedEngine:
     def _prefill_long(self, req, slot):
         # prompt > WAVE_MAX: prefill alone in <=WAVE_MAX-column chunks (continuation; the slot
         # state + paged blocks carry across chunks). seed computed on the final chunk.
-        ids = req.ids; n = req.n_prompt; pos = 0; seed = 0
-        while pos < n:
+        # Legacy blocking form (prefill_waves_per_step == 0): the whole prompt in one go.
+        self._prefill_start(req, slot)
+        while self.prefilling is not None:
+            self._prefill_step(1 << 30)
+
+    def _prefill_start(self, req, slot):
+        self.prefilling = {"req": req, "slot": slot, "pos": 0,
+                           "need": (req.n_prompt + self.page - 1) // self.page}
+
+    def _prefill_reserved(self):
+        # blocks the in-flight prefill still has to allocate (kept out of admission control so
+        # a short wave admitted mid-prefill cannot run the long one's pool dry)
+        pf = self.prefilling
+        if pf is None:
+            return 0
+        got = (pf["pos"] + self.page - 1) // self.page
+        return max(0, pf["need"] - got)
+
+    def _prefill_step(self, max_waves):
+        # advance the in-flight long prefill by <= max_waves waves; activate on completion
+        pf = self.prefilling
+        req, slot, n = pf["req"], pf["slot"], pf["req"].n_prompt
+        ids = req.ids
+        for _ in range(max_waves):
+            pos = pf["pos"]
             c = min(WAVE_MAX, n - pos)
             final = 1 if pos + c >= n else 0
             oseed = (ctypes.c_int * 1)()
@@ -164,9 +197,66 @@ class BatchedEngine:
                 _ci(ids[pos:pos + c]), _ci([slot] * c), _ci(list(range(pos, pos + c))),
                 _ci([slot]), _ci([0]), _ci([c]), _ci([final]), 1, c, oseed)
             if rc != 0:
-                self.free_slots.append(slot); req.err = f"prefill_long chunk rc={rc}"; req.done.set(); return
-            seed = oseed[0]; pos += c
-        self._activate(req, slot, seed)
+                self.prefilling = None
+                self.L.qwn_paged_reset_slot(slot)
+                self.free_slots.append(slot); req.err = f"prefill_long chunk rc={rc}"; req.done.set()
+                return
+            self.prefill_waves += 1; self.prefilled_tokens += c
+            pf["pos"] = pos + c
+            if final:
+                self.prefilling = None
+                self._activate(req, slot, oseed[0])
+                return
+
+    def _mixed_wave(self):
+        """One ragged wave = the next chunk of the in-flight long prefill + a 1-token FINAL segment
+        per active slot (its decode step). qwn_paged_prefill_batch runs the projections/MLPs over
+        all columns with one weight read, the MMA ragged attention per segment, and returns the
+        argmax of every final segment -> the decoders get one token per wave (~70 ms @32K,
+        ~110 ms @128K) while the long prompt prefills at nearly full speed, instead of stalling for
+        the whole prefill (17 s @32K, 115 s @128K). Decode-only steps keep qwn_paged_decode_step."""
+        pf = self.prefilling
+        req, slot, n = pf["req"], pf["slot"], pf["req"].n_prompt
+        slots = list(self.active.keys())
+        nd = len(slots)
+        pos = pf["pos"]
+        c = min(WAVE_MAX - nd, n - pos)
+        if c < 1:                                   # too many decoders for one wave: alternate
+            self._prefill_step(1)
+            if self.active and self.prefilling is not None:
+                self._step()
+            return
+        final = 1 if pos + c >= n else 0
+        toks = list(req.ids[pos:pos + c]); cslot = [slot] * c; cpos = list(range(pos, pos + c))
+        sslot = [slot]; soff = [0]; slen = [c]; sfin = [final]
+        off = c
+        for s in slots:
+            r = self.active[s]
+            toks.append(r.next_tok); cslot.append(s); cpos.append(r.pos)
+            sslot.append(s); soff.append(off); slen.append(1); sfin.append(1)
+            off += 1
+        K = 1 + nd
+        oseed = (ctypes.c_int * K)()
+        rc = self.L.qwn_paged_prefill_batch(_ci(toks), _ci(cslot), _ci(cpos), _ci(sslot),
+                                            _ci(soff), _ci(slen), _ci(sfin), K, off, oseed)
+        if rc != 0:
+            raise RuntimeError(f"mixed wave rc={rc} (prefill pos {pos}, {nd} decode columns)")
+        self.prefill_waves += 1; self.prefilled_tokens += c
+        pf["pos"] = pos + c
+        # decode columns: same bookkeeping as _step()
+        self.steps += 1; self.decoded_tokens += nd
+        finished = []
+        for j, s in enumerate(slots):
+            r = self.active[s]
+            o = oseed[1 + j]
+            r.out.append(o); r.pos += 1; r.next_tok = o
+            if o in r.eos or len(r.out) >= r.max_new:
+                finished.append(s)
+        for s in finished:
+            self._detach(s)
+        if final:
+            self.prefilling = None
+            self._activate(req, slot, oseed[0])
 
     def _prefill_wave(self, wave):
         toks = []; cslot = []; cpos = []; soff = []; slen = []; sslot = []; sfin = []
@@ -190,7 +280,7 @@ class BatchedEngine:
     def _admit(self):
         # batch short queued requests into one <=WAVE_MAX-column prefill wave (1 weight read for
         # all clients); long prompts are prefilled alone in chunks.
-        free_blk = self._free_blocks()
+        free_blk = self._free_blocks() - self._prefill_reserved()
         wave = []; cols = 0
         while self.q and self.free_slots:
             req = self.q[0]
@@ -202,12 +292,15 @@ class BatchedEngine:
             if need > free_blk:
                 break                                   # pool full -> wait (admission control)
             if req.n_prompt > WAVE_MAX:                 # long: flush any pending wave, prefill alone
-                if wave:
-                    break
+                if wave or self.prefilling is not None:
+                    break                               # one long prefill in flight at a time
                 self.q.pop(0); slot = self.free_slots.pop()
                 ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
                 free_blk -= need
-                self._prefill_long(req, slot)
+                if self.prefill_waves_per_step > 0:
+                    self._prefill_start(req, slot)      # advanced by _loop between decode steps
+                else:
+                    self._prefill_long(req, slot)
                 continue
             if cols + req.n_prompt > WAVE_MAX:
                 break                                   # wave full -> process it, rest waits
@@ -247,15 +340,35 @@ class BatchedEngine:
     def _loop(self):
         while True:
             with self.cv:
-                while self.running and not self.q and not self.active:
+                while self.running and not self.q and not self.active and self.prefilling is None:
                     self.cv.wait(timeout=0.5)
-                if not self.running and not self.active and not self.q:
+                if not self.running and not self.active and not self.q and self.prefilling is None:
                     return
                 try:
                     self._admit()
                 except Exception as e:
                     print(f"[engine] admit error: {e}", flush=True)
-                have = bool(self.active)
+                did_decode = False
+                if self.prefilling is not None:
+                    # mixed: the decoders ride along in the prefill wave (one token per wave);
+                    # alternate: a few prefill waves, then one decode step for everyone else.
+                    # With no active decoders there is nothing to wait for -> prefill flat out.
+                    try:
+                        if self.active and self.mixed_prefill:
+                            self._mixed_wave(); did_decode = True
+                        else:
+                            self._prefill_step(self.prefill_waves_per_step if self.active else (1 << 30))
+                    except Exception as e:
+                        print(f"[engine] prefill error: {e}", flush=True)
+                        pf = self.prefilling; self.prefilling = None
+                        if pf is not None:
+                            try:
+                                self.L.qwn_paged_reset_slot(pf["slot"])
+                            except Exception:
+                                pass
+                            self.free_slots.append(pf["slot"])
+                            pf["req"].err = f"prefill failed: {e}"; pf["req"].done.set()
+                have = bool(self.active) and not did_decode
             if have:
                 try:
                     self._step()
@@ -297,7 +410,9 @@ def selftest(args):
     ids_list = [tok(t, add_special_tokens=False).input_ids for t in prompts_txt]
     MAXNEW = args.gen
 
-    eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page)
+    eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
+                        prefill_waves_per_step=args.prefill_waves_per_step,
+                        mixed_prefill=args.mixed_prefill)
     fb, tb, pg, mb = eng._stats()
     print(f"engine up: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
 
@@ -551,7 +666,9 @@ def make_handler(eng, tok, args):
 def serve(args):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page)
+    eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
+                        prefill_waves_per_step=args.prefill_waves_per_step,
+                        mixed_prefill=args.mixed_prefill)
     fb, tb, pg, mb = eng._stats()
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
@@ -638,6 +755,17 @@ def main():
                          "~310 tok/s @32K and super-linear beyond, vs ~1900 tok/s @32K / "
                          "~1500 @64K with it (2026-09-21, RTX 5090). The decode path is unaffected.")
     ap.add_argument("--no-wide-attn-mma", dest="wide_attn_mma", action="store_false")
+    ap.add_argument("--prefill-waves-per-step", type=int, default=2,
+                    help="long-prompt prefill is advanced by this many <=128-column waves between "
+                         "decode steps of the other slots (interleaving; one long prefill in flight "
+                         "at a time). 0 = legacy: the whole prompt in one blocking pass. "
+                         "One wave ~= 70 ms @32K, ~110 ms @128K on a 5090.")
+    ap.add_argument("--mixed-prefill", dest="mixed_prefill", action="store_true", default=True,
+                    help="while a long prefill is in flight, the active slots' decode steps ride in "
+                         "the same ragged wave as 1-token final segments (one token per wave for "
+                         "every decoder, prefill at ~full speed). --no-mixed-prefill alternates "
+                         "whole prefill waves and decode steps instead.")
+    ap.add_argument("--no-mixed-prefill", dest="mixed_prefill", action="store_false")
     args = ap.parse_args()
     # The engine lib reads this lazily on the first prefill wave; explicit env overrides the flag.
     os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
