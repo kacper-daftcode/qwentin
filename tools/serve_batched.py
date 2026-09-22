@@ -130,7 +130,7 @@ class Request:
 
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, prefill_waves_per_step=2,
-                 mixed_prefill=True, prefix_cache=True, park_ram_bytes=0):
+                 mixed_prefill=True, prefix_cache=True, park_ram_bytes=0, decode_steps_per_wave=0):
         self.L = lib
         ck(self.L.qwn_init(tqf.encode()), "init")
         self.page = page; self.max_slots = max_slots
@@ -169,6 +169,10 @@ class BatchedEngine:
         self.pf_round = 0
         self.prefill_waves_per_step = prefill_waves_per_step
         self.mixed_prefill = mixed_prefill
+        # extra pure decode steps after every mixed wave: with the GQA decode kernel a step costs
+        # ~17-25 ms vs ~70-110 ms per prefill wave, so k=1 gives decoders 2 tokens per ~95 ms
+        # (~21 tok/s) instead of 1 per wave (~11-14), at ~25-35% lower prefill speed (0 = off).
+        self.decode_steps_per_wave = decode_steps_per_wave
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
         self.running = True
@@ -553,6 +557,9 @@ class BatchedEngine:
                     try:
                         if self.active and self.mixed_prefill:
                             self._mixed_wave(); did_decode = True
+                            for _ in range(self.decode_steps_per_wave):
+                                if self.active:
+                                    self._step()
                         else:
                             self._prefill_step(self.prefill_waves_per_step if self.active else 8)
                     except Exception as e:
@@ -604,7 +611,8 @@ def selftest(args):
     eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
                         prefill_waves_per_step=args.prefill_waves_per_step,
                         mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
-                        park_ram_bytes=int(args.park_ram_gb * 2**30))
+                        park_ram_bytes=int(args.park_ram_gb * 2**30),
+                        decode_steps_per_wave=args.decode_steps_per_wave)
     fb, tb, pg, mb = eng._stats()
     print(f"engine up: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
 
@@ -935,7 +943,8 @@ def serve(args):
     eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
                         prefill_waves_per_step=args.prefill_waves_per_step,
                         mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
-                        park_ram_bytes=int(args.park_ram_gb * 2**30))
+                        park_ram_bytes=int(args.park_ram_gb * 2**30),
+                        decode_steps_per_wave=args.decode_steps_per_wave)
     fb, tb, pg, mb = eng._stats()
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
@@ -1039,6 +1048,9 @@ def main():
                          "the consumed history continues from there (only the new tokens are "
                          "prefilled). Parked slots are evicted LRU when slots/blocks are needed.")
     ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
+    ap.add_argument("--decode-steps-per-wave", type=int, default=0,
+                    help="extra pure decode steps after each mixed prefill wave (decoders get 1+k tokens "
+                         "per wave; prefill slows by ~k x 25%%). 0 = one token per wave.")
     ap.add_argument("--park-ram-gb", type=float, default=64.0,
                     help="host-RAM budget for parked sessions evicted from the GPU (KV blocks + DeltaNet "
                          "state, ~26 KiB/token + 155 MiB each; LRU). 0 disables the host tier. Needs the "
