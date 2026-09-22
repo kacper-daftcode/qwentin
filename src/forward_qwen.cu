@@ -21294,23 +21294,43 @@ static int launch_paged_attn_q4_mma_prefill(
         block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
     for (int k = 0; k < K; k++) {
         int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
-        int nqt = (n + 15) / 16;
+        // 32-row query tiles (QT=2) like the single-stream wide path: the kernel is L2-bound on
+        // the K/V super-tile stream, so two tiles per block halve that traffic per query token
+        // (the ragged path ran QT=1 until 2026-09-22: 128K prefill 115 s vs 85 s single-stream).
+        // Segments shorter than 32 rows (decode columns in mixed waves, short follow-ups) keep QT=1.
+        int qr = (wide_attn_qrows() == 32 && n > 16) ? 32 : 16;
+        int nqt = (n + qr - 1) / qr;
+        int part_f = 2 * qr + qr * 256;
         // key-split by this segment's own prefix depth (its last column's slot pos);
         // segments run sequentially on one stream, so the partial slab is reused
         int max_pos = col_pos_host ? col_pos_host[off + n - 1] : -1;
         int S = wide_attn_split_S(max_pos);
-        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
+        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * part_f) != 0)
             S = 1;
-        k_tq_wide_attn_mma<4, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
-            out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
-            NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
-            positions + off, slot, block_table, max_blocks, page, page_log,
-            n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
-            g_wide_attn_part);
-        if (S > 1)
-            k_tq_wide_attn_mma_merge<1><<<dim3(nh, nqt), 256, 0, st>>>(
-                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
-                n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+        if (qr == 32)
+            k_tq_wide_attn_mma<4, 2><<<dim3(nh, nqt, S), 256, 0, st>>>(
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
+                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
+                positions + off, slot, block_table, max_blocks, page, page_log,
+                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+                g_wide_attn_part);
+        else
+            k_tq_wide_attn_mma<4, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
+                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
+                positions + off, slot, block_table, max_blocks, page, page_log,
+                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+                g_wide_attn_part);
+        if (S > 1) {
+            if (qr == 32)
+                k_tq_wide_attn_mma_merge<2><<<dim3(nh, nqt), 256, 0, st>>>(
+                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
+                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+            else
+                k_tq_wide_attn_mma_merge<1><<<dim3(nh, nqt), 256, 0, st>>>(
+                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
+                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+        }
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
