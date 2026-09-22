@@ -52,6 +52,16 @@ def load_lib(path):
     L.qwn_prefill_chunk.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     L.qwn_prefill_chunk.restype = ctypes.c_int
     L.qwn_free.restype = ctypes.c_int
+    # session parking (slot KV blocks + DeltaNet state <-> host buffer); older builds lack these
+    try:
+        L.qwn_paged_slot_bytes.argtypes = [ctypes.c_int]; L.qwn_paged_slot_bytes.restype = ctypes.c_size_t
+        L.qwn_paged_slot_save.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        L.qwn_paged_slot_save.restype = ctypes.c_int
+        L.qwn_paged_slot_restore.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        L.qwn_paged_slot_restore.restype = ctypes.c_int
+        L.has_parking = True
+    except AttributeError:
+        L.has_parking = False
     return L
 
 
@@ -120,7 +130,7 @@ class Request:
 
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, prefill_waves_per_step=2,
-                 mixed_prefill=True, prefix_cache=True):
+                 mixed_prefill=True, prefix_cache=True, park_ram_bytes=0):
         self.L = lib
         ck(self.L.qwn_init(tqf.encode()), "init")
         self.page = page; self.max_slots = max_slots
@@ -139,11 +149,23 @@ class BatchedEngine:
         self.prefix_cache = prefix_cache
         self.parked = {}            # slot -> dict(ids, consumed, t, nblocks)
         self.cache_hits = 0; self.cache_tokens = 0
+        # Second tier: a GPU-parked slot that has to be evicted is SAVED to host RAM (its KV blocks
+        # + DeltaNet state, ~26 KiB/token + 155 MiB) instead of dropped; a later follow-up restores
+        # it into a free slot (~1 GB per 40K tokens, sub-second) instead of re-prefilling for tens of
+        # seconds. LRU within the RAM budget. Needs the qwn_paged_slot_save/restore ABI.
+        self.park_ram_bytes = park_ram_bytes if getattr(lib, "has_parking", False) else 0
+        self.host_parked = {}       # key -> dict(ids, consumed, buf, nbytes, t)
+        self.host_bytes = 0; self.host_key = 0
+        self.host_hits = 0; self.host_saves = 0; self.host_save_s = 0.0; self.host_restore_s = 0.0
         # Long-prompt prefill in flight, interleaved with decode steps: at most one at a time,
         # advanced by <= prefill_waves_per_step waves (<= WAVE_MAX columns each) per engine
         # iteration so the active decoders keep stepping (0 = legacy: whole prompt at once).
         self.prefills = []          # in-flight long prefills: dict(req, slot, pos, need)
-        self.max_prefills = 4       # cap on partially prefilled slots holding blocks
+        # In-flight COLD prefills (start == 0) are capped: each holds a slot and a growing share of
+        # the pool while it runs, and 8 simultaneous 32K cold starts thrash the parked tier (54 host
+        # saves / 43 restores in one 4-turn run vs 15 / 12 with the cap). Continuations (start > 0,
+        # the agent follow-up) always enter -- SRPT finishes them in a few waves.
+        self.max_cold_prefills = 2
         self.pf_round = 0
         self.prefill_waves_per_step = prefill_waves_per_step
         self.mixed_prefill = mixed_prefill
@@ -202,9 +224,51 @@ class BatchedEngine:
                              "nblocks": (consumed + self.page - 1) // self.page}
 
     def _evict(self, slot):
-        self.parked.pop(slot, None)
+        p = self.parked.pop(slot, None)
+        if p is not None and self.park_ram_bytes > 0 and p["consumed"] >= self.page:
+            self._park_to_host(slot, p)
         ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
         self.free_slots.append(slot)
+
+    def _park_to_host(self, slot, p):
+        upto = p["consumed"] - 1
+        nbytes = int(self.L.qwn_paged_slot_bytes(upto))
+        if nbytes <= 0 or nbytes > self.park_ram_bytes:
+            return
+        # make room (LRU) within the RAM budget
+        while self.host_parked and self.host_bytes + nbytes > self.park_ram_bytes:
+            k = min(self.host_parked, key=lambda k: self.host_parked[k]["t"])
+            self.host_bytes -= self.host_parked.pop(k)["nbytes"]
+        buf = (ctypes.c_char * nbytes)()
+        t0 = time.time()
+        rc = self.L.qwn_paged_slot_save(slot, upto, buf, nbytes)
+        dt = time.time() - t0
+        if rc != 0:
+            print(f"[park] save slot {slot} failed rc={rc}", flush=True)
+            return
+        self.host_key += 1
+        self.host_parked[self.host_key] = {"ids": p["ids"], "consumed": p["consumed"], "buf": buf,
+                                           "nbytes": nbytes, "t": p["t"]}
+        self.host_bytes += nbytes; self.host_saves += 1; self.host_save_s += dt
+        print(f"[park] slot {slot} -> host: {p['consumed']} tokens, {nbytes / 2**20:.0f} MiB in {dt:.2f}s "
+              f"({nbytes / 2**30 / max(dt, 1e-6):.1f} GB/s); host tier {len(self.host_parked)} sessions, "
+              f"{self.host_bytes / 2**30:.1f} GiB", flush=True)
+
+    def _restore_from_host(self, key, slot):
+        """Restore a host-parked session into the (reset, empty) slot. Returns True on success."""
+        h = self.host_parked.pop(key)
+        self.host_bytes -= h["nbytes"]
+        t0 = time.time()
+        rc = self.L.qwn_paged_slot_restore(slot, h["consumed"] - 1, h["buf"], h["nbytes"])
+        dt = time.time() - t0
+        if rc != 0:
+            print(f"[park] restore into slot {slot} failed rc={rc} ({h['consumed']} tokens)", flush=True)
+            self.L.qwn_paged_reset_slot(slot)
+            return False
+        self.host_hits += 1; self.host_restore_s += dt
+        print(f"[park] host -> slot {slot}: {h['consumed']} tokens, {h['nbytes'] / 2**20:.0f} MiB in {dt:.2f}s "
+              f"({h['nbytes'] / 2**30 / max(dt, 1e-6):.1f} GB/s)", flush=True)
+        return True
 
     def _evict_lru(self):
         if not self.parked:
@@ -214,14 +278,21 @@ class BatchedEngine:
         return True
 
     def _match_parked(self, ids):
-        """Best parked slot whose CONSUMED history is a prefix of ids -> (slot, consumed) or None."""
+        """Best parked session whose CONSUMED history is a prefix of ids:
+        ("gpu", slot, consumed) | ("host", key, consumed) | None. GPU tier wins ties."""
         best = None
         for slot, p in self.parked.items():
             c = p["consumed"]
             if c <= 0 or len(ids) < c or c < self.page:
                 continue                            # too short to be worth a continuation
-            if ids[:c] == p["ids"][:c] and (best is None or c > best[1]):
-                best = (slot, c)
+            if ids[:c] == p["ids"][:c] and (best is None or c > best[2]):
+                best = ("gpu", slot, c)
+        for key, h in self.host_parked.items():
+            c = h["consumed"]
+            if len(ids) < c or c < self.page:
+                continue
+            if ids[:c] == h["ids"][:c] and (best is None or c > best[2]):
+                best = ("host", key, c)
         return best
 
     def _prefill_long(self, req, slot):
@@ -373,17 +444,20 @@ class BatchedEngine:
             need_total = (req.n_prompt + self.page - 1) // self.page
             if need_total > self.max_blocks_per_seq:
                 self.q.pop(0); self._finish(req, "prompt exceeds context"); continue
-            # prefix cache: a parked slot whose consumed history this prompt extends
+            # prefix cache: a parked session (GPU slot or host buffer) this prompt extends
             m = self._match_parked(req.ids) if self.prefix_cache else None
-            hit_slot = m[0] if m else -1
-            start = m[1] if m else 0
+            tier = m[0] if m else None
+            hit_slot = m[1] if tier == "gpu" else -1
+            start = m[2] if m else 0
             n_new = req.n_prompt - start
             is_long = n_new > WAVE_MAX
-            if is_long and (wave or len(self.prefills) >= self.max_prefills):
-                break                                   # flush the short wave first / too many in flight
+            n_cold = sum(1 for pf in self.prefills if pf["req"].start == 0)
+            if is_long and (wave or (start == 0 and n_cold >= self.max_cold_prefills)):
+                break                                   # flush the short wave first / cold cap reached
             if not is_long and cols + n_new > WAVE_MAX:
                 break                                   # wave full -> process it, rest waits
-            need = need_total - ((start + self.page - 1) // self.page)
+            # blocks to add: a GPU hit already holds its history; a host hit needs them all back
+            need = need_total - ((start + self.page - 1) // self.page if tier == "gpu" else 0)
             # blocks: evict LRU parked slots (never the one we are about to reuse) until it fits
             while need > free_blk:
                 victims = [s for s in self.parked if s != hit_slot]
@@ -394,7 +468,7 @@ class BatchedEngine:
             if need > free_blk:
                 break                                   # pool full even so -> wait (admission control)
             # slot
-            if m:
+            if tier == "gpu":
                 p = self.parked.pop(hit_slot); slot = hit_slot
                 self.cache_hits += 1; self.cache_tokens += start
                 pending = p["ids"][-1]
@@ -404,6 +478,15 @@ class BatchedEngine:
                 slot = self.free_slots.pop()
                 ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
                 pending = None
+                if tier == "host":
+                    h = self.host_parked[m[1]]
+                    if self._restore_from_host(m[1], slot):
+                        self.cache_hits += 1; self.cache_tokens += start
+                        pending = h["ids"][-1]
+                    else:
+                        start = 0; n_new = req.n_prompt; is_long = n_new > WAVE_MAX
+                        if is_long and (wave or n_cold >= self.max_cold_prefills):
+                            self.free_slots.append(slot); break
             self.q.pop(0)
             req.start = start
             free_blk -= need
@@ -520,7 +603,8 @@ def selftest(args):
 
     eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
                         prefill_waves_per_step=args.prefill_waves_per_step,
-                        mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache)
+                        mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
+                        park_ram_bytes=int(args.park_ram_gb * 2**30))
     fb, tb, pg, mb = eng._stats()
     print(f"engine up: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
 
@@ -688,6 +772,11 @@ def make_handler(eng, tok, args):
                                  "parked": len(eng.parked), "prefilling": len(eng.prefills),
                                  "prefix_cache_hits": eng.cache_hits,
                                  "prefix_cache_tokens": eng.cache_tokens,
+                                 "host_parked": len(eng.host_parked),
+                                 "host_parked_gib": round(eng.host_bytes / 2**30, 2),
+                                 "host_hits": eng.host_hits, "host_saves": eng.host_saves,
+                                 "host_save_s": round(eng.host_save_s, 2),
+                                 "host_restore_s": round(eng.host_restore_s, 2),
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "decoded_tokens": eng.decoded_tokens, "steps": eng.steps})
             else:
@@ -845,7 +934,8 @@ def serve(args):
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
                         prefill_waves_per_step=args.prefill_waves_per_step,
-                        mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache)
+                        mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
+                        park_ram_bytes=int(args.park_ram_gb * 2**30))
     fb, tb, pg, mb = eng._stats()
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
@@ -949,6 +1039,10 @@ def main():
                          "the consumed history continues from there (only the new tokens are "
                          "prefilled). Parked slots are evicted LRU when slots/blocks are needed.")
     ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
+    ap.add_argument("--park-ram-gb", type=float, default=64.0,
+                    help="host-RAM budget for parked sessions evicted from the GPU (KV blocks + DeltaNet "
+                         "state, ~26 KiB/token + 155 MiB each; LRU). 0 disables the host tier. Needs the "
+                         "qwn_paged_slot_save/restore ABI in the engine library.")
     args = ap.parse_args()
     # The engine lib reads this lazily on the first prefill wave; explicit env overrides the flag.
     os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")

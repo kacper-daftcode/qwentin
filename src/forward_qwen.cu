@@ -21213,6 +21213,88 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -7;
 }
 
+// ===== Session parking: a slot's paged KV + DeltaNet state <-> a host buffer =====
+// Host layout (bytes), logical-block order so a restore may land in different physical blocks:
+//   [for each FULL layer L][for each logical block lb < nb]: K4 rows | kq4s rows | V8 rows | vscale rows
+//   [for each LINEAR layer L]: recur floats | conv floats
+// Rows per block = page except the last (cnt = n - lb*page). n = upto_pos + 1 consumed positions.
+// Pageable host memory is fine for v1 (the runtime stages it; ~1 GB per 40K tokens moves in
+// ~0.2-0.4 s); pinned buffers turn the copies async later.
+static size_t paged_slot_bytes(int upto_pos) {
+    int n = upto_pos + 1, page = g_pg_page;
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
+    size_t qe = batched_q4s_elem_bytes();
+    size_t per_tok = (size_t)(kv_m >> 1) + (size_t)nkv * 16 * qe + (size_t)kv_m + (size_t)nkv * sizeof(float);
+    size_t bytes = 0;
+    int nfull = 0, nlin = 0;
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) nfull++;
+        else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) nlin++;
+    }
+    bytes += (size_t)nfull * (size_t)n * per_tok;
+    bytes += (size_t)nlin * ((size_t)batched_recur_floats() + (size_t)batched_conv_floats()) * sizeof(float);
+    (void)page;
+    return bytes;
+}
+
+extern "C" size_t qwn_paged_slot_bytes(int upto_pos) {
+    if (!g_pg_ready || upto_pos < 0) return 0;
+    return paged_slot_bytes(upto_pos);
+}
+
+// dir 0 = save (device -> host), 1 = restore (host -> device; the slot must already own the blocks)
+static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv, page = g_pg_page;
+    size_t qe = batched_q4s_elem_bytes();
+    size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+    int *row = h_block_table + (size_t)slot * g_pg_maxblk;
+    int n = upto_pos + 1, nb = (upto_pos >> g_pg_plog) + 1;
+    if (nb > h_slot_nb[slot]) return -3;                         // slot does not own that many blocks
+    cudaMemcpyKind kind = dir ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
+    char *p = host;
+    #define TQ_XFER(dev, bytes) do { \
+        void *d_ = (void *)(dev); size_t b_ = (bytes); \
+        cudaError_t e_ = dir ? cudaMemcpyAsync(d_, p, b_, kind, g_qwen.stream) \
+                             : cudaMemcpyAsync(p, d_, b_, kind, g_qwen.stream); \
+        if (e_ != cudaSuccess) return -4; p += b_; } while (0)
+    for (int L = 0; L < g_qwen.L; L++) {
+        tq_layer_t *l = &g_qwen.layers[L];
+        (void)l;
+        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
+            for (int lb = 0; lb < nb; lb++) {
+                int phys = row[lb], t0 = lb * page, cnt = n - t0;
+                if (cnt > page) cnt = page;
+                if (cnt <= 0) break;
+                size_t bo = (size_t)phys * page;
+                TQ_XFER(g_pool_k4[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                TQ_XFER((char *)g_pool_kq4s[L] + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+                TQ_XFER(g_pool_v8[L] + bo * kv_m, (size_t)cnt * kv_m);
+                TQ_XFER(g_pool_vscale[L] + bo * nkv, (size_t)cnt * nkv * sizeof(float));
+            }
+        } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
+            TQ_XFER(g_pg_recur[L] + (size_t)slot * recur_f, recur_f * sizeof(float));
+            TQ_XFER(g_pg_conv[L] + (size_t)slot * conv_f, conv_f * sizeof(float));
+        }
+    }
+    #undef TQ_XFER
+    return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -5;
+}
+
+// Save positions [0..upto_pos] of a slot (KV blocks + DeltaNet state) into `host` (>= qwn_paged_slot_bytes).
+extern "C" int qwn_paged_slot_save(int slot, int upto_pos, void *host, size_t host_bytes) {
+    if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots || upto_pos < 0 || !host) return -1;
+    if (host_bytes < paged_slot_bytes(upto_pos)) return -2;
+    return paged_slot_xfer(slot, upto_pos, (char *)host, 0);
+}
+
+// Restore a saved session into a (reset, empty) slot: allocates its blocks, copies KV + state back.
+extern "C" int qwn_paged_slot_restore(int slot, int upto_pos, const void *host, size_t host_bytes) {
+    if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots || upto_pos < 0 || !host) return -1;
+    if (host_bytes < paged_slot_bytes(upto_pos)) return -2;
+    if (paged_ensure_blocks(slot, upto_pos) != 0) return -6;     // pool exhausted
+    return paged_slot_xfer(slot, upto_pos, (char *)host, 1);
+}
+
 // One paged decode step over N active columns. column j -> slot_ids[j] (persistent slot);
 // tokens[j] is decoded at positions[j] (its own KV history via the block table).
 static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
