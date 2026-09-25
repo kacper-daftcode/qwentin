@@ -19628,7 +19628,7 @@ template <int KB, int NG>
 __global__ void __launch_bounds__(256, (NG <= 2) ? 4 : 2) k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                                                            const uint16_t *trellis, const uint32_t *bfrag,
                                                            const uint16_t *svh, int M, int Kt16, int nvar,
-                                                           int GP, int ntg, int k_splits, int per, int *ctr) {
+                                                           int GP, int g_base, int ntg, int k_splits, int per, int *ctr) {
     constexpr int NW = 8 * KB;
     constexpr int PF = (NG <= 4) ? 4 : 2;         // tiles in flight per warp (register ring)
     constexpr int RW = 2 * tq_exl3_win<KB>::NGRP;   // words per lane per tile
@@ -19657,8 +19657,8 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? 4 : 2) k_tq_exl3_wide_gemm(fl
         // this unit's tokens: tg*8*NG .. ; bfrag groups and out rows offset accordingly
         const int tok_base = tg * 8 * NG;
         const int nvar_u = (nvar - tok_base < 8 * NG) ? (nvar - tok_base) : 8 * NG;
-        const int gp0 = (tg * NG) >> 1;           // first group pair of this unit (NG >= 2 even; NG == 1 -> tg*NG/2)
-        const int half0 = (tg * NG) & 1;          // NG == 1: which half of the pair
+        const int gp0 = (g_base + tg * NG) >> 1;  // first group pair of this unit (g_base + tg*NG even when NG >= 2)
+        const int half0 = (g_base + tg * NG) & 1; // NG == 1: which half of the pair
         float *out_u = out + (size_t)tok_base * M;
         float *partials_u = partials + (size_t)tok_base * M;
         float c[NG][4];
@@ -19929,7 +19929,7 @@ static int exl3_pick_splits(int cap, int units, int Kt16, int N, int M, int KB, 
 
 template <int KB, int NG>
 static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, const tq_qmma_weight_t *w,
-                            const uint32_t *bp, int M, int Kt16, int N, int Gt, cudaStream_t st) {
+                            const uint32_t *bp, int M, int Kt16, int N, int Gt, int g_base, cudaStream_t st) {
     int cap = exl3_gemm_cap<KB, NG>();
     int ntg = (N + 8 * NG - 1) / (8 * NG);
     int units = (M / 128) * ntg;
@@ -19949,7 +19949,7 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
     int total = units * ks;
     int grid = total < cap ? total : cap;
     k_tq_exl3_wide_gemm<KB, NG><<<grid, 256, 0, st>>>(out, pout, split_stride, w->d_exl3_trellis, bp,
-                                                      w->d_exl3_svh, M, Kt16, N, (Gt + 1) / 2, ntg, ks, per, g_exl3_ctr);
+                                                      w->d_exl3_svh, M, Kt16, N, (Gt + 1) / 2, g_base, ntg, ks, per, g_exl3_ctr);
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("TQ_EXL3_DEBUG") != NULL;
     if (dbg) {   // counters must be back at zero after every launch
@@ -19965,12 +19965,27 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
 }
 
 #define TQ_EXL3_LAUNCH(KB_, NG_) \
-    return exl3_launch_gemm<KB_, NG_>(out, NULL, split_stride, w, g_exl3_b, M, Kt16, N, Gt, st)
+    return exl3_launch_gemm<KB_, NG_>(out + (size_t)n0 * M, NULL, split_stride, w, g_exl3_b, M, Kt16, nn, Gt, n0 / 8, st)
 #define TQ_EXL3_SWITCH_NG(KB_) \
     switch (G) { \
         case 1: TQ_EXL3_LAUNCH(KB_, 1); case 2: TQ_EXL3_LAUNCH(KB_, 2); \
         case 4: TQ_EXL3_LAUNCH(KB_, 4); case 8: TQ_EXL3_LAUNCH(KB_, 8); \
         case 16: TQ_EXL3_LAUNCH(KB_, 16); default: return -113; }
+
+// Tokens [n0, n0+nn) of the prepared fragments with NG-wide units.
+static int exl3_launch_part(const tq_qmma_weight_t *w, float *out, int n0, int nn, int G, int Gt,
+                            int M, int Kt16, size_t split_stride, cudaStream_t st) {
+    switch (w->exl3_kbits) {
+        case 2: TQ_EXL3_SWITCH_NG(2);
+        case 3: TQ_EXL3_SWITCH_NG(3);
+        case 4: TQ_EXL3_SWITCH_NG(4);
+        case 5: TQ_EXL3_SWITCH_NG(5);
+        case 6: TQ_EXL3_SWITCH_NG(6);
+        case 7: TQ_EXL3_SWITCH_NG(7);
+        case 8: TQ_EXL3_SWITCH_NG(8);
+        default: return -114;
+    }
+}
 
 static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     cudaStream_t st = g_qwen.stream;
@@ -19997,17 +20012,17 @@ static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     int nwarps = N * (K / 128);
     k_tq_exl3_bfrag<<<(nwarps + 3) / 4, 128, 0, st>>>(g_exl3_b, g_exl3_x, w->d_exl3_suh, K, N, Kt16, GP);
     size_t split_stride = (size_t)N * M;
+    // Ragged N (a mixed prefill wave = 128 prompt columns + a few decoders): full 8*G-token
+    // units for the head, then the remainder with the narrowest units that cover it -- one
+    // more streaming pass of the weights instead of a full wide unit pass per feature block.
     int G = exl3_unit_ng(N, M / 128);
-    switch (w->exl3_kbits) {
-        case 2: TQ_EXL3_SWITCH_NG(2);
-        case 3: TQ_EXL3_SWITCH_NG(3);
-        case 4: TQ_EXL3_SWITCH_NG(4);
-        case 5: TQ_EXL3_SWITCH_NG(5);
-        case 6: TQ_EXL3_SWITCH_NG(6);
-        case 7: TQ_EXL3_SWITCH_NG(7);
-        case 8: TQ_EXL3_SWITCH_NG(8);
-        default: return -114;
-    }
+    int unit_tokens = 8 * G;
+    int n_main = (N >= unit_tokens) ? (N / unit_tokens) * unit_tokens : N;
+    int r = 0;
+    if (n_main > 0) r = exl3_launch_part(w, out, 0, n_main, G, Gt, M, Kt16, split_stride, st);
+    if (r == 0 && n_main < N)
+        r = exl3_launch_part(w, out, n_main, N - n_main, wide_ng(N - n_main), Gt, M, Kt16, split_stride, st);
+    return r;
 }
 #undef TQ_EXL3_LAUNCH
 #undef TQ_EXL3_SWITCH_NG
