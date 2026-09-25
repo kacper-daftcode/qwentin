@@ -53,6 +53,10 @@ FLAG_BLOCK_SCALED_QMMA_WORDMAJOR = 1 << 7
 FLAG_BLOCK_SCALED_E2M3 = 1 << 8  # weights E2M3 (6-bit dense), activations stay E4M3
 FLAG_SPARSE_24_E2M3 = 1 << 9  # + tile-level WANDA 2:4 draft record after each linear_attn proj
 FLAG_HAS_MTP = 1 << 10  # native MTP head section appended after the payload (env TQ_EMIT_MTP=1)
+# Linear weights are EXL3 trellis records (exllamav3 checkpoint as the source): each qm8 slot
+# holds <IIII kbits K M codebook> + suh fp16[K] + svh fp16[M] + trellis int16[K/16][M/16][16*kbits];
+# kbits == 0 means the checkpoint kept that Linear unquantized -> bf16 [M][K] follows instead.
+FLAG_EXL3_WEIGHTS = 1 << 11
 
 COMMON_SUFFIXES = (
     "input_layernorm.weight",
@@ -664,6 +668,76 @@ def write_qmma_f8_block_scaled(
     return size
 
 
+def exl3_source(model_dir: Path) -> bool:
+    """True when the checkpoint is an exllamav3 EXL3 quantization (quantization_config.json)."""
+    qc = model_dir / "quantization_config.json"
+    if not qc.exists():
+        return False
+    try:
+        with qc.open("r", encoding="utf-8") as f:
+            return json.load(f).get("quant_method") == "exl3"
+    except (OSError, ValueError):
+        return False
+
+
+def exl3_base(name: str) -> str:
+    return name[: -len(".weight")] if name.endswith(".weight") else name
+
+
+def exl3_has_linear(names: set[str], spec: TensorSpec) -> bool:
+    base = exl3_base(spec.name)
+    return f"{base}.trellis" in names or spec.name in names
+
+
+def write_exl3_record(f, store: TensorStore, spec: TensorSpec, dry_run: bool) -> int:
+    """One Linear from an EXL3 checkpoint, verbatim (no requantization).
+
+    Record: <IIII> kbits, K (in_features), M (out_features), codebook (0 3inst, 1 mcg, 2 mul1);
+    kbits > 0: suh fp16[K], svh fp16[M], trellis int16 [K/16, M/16, 16*kbits] as stored by
+    exllamav3 (the engine dequantizes tiles in the tensor-core fragment order);
+    kbits == 0: the checkpoint left this Linear in bf16 -> bf16 [M, K] row-major."""
+    m, k = spec.shape
+    base = exl3_base(spec.name)
+    names = store.names()
+    if f"{base}.trellis" not in names:
+        size = 16 + m * k * 2
+        if dry_run:
+            return size
+        w = store.get(spec.name)
+        validate_shape(w, spec)
+        f.write(struct.pack("<IIII", 0, k, m, 0))
+        f.write(u16_bytes(w, DTYPE_BF16))
+        print(f"  {spec.name:72s} {spec.shape!s:18s} exl3: bf16 (unquantized in source)")
+        return size
+    trellis = store.get(f"{base}.trellis")
+    if trellis.dtype != torch.int16 or trellis.dim() != 3:
+        raise ValueError(f"{base}.trellis: expected int16 [K/16, M/16, 16*kbits], got {trellis.dtype} {tuple(trellis.shape)}")
+    kbits = int(trellis.shape[2]) // 16
+    if trellis.shape[2] != 16 * kbits or not (1 <= kbits <= 8):
+        raise ValueError(f"{base}.trellis: bad packed width {trellis.shape[2]}")
+    if tuple(trellis.shape[:2]) != (k // 16, m // 16) or k % 128 or m % 128:
+        raise ValueError(f"{base}.trellis: shape {tuple(trellis.shape)} does not match Linear [{m}, {k}]")
+    size = 16 + 2 * k + 2 * m + trellis.numel() * 2
+    if dry_run:
+        return size
+    suh = store.get(f"{base}.suh")
+    svh = store.get(f"{base}.svh")
+    if suh.numel() != k or svh.numel() != m:
+        raise ValueError(f"{base}: suh {suh.numel()} / svh {svh.numel()} vs K={k} M={m}")
+    if f"{base}.mul1" in names:
+        codebook = 2
+    elif f"{base}.mcg" in names:
+        codebook = 1
+    else:
+        codebook = 0
+    f.write(struct.pack("<IIII", kbits, k, m, codebook))
+    f.write(u16_bytes(suh, DTYPE_FP16))
+    f.write(u16_bytes(svh, DTYPE_FP16))
+    f.write(trellis.contiguous().view(torch.uint16).numpy().astype("<u2", copy=False).tobytes())
+    print(f"  {spec.name:72s} {spec.shape!s:18s} exl3: {kbits} bpw codebook={codebook}")
+    return size
+
+
 def qmma_source_tensor(store: TensorStore, spec: TensorSpec) -> torch.Tensor:
     """Checkpoint tensor with source FP8 block scales applied (true float values).
 
@@ -809,7 +883,7 @@ def mtp_tensor_specs(config) -> list[TensorSpec]:
 
 
 def build_header(config, dtype_id: int, names: set[str], block_scaled: bool, block_layout: str,
-                 emit_mtp: bool = False) -> bytes:
+                 emit_mtp: bool = False, exl3: bool = False) -> bytes:
     text = as_text_config(config)
     rope = getattr(text, "rope_parameters", {}) or {}
     layer_types = list(text.layer_types)
@@ -840,6 +914,8 @@ def build_header(config, dtype_id: int, names: set[str], block_scaled: bool, blo
         flags |= FLAG_SPARSE_24_E2M3
     if emit_mtp:
         flags |= FLAG_HAS_MTP
+    if exl3:
+        flags |= FLAG_EXL3_WEIGHTS
 
     encoded_layer_types = bytes(layer_type_id(layer_type) for layer_type in layer_types)
     fixed = struct.pack(
@@ -904,6 +980,8 @@ def write_tqf(
     block_scaled_mode: str,
     block_scale_policy: str,
     block_layout: str,
+    exl3_mode: str = "auto",
+    mtp_source: str | None = None,
 ) -> dict[str, Any]:
     model_dir = Path(model_path)
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -911,15 +989,33 @@ def write_tqf(
     if model_type != "qwen3_5":
         raise ValueError(f"convert_qwen_tqf.py expects model_type='qwen3_5', got {model_type!r}")
 
+    if exl3_mode == "auto":
+        exl3 = exl3_source(model_dir)
+    elif exl3_mode == "always":
+        exl3 = True
+    elif exl3_mode == "never":
+        exl3 = False
+    else:
+        raise ValueError(f"unsupported exl3 mode: {exl3_mode}")
+    if exl3:
+        print(f"  EXL3 source: Linear weights copied as trellis records (flag 0x{FLAG_EXL3_WEIGHTS:x})")
+
     dtype_id = dtype_id_from_name(non_quant_dtype)
+    mtp_store_cm = TensorStore(Path(mtp_source)) if mtp_source else None
     with TensorStore(model_dir) as store:
         specs = tensor_specs(cfg, store.names())
-        missing = [spec.name for spec in specs if spec.name not in store.names()]
+        if exl3:
+            missing = [spec.name for spec in specs
+                       if not (exl3_has_linear(store.names(), spec) if spec.kind == "qm8" else spec.name in store.names())]
+        else:
+            missing = [spec.name for spec in specs if spec.name not in store.names()]
         if missing:
             raise KeyError("missing required tensor(s): " + ", ".join(missing))
 
         has_source_block_scales = any(f"{spec.name}_scale_inv" in store.names() for spec in specs if spec.kind == "qm8")
-        if block_scaled_mode == "auto":
+        if exl3:
+            block_scaled = False
+        elif block_scaled_mode == "auto":
             block_scaled = has_source_block_scales
         elif block_scaled_mode == "always":
             block_scaled = True
@@ -928,13 +1024,16 @@ def write_tqf(
         else:
             raise ValueError(f"unsupported block_scaled_mode: {block_scaled_mode}")
 
+        # MTP head: bf16 projections. An EXL3 checkpoint quantizes them, so take the
+        # section from --mtp-source (the original bf16 model directory) when given.
+        mtp_store = mtp_store_cm.__enter__() if mtp_store_cm is not None else store
         mtp_specs = mtp_tensor_specs(cfg)
-        emit_mtp = mtp_emit_enabled() and all(s.name in store.names() for s in mtp_specs)
+        emit_mtp = mtp_emit_enabled() and all(s.name in mtp_store.names() for s in mtp_specs)
         if mtp_emit_enabled() and not emit_mtp:
-            missing_mtp = [s.name for s in mtp_specs if s.name not in store.names()]
+            missing_mtp = [s.name for s in mtp_specs if s.name not in mtp_store.names()]
             print(f"  TQ_EMIT_MTP set but model lacks MTP tensors {missing_mtp}; MTP section NOT emitted")
 
-        header = build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp)
+        header = build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp, exl3)
         bytes_written = len(header)
         kind_counts: dict[str, int] = {}
         output_file = None
@@ -954,7 +1053,9 @@ def write_tqf(
                 elif spec.kind == "f32":
                     size = write_f32(output_file, store.get(spec.name), spec, dry_run)
                 elif spec.kind == "qm8":
-                    if block_scaled:
+                    if exl3:
+                        size = write_exl3_record(output_file, store, spec, dry_run)
+                    elif block_scaled:
                         scale_inv = None if dry_run else qmma_scale_inv_tensor(store, spec)
                         if not dry_run:
                             # Paths that requantize from the tensor need true float
@@ -993,7 +1094,7 @@ def write_tqf(
                     # FP8 checkpoints quantize most mtp.layers.0 projections
                     # (weight + weight_scale_inv); deblock so the stored BF16
                     # values are the true weights, not raw E4M3 codes.
-                    tensor = qmma_source_tensor(store, spec)
+                    tensor = qmma_source_tensor(mtp_store, spec)
                     if spec.kind == "non_quant":
                         size = write_non_quant(output_file, tensor, spec, dtype_id, dry_run)
                     elif spec.kind == "qm8":
@@ -1004,12 +1105,12 @@ def write_tqf(
                             ):
                                 pass  # `tensor` already deblocked above (true float values)
                             elif not dry_run:
-                                tensor = store.get(spec.name)
+                                tensor = mtp_store.get(spec.name)
                             size = write_qmma_f8_block_scaled(
                                 output_file, tensor, spec, dry_run, scale_inv, block_scale_policy, block_layout
                             )
                         else:
-                            qmma_tensor = tensor if dry_run else qmma_source_tensor(store, spec)
+                            qmma_tensor = tensor if dry_run else qmma_source_tensor(mtp_store, spec)
                             size = write_qmma_f8(output_file, qmma_tensor, spec, dry_run)
                     else:
                         raise ValueError(f"{spec.name}: unsupported MTP tensor kind {spec.kind!r}")
@@ -1019,6 +1120,8 @@ def write_tqf(
         finally:
             if output_file is not None:
                 output_file.close()
+            if mtp_store_cm is not None:
+                mtp_store_cm.__exit__(None, None, None)
 
     return {
         "model": str(model_dir),
@@ -1029,6 +1132,8 @@ def write_tqf(
         "total_gb": bytes_written / 1e9,
         "tensor_count": len(specs),
         "kind_counts": kind_counts,
+        "exl3": exl3,
+        "mtp_source": mtp_source,
         "block_scaled": block_scaled,
         "block_scale_policy": block_scale_policy if block_scaled else None,
         "block_layout": block_layout if block_scaled else None,
@@ -1073,6 +1178,20 @@ def main() -> None:
             "qmma-e2m3 packs weights as dense 6-bit E2M3 (0.75x bytes) for the mixed E2M3xE4M3 path."
         ),
     )
+    parser.add_argument(
+        "--exl3",
+        default="auto",
+        choices=("auto", "always", "never"),
+        help=(
+            "Copy EXL3 (exllamav3) trellis Linears verbatim instead of quantizing to E2M3. "
+            "auto reads quantization_config.json; the engine dequantizes the tiles at run time."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-source",
+        default=None,
+        help="Model directory to take the bf16 MTP head from (an EXL3 checkpoint quantizes it); with TQ_EMIT_MTP=1",
+    )
     args = parser.parse_args()
 
     summary = write_tqf(
@@ -1083,6 +1202,8 @@ def main() -> None:
         args.block_scaled,
         args.block_scale_policy,
         args.block_layout,
+        args.exl3,
+        args.mtp_source,
     )
     print(json.dumps(summary, indent=2))
     if not args.dry_run:

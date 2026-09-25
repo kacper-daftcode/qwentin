@@ -33,6 +33,9 @@
 #define TQ_FLAG_BLOCK_SCALED_E2M3 (1u << 8)
 #define TQ_FLAG_SPARSE_24_E2M3 (1u << 9)
 #define TQ_FLAG_HAS_MTP (1u << 10)
+// Linear weights are EXL3 trellis records copied from an exllamav3 checkpoint (see
+// tools/convert_qwen_tqf.py write_exl3_record); dequantized per 16x16 tile at run time.
+#define TQ_FLAG_EXL3_WEIGHTS (1u << 11)
 #define TQ_MTP_TOPK_MAX 64
 #define TQ_MTP_MAX_DEPTH 15  // max MTP covering-tree depth (16-slot KV archive: root + 15)
 
@@ -121,6 +124,17 @@ typedef struct {
     uint32_t *d_sparse_meta;
     int has_sparse;
     int Kt64;
+    // EXL3 trellis weights (TQ_FLAG_EXL3_WEIGHTS). W[m][k] = svh[m] * (H128 W_hat H128)[k][m] * suh[k]
+    // per 128x128 tile, W_hat dequantized from the 16x16 trellis tiles (mul1 codebook). The wide
+    // path reads these; the E2M3 payload fields above stay NULL. exl3_kbits == 0: the source kept
+    // this Linear unquantized -> d_exl3_bf16 holds bf16 [M][K] row-major.
+    int exl3;
+    int exl3_kbits;
+    int exl3_codebook;       // 0 3inst, 1 mcg, 2 mul1 (only mul1 is implemented)
+    uint16_t *d_exl3_trellis; // int16 [K/16][M/16][16*kbits]
+    uint16_t *d_exl3_suh;     // fp16 [K]
+    uint16_t *d_exl3_svh;     // fp16 [M]
+    uint16_t *d_exl3_bf16;    // kbits == 0 only
 } tq_qmma_weight_t;
 
 static float g_spec_temp_v = -1.0f;       // <0 = uninitialized (read env once)
@@ -10662,12 +10676,72 @@ static int read_f32(FILE *f, float **dst, size_t count, const char *what, int up
     return upload_payload(f, (void **)dst, nbytes, what, upload);
 }
 
+// [kt][nt][NW] -> [nt][kt][NW] (uint32 words), one thread per word.
+__global__ void k_tq_exl3_repack_tiles(uint32_t *dst, const uint32_t *src, int KT, int NT, int NW) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)KT * NT * NW;
+    if (i >= total) return;
+    int wd = (int)(i % NW);
+    long tile = i / NW;
+    int nt = (int)(tile % NT), kt = (int)(tile / NT);
+    dst[((long)nt * KT + kt) * NW + wd] = src[i];
+}
+
+// EXL3 record (TQ_FLAG_EXL3_WEIGHTS): <IIII> kbits, K, M, codebook; kbits > 0: suh fp16[K],
+// svh fp16[M], trellis int16 [K/16][M/16][16*kbits] (re-ordered to [M/16][K/16] on the device
+// at load); kbits == 0: bf16 [M][K].
+static int read_exl3(FILE *f, tq_qmma_weight_t *w, int M, int K, const char *what, int upload) {
+    uint32_t hdr[4];
+    if (read_exact(f, hdr, sizeof(hdr), what) != 0) return -1;
+    uint32_t kbits = hdr[0], rk = hdr[1], rm = hdr[2], cb = hdr[3];
+    if (rk != (uint32_t)K || rm != (uint32_t)M) {
+        fprintf(stderr, "%s: exl3 record shape K=%u M=%u, expected K=%d M=%d\n", what, rk, rm, K, M);
+        return -1;
+    }
+    w->M = M; w->K = K; w->Mt = M / 16; w->Kt = K / 32;
+    w->exl3 = 1;
+    w->exl3_kbits = (int)kbits;
+    w->exl3_codebook = (int)cb;
+    g_qwen.qmma_count++;
+    if (kbits == 0) {
+        return upload_payload(f, (void **)&w->d_exl3_bf16, (size_t)M * K * 2, what, upload);
+    }
+    if (kbits > 8 || (M % 128) != 0 || (K % 128) != 0) {
+        fprintf(stderr, "%s: exl3 kbits=%u shape %dx%d unsupported (need 1..8 bits, 128-aligned)\n",
+                what, kbits, M, K);
+        return -1;
+    }
+    if (cb != 2) {
+        fprintf(stderr, "%s: exl3 codebook %u not implemented (mul1 only)\n", what, cb);
+        return -1;
+    }
+    if (upload_payload(f, (void **)&w->d_exl3_suh, (size_t)K * 2, what, upload) != 0) return -1;
+    if (upload_payload(f, (void **)&w->d_exl3_svh, (size_t)M * 2, what, upload) != 0) return -1;
+    size_t tbytes = (size_t)(K / 16) * (size_t)(M / 16) * (size_t)(16 * kbits) * 2;
+    if (upload_payload(f, (void **)&w->d_exl3_trellis, tbytes, what, upload) != 0) return -1;
+    if (upload) {
+        // exllamav3 stores tiles [kt][nt]; the streaming GEMM walks k for a fixed n-tile, so
+        // re-order to [nt][kt] (each warp then reads one contiguous run of tiles).
+        uint16_t *dst = NULL;
+        if (cudaMalloc(&dst, tbytes) != cudaSuccess) { fprintf(stderr, "%s: exl3 repack alloc failed\n", what); return -1; }
+        int KT = K / 16, NT = M / 16, NW = 8 * (int)kbits;
+        long ntiles = (long)KT * NT;
+        k_tq_exl3_repack_tiles<<<(unsigned)((ntiles * NW + 255) / 256), 256>>>(
+            (uint32_t *)dst, (const uint32_t *)w->d_exl3_trellis, KT, NT, NW);
+        if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr, "%s: exl3 repack failed\n", what); return -1; }
+        cudaFree(w->d_exl3_trellis);
+        w->d_exl3_trellis = dst;
+    }
+    return 0;
+}
+
 static int read_qmma(FILE *f, tq_qmma_weight_t *w, int M, int K, const char *what, int upload,
                      int want_sparse) {
     if ((M % 16) != 0 || (K % 32) != 0) {
         fprintf(stderr, "%s: unaligned QMMA shape %dx%d\n", what, M, K);
         return -1;
     }
+    if (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) return read_exl3(f, w, M, K, what, upload);
     w->M = M;
     w->K = K;
     w->Mt = M / 16;
@@ -10732,6 +10806,10 @@ static void free_qmma(tq_qmma_weight_t *w) {
     if (w->d_block_scale_inv) cudaFree(w->d_block_scale_inv);
     if (w->d_sparse_a) cudaFree(w->d_sparse_a);
     if (w->d_sparse_meta) cudaFree(w->d_sparse_meta);
+    if (w->d_exl3_trellis) cudaFree(w->d_exl3_trellis);
+    if (w->d_exl3_suh) cudaFree(w->d_exl3_suh);
+    if (w->d_exl3_svh) cudaFree(w->d_exl3_svh);
+    if (w->d_exl3_bf16) cudaFree(w->d_exl3_bf16);
     memset(w, 0, sizeof(*w));
 }
 
@@ -19396,7 +19474,9 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
 // (token-major); may NOT alias. Returns 0; -1 if mlp weights aren't e2m3-SF (caller falls back).
 static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) {
     int H = g_qwen.H, I = g_qwen.I;
-    if (!((l->mlp_gate.e2m3 || l->mlp_gate.e2m1) && (l->mlp_up.e2m3 || l->mlp_up.e2m1) &&
+    int exl3_ok = l->mlp_gate.exl3 && l->mlp_up.exl3 && l->mlp_down.exl3;
+    if (!exl3_ok &&
+        !((l->mlp_gate.e2m3 || l->mlp_gate.e2m1) && (l->mlp_up.e2m3 || l->mlp_up.e2m1) &&
           (l->mlp_down.e2m3 || l->mlp_down.e2m1) &&
           can_use_qmma_sf_weight(&l->mlp_gate) && !l->mlp_gate.row_major &&
           can_use_qmma_sf_weight(&l->mlp_down) && !l->mlp_down.row_major)) return -1;
@@ -19412,15 +19492,533 @@ static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) 
     return 0;
 }
 
+// ===== EXL3 trellis weights on the wide path (TQ_FLAG_EXL3_WEIGHTS) =====
+// A Linear y = x W^T with W [M][K] is stored as W = diag(svh) (H128 W_hat H128)^T diag(suh):
+// W_hat is [K][M] in 16x16 trellis tiles (int16 [K/16][M/16][16*KB]), H128 the 128-point
+// Sylvester Hadamard scaled 1/sqrt(128), applied per 128-block on each side. Forward:
+//   xh = H128(x * suh)  ->  y_hat = xh W_hat  ->  y = H128(y_hat) * svh.
+// Tile stream: 256*KB bits, circular, MSB-first inside uint32 words; weight t (tensor-core
+// fragment order, t = lane*8 + j) has the 16-bit codeword ending at stream bit (t+1)*KB.
+// mul1 codebook. Same arithmetic as exllamav3 (exl3_dq.cuh / codebook.cuh, cb == 2), so the
+// dequantized fp16 weights are bit-identical to that engine's.
+static __device__ __forceinline__ __half tq_exl3_mul1(uint32_t x) {
+    x *= 0x83DCD12Du;
+    uint32_t sum = __dp4a(x, 0x01010101u, 0x6400u);           // byte sum + 1024.0 in fp16 bits
+    return __hfma(__ushort_as_half((uint16_t)sum), __ushort_as_half(0x1eee), __ushort_as_half(0xc931));
+}
+
+static __device__ __forceinline__ uint32_t tq_exl3_pack(__half lo, __half hi) {
+    return (uint32_t)__half_as_ushort(lo) | ((uint32_t)__half_as_ushort(hi) << 16);
+}
+
+// Codeword extraction (the exllamav3 dq4 / dq2x2 / dq8 scheme). The lane's 8 weights are the
+// A operand of mma.m16n8k16 (rows = output features n, cols = k): a0 (n=l/4, k=2(l%4)+{0,1}),
+// a1 (n+8), a2 (k+8,+9), a3 (n+8, k+8,+9) = codewords t = 8*lane + {0,1}, {4,5}, {2,3}, {6,7}.
+// They are taken in groups of NCW consecutive codewords, each group from ONE pair of stream
+// words (a = word of the group's first bit, b = word of its last bit) via a 64-bit shift. The
+// group fits two words because of the fragment order: 8 codewords start at 8*lane*KB, so the
+// offset of a group's first bit inside its word plus (NCW-1)*KB+16 never exceeds 64 for the
+// NCW chosen per KB (1..3 bits: 8; 4,5,6,8 bits: 4; 7 bits: 2). Word indices and shifts depend
+// on the lane only, so they are computed once per warp; per tile each lane loads 2 words per
+// group (L1 absorbs the overlap between lanes; the tile leaves DRAM once).
+template <int KB> struct tq_exl3_ncw { static constexpr int v = (KB <= 3) ? 8 : (KB == 7 ? 2 : 4); };
+
+template <int KB>
+struct tq_exl3_win {
+    static constexpr int NCW = tq_exl3_ncw<KB>::v;
+    static constexpr int NGRP = 8 / NCW;
+    static constexpr int NW = 8 * KB;
+    int ia[NGRP], ib[NGRP], s2[NGRP];
+    __device__ __forceinline__ void init(int lane) {
+        #pragma unroll
+        for (int g = 0; g < NGRP; g++) {
+            int t = lane * 8 + g * NCW;
+            int b0 = (t + 257) * KB - 16;               // start of the group's first codeword
+            int b2 = b0 + (NCW - 1) * KB + 16;          // end of its last codeword
+            int i0 = b0 >> 5, i2 = (b2 - 1) >> 5;
+            s2[g] = ((i2 + 1) << 5) - b2;
+            ia[g] = i0 % NW;
+            ib[g] = i2 % NW;
+        }
+    }
+    // Per-lane direct loads of the group words (2 x 32-bit per group per tile per lane).
+    __device__ __forceinline__ void load(const uint32_t *tile, uint32_t *r) const {
+        #pragma unroll
+        for (int g = 0; g < NGRP; g++) { r[2 * g] = __ldcs(tile + ia[g]); r[2 * g + 1] = __ldcs(tile + ib[g]); }
+    }
+    __device__ __forceinline__ void frag(const uint32_t *r, uint32_t &a0, uint32_t &a1, uint32_t &a2, uint32_t &a3) const {
+        __half w[8];
+        #pragma unroll
+        for (int g = 0; g < NGRP; g++) {
+            uint64_t m = ((uint64_t)r[2 * g] << 32) | (uint64_t)r[2 * g + 1];
+            #pragma unroll
+            for (int j = 0; j < NCW; j++)
+                w[g * NCW + j] = tq_exl3_mul1((uint32_t)(m >> (s2[g] + (NCW - 1 - j) * KB)) & 0xffffu);
+        }
+        a0 = tq_exl3_pack(w[0], w[1]);
+        a2 = tq_exl3_pack(w[2], w[3]);
+        a1 = tq_exl3_pack(w[4], w[5]);
+        a3 = tq_exl3_pack(w[6], w[7]);
+    }
+};
+
+static __device__ __forceinline__ float tq_fp16_to_float(uint16_t bits) {
+    return __half2float(__ushort_as_half(bits));
+}
+
+// 4-then-32 butterfly over a warp: 128-point Hadamard of (lane*4 + i) values (natural order),
+// same sign convention as exllamav3 shuffle_had_f4x32.
+static __device__ __forceinline__ void tq_had128_warp(float &v0, float &v1, float &v2, float &v3, int lane) {
+    float s0 = v0 + v1, d0 = v0 - v1, s1 = v2 + v3, d1 = v2 - v3;
+    v0 = s0 + s1; v1 = d0 + d1; v2 = s0 - s1; v3 = d0 - d1;
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1) {
+        float p0 = __shfl_xor_sync(0xffffffffu, v0, i);
+        float p1 = __shfl_xor_sync(0xffffffffu, v1, i);
+        float p2 = __shfl_xor_sync(0xffffffffu, v2, i);
+        float p3 = __shfl_xor_sync(0xffffffffu, v3, i);
+        float sg = (lane & i) ? -1.0f : 1.0f;
+        v0 = sg * v0 + p0; v1 = sg * v1 + p1; v2 = sg * v2 + p2; v3 = sg * v3 + p3;
+    }
+}
+
+#define TQ_EXL3_RSCALE 0.08838834764831845f   // 1/sqrt(128)
+
+// x fp32 [N][K] token-major -> fp16 B fragments of H128(x*suh) for mma.m16n8k16:
+// layout [k16 tile][group pair gp = n/16][lane][2 groups][2 words] (GP = ceil(Gt/2) pairs);
+// lane = (n%8)*4 + tig holds k = 2*tig+{0,1} (word 0) and k+8,+9 (word 1). A warp's 128-bit
+// load of a group pair is one contiguous 512-byte run. One warp per (token, 128-block of K).
+// Pad tokens are zeroed by the caller (memset).
+__global__ void __launch_bounds__(128) k_tq_exl3_bfrag(uint32_t *bfrag, const float *x, const uint16_t *suh,
+                                                       int K, int N, int Kt16, int GP) {
+    int wg = blockIdx.x * 4 + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int nblk = K >> 7;
+    int n = wg / nblk, bk = wg - n * nblk;
+    if (n >= N) return;
+    float4 v = *(const float4 *)(x + (size_t)n * K + bk * 128 + lane * 4);
+    const uint16_t *sp = suh + bk * 128 + lane * 4;
+    float v0 = v.x * tq_fp16_to_float(sp[0]), v1 = v.y * tq_fp16_to_float(sp[1]);
+    float v2 = v.z * tq_fp16_to_float(sp[2]), v3 = v.w * tq_fp16_to_float(sp[3]);
+    tq_had128_warp(v0, v1, v2, v3, lane);
+    __half h0 = __float2half_rn(v0 * TQ_EXL3_RSCALE), h1 = __float2half_rn(v1 * TQ_EXL3_RSCALE);
+    __half h2 = __float2half_rn(v2 * TQ_EXL3_RSCALE), h3 = __float2half_rn(v3 * TQ_EXL3_RSCALE);
+    int kt = bk * 8 + (lane >> 2);
+    int w = (lane & 2) ? 1 : 0;
+    int tig = (lane & 1) * 2;
+    int g = n >> 3, r = n & 7;
+    uint32_t *dst = bfrag + (((size_t)kt * GP + (g >> 1)) * 32 + r * 4 + tig) * 4 + (g & 1) * 2 + w;
+    dst[0] = tq_exl3_pack(h0, h1);
+    dst[4] = tq_exl3_pack(h2, h3);                // next lane (tig+1), same group
+}
+
+// Streaming GEMM with the output Hadamard fused. Work unit = (128 output features, one
+// k-split); a block of 8 warps (one 16-feature trellis tile each) takes units from a counter
+// until none are left (no tail from a static grid; the grid is sized to what is resident).
+// For k_splits == 1 the block's smem epilogue applies H128 and svh and writes out directly.
+// For k_splits > 1 every split stores its y_hat partial; the LAST split to arrive at a
+// feature block (per-block arrival counter) sums the partials in split order -- so the
+// result does not depend on arrival order -- and runs the same epilogue. The counters
+// (ctr[0] units, ctr[1] blocks done, ctr[2..] per-feature-block arrivals) are reset by the
+// block that finishes last, so the next launch on the stream starts from zero.
+// Unit = (128 output features) x (8*NG tokens = one token group) x (one k-split); ntg token
+// groups. Wide N runs as several token groups over the same weights (L2 serves the re-reads)
+// instead of huge accumulator sets or deep k-splits.
+template <int KB, int NG>
+__global__ void __launch_bounds__(256, (NG <= 2) ? 4 : 2) k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
+                                                           const uint16_t *trellis, const uint32_t *bfrag,
+                                                           const uint16_t *svh, int M, int Kt16, int nvar,
+                                                           int GP, int ntg, int k_splits, int per, int *ctr) {
+    constexpr int NW = 8 * KB;
+    constexpr int PF = (NG <= 4) ? 4 : 2;         // tiles in flight per warp (register ring)
+    constexpr int RW = 2 * tq_exl3_win<KB>::NGRP;   // words per lane per tile
+    __shared__ int s_unit;
+    __shared__ __align__(16) float s_red[8][128];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int tig = lane & 3, gid = lane >> 2;
+    int MB = M >> 7;
+    int total = MB * ntg * k_splits;
+    const size_t kstride = NW;                    // tiles stored [nt][kt]: k-walk is contiguous
+    tq_exl3_win<KB> win;
+    win.init(lane);
+    for (;;) {
+        if (threadIdx.x == 0) s_unit = atomicAdd(&ctr[0], 1);
+        __syncthreads();
+        int u = s_unit;
+        __syncthreads();
+        if (u >= total) break;
+        int split = u % k_splits;
+        int bt = u / k_splits;                    // (feature block, token group), token group fastest
+        int tg = bt % ntg, bm = bt / ntg;
+        int nt = bm * 8 + warp;
+        int t0 = split * per, t1 = t0 + per;
+        if (t1 > Kt16) t1 = Kt16;                 // ragged last split
+        const uint32_t *tr = (const uint32_t *)trellis + (size_t)nt * Kt16 * NW;
+        // this unit's tokens: tg*8*NG .. ; bfrag groups and out rows offset accordingly
+        const int tok_base = tg * 8 * NG;
+        const int nvar_u = (nvar - tok_base < 8 * NG) ? (nvar - tok_base) : 8 * NG;
+        const int gp0 = (tg * NG) >> 1;           // first group pair of this unit (NG >= 2 even; NG == 1 -> tg*NG/2)
+        const int half0 = (tg * NG) & 1;          // NG == 1: which half of the pair
+        float *out_u = out + (size_t)tok_base * M;
+        float *partials_u = partials + (size_t)tok_base * M;
+        float c[NG][4];
+        #pragma unroll
+        for (int g = 0; g < NG; g++) { c[g][0] = c[g][1] = c[g][2] = c[g][3] = 0.0f; }
+        // Wide N (prefill) is tensor-pipe bound (ncu: 79 % tensor active, math-pipe throttle),
+        // and GeForce runs f16-accumulate MMAs at twice the f32-accumulate rate: accumulate
+        // TQ_EXL3_FOLD tiles (16*FOLD products) in fp16 and fold into the fp32 accumulators.
+        // Decode-size N keeps the f32 MMA (tensor work is negligible there).
+        constexpr bool ACC16 = (NG >= 8);
+        constexpr int FOLD = 8;
+        uint32_t ch[ACC16 ? NG : 1][2];
+        #pragma unroll
+        for (int g = 0; g < (ACC16 ? NG : 1); g++) { ch[g][0] = 0u; ch[g][1] = 0u; }
+        auto fold16 = [&]() {
+            if (ACC16) {
+                #pragma unroll
+                for (int g = 0; g < NG; g++) {
+                    __half2 h0 = *reinterpret_cast<__half2 *>(&ch[g][0]);
+                    __half2 h1 = *reinterpret_cast<__half2 *>(&ch[g][1]);
+                    c[g][0] += __low2float(h0); c[g][1] += __high2float(h0);
+                    c[g][2] += __low2float(h1); c[g][3] += __high2float(h1);
+                    ch[g][0] = 0u; ch[g][1] = 0u;
+                }
+            }
+        };
+        // One tile's NG MMAs against the tokens (A fragment already dequantized). Group pairs
+        // are contiguous per lane: two groups per 16-byte load, coalesced across the warp.
+        auto tile_mma = [&](uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, int kt) {
+            const uint32_t *bp = bfrag + (((size_t)kt * GP + gp0) * 32 + lane) * 4;
+            uint32_t bw[NG][2];
+            if (NG >= 2) {
+                #pragma unroll
+                for (int g = 0; g < NG; g += 2) {
+                    uint4 q = __ldg((const uint4 *)(bp + (size_t)(g >> 1) * 128));
+                    bw[g][0] = q.x; bw[g][1] = q.y; bw[g + 1][0] = q.z; bw[g + 1][1] = q.w;
+                }
+            } else {
+                uint2 q = __ldg((const uint2 *)(bp + half0 * 2));
+                bw[0][0] = q.x; bw[0][1] = q.y;
+            }
+            #pragma unroll
+            for (int g = 0; g < NG; g++) {
+                if (ACC16) {
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                        : "+r"(ch[g][0]), "+r"(ch[g][1])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bw[g][0]), "r"(bw[g][1]));
+                } else {
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(c[g][0]), "+f"(c[g][1]), "+f"(c[g][2]), "+f"(c[g][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bw[g][0]), "r"(bw[g][1]));
+                }
+            }
+        };
+        // Register ring: pf[d] holds the lane's words of tile kt+d (direct per-lane loads of
+        // the two words of each codeword group; L1 absorbs the overlap between lanes).
+        uint32_t pf[PF][RW];
+        #pragma unroll
+        for (int d = 0; d < PF; d++)
+            if (t0 + d < t1) win.load(tr + (size_t)(t0 + d) * kstride, pf[d]);
+        int kt = t0;
+        // main loop: PF tiles in hand and PF more guaranteed ahead -> no per-tile branches
+        for (; kt + 2 * PF <= t1; kt += PF) {
+            #pragma unroll
+            for (int d = 0; d < PF; d++) {
+                uint32_t r[RW];
+                #pragma unroll
+                for (int q = 0; q < RW; q++) r[q] = pf[d][q];
+                win.load(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                uint32_t a0, a1, a2, a3;
+                win.frag(r, a0, a1, a2, a3);
+                tile_mma(a0, a1, a2, a3, kt + d);
+            }
+            if (ACC16 && (((kt - t0) / PF + 1) % (FOLD / PF)) == 0) fold16();
+        }
+        // tail: fewer than 2*PF tiles left
+        for (; kt < t1; kt += PF) {
+            #pragma unroll
+            for (int d = 0; d < PF; d++) {
+                if (kt + d >= t1) break;
+                uint32_t r[RW];
+                #pragma unroll
+                for (int q = 0; q < RW; q++) r[q] = pf[d][q];
+                if (kt + d + PF < t1) win.load(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                uint32_t a0, a1, a2, a3;
+                win.frag(r, a0, a1, a2, a3);
+                tile_mma(a0, a1, a2, a3, kt + d);
+            }
+            if (ACC16) fold16();
+        }
+        fold16();
+        int row0 = nt * 16 + gid, row1 = row0 + 8;
+        bool finish = true;
+        if (k_splits > 1) {
+            // publish this split's y_hat partial, then see whether we are the last split of (bm, tg)
+            float *pout = partials_u + (size_t)split * split_stride;
+            #pragma unroll
+            for (int g = 0; g < NG; g++) {
+                int tok0 = g * 8 + 2 * tig, tok1 = tok0 + 1;
+                if (tok0 < nvar_u) { pout[(size_t)tok0 * M + row0] = c[g][0]; pout[(size_t)tok0 * M + row1] = c[g][2]; }
+                if (tok1 < nvar_u) { pout[(size_t)tok1 * M + row0] = c[g][1]; pout[(size_t)tok1 * M + row1] = c[g][3]; }
+            }
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                int arrived = atomicAdd(&ctr[2 + bt], 1);
+                s_unit = (arrived == k_splits - 1) ? 1 : 0;
+                if (arrived == k_splits - 1) ctr[2 + bt] = 0;
+            }
+            __syncthreads();
+            finish = s_unit != 0;
+            __syncthreads();
+            if (finish) __threadfence();
+        }
+        if (finish) {
+            #pragma unroll
+            for (int g = 0; g < NG; g++) {
+                if (g * 8 >= nvar_u) break;
+                // this warp's 16 features x 8 tokens of group g -> s_red[token][feature]
+                int f0 = warp * 16 + gid, f1 = f0 + 8;
+                if (k_splits > 1) {
+                    // deterministic: partials summed in split order 0..k_splits-1
+                    int tok0 = g * 8 + 2 * tig, tok1 = tok0 + 1;
+                    float v00 = 0.f, v01 = 0.f, v10 = 0.f, v11 = 0.f;
+                    for (int s = 0; s < k_splits; s++) {
+                        const float *ps = partials_u + (size_t)s * split_stride;   // other blocks' data: skip L1
+                        if (tok0 < nvar_u) { v00 += __ldcg(ps + (size_t)tok0 * M + row0); v10 += __ldcg(ps + (size_t)tok0 * M + row1); }
+                        if (tok1 < nvar_u) { v01 += __ldcg(ps + (size_t)tok1 * M + row0); v11 += __ldcg(ps + (size_t)tok1 * M + row1); }
+                    }
+                    s_red[2 * tig][f0] = v00; s_red[2 * tig + 1][f0] = v01;
+                    s_red[2 * tig][f1] = v10; s_red[2 * tig + 1][f1] = v11;
+                } else {
+                    s_red[2 * tig][f0] = c[g][0]; s_red[2 * tig + 1][f0] = c[g][1];
+                    s_red[2 * tig][f1] = c[g][2]; s_red[2 * tig + 1][f1] = c[g][3];
+                }
+                __syncthreads();
+                // warp w: token g*8+w, 128 features -> H128 * svh -> out
+                int tok = g * 8 + warp;
+                if (tok < nvar_u) {
+                    float4 v = *(const float4 *)&s_red[warp][lane * 4];
+                    tq_had128_warp(v.x, v.y, v.z, v.w, lane);
+                    const uint16_t *sp = svh + bm * 128 + lane * 4;
+                    float4 o;
+                    o.x = v.x * TQ_EXL3_RSCALE * tq_fp16_to_float(sp[0]);
+                    o.y = v.y * TQ_EXL3_RSCALE * tq_fp16_to_float(sp[1]);
+                    o.z = v.z * TQ_EXL3_RSCALE * tq_fp16_to_float(sp[2]);
+                    o.w = v.w * TQ_EXL3_RSCALE * tq_fp16_to_float(sp[3]);
+                    *(float4 *)(out_u + (size_t)tok * M + bm * 128 + lane * 4) = o;
+                }
+                __syncthreads();
+            }
+        }
+    }
+    // the last block to finish resets the unit counter for the next launch
+    if (threadIdx.x == 0) {
+        __threadfence();
+        int done = atomicAdd(&ctr[1], 1);
+        if (done == (int)gridDim.x - 1) { ctr[0] = 0; ctr[1] = 0; __threadfence(); }
+    }
+}
+
+// Linears the checkpoint left in bf16 (tiny: in_proj_a/b): out[n][m] = sum_k W[m][k] x[n][k].
+// grid (M, ceil(N/8)), 1024 threads (few rows -> the K loop must be short); one weight row
+// read per 8 tokens.
+__global__ void __launch_bounds__(1024) k_tq_exl3_bf16_wide(float *out, const uint16_t *w, const float *x,
+                                                            int M, int K, int N) {
+    __shared__ float red[8][1024];
+    int m = blockIdx.x, n0 = blockIdx.y * 8, tid = threadIdx.x;
+    const uint16_t *wr = w + (size_t)m * K;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k = tid; k < K; k += 1024) {
+        float wv = tq_bf16_to_float(__ldg(wr + k));
+        #pragma unroll
+        for (int c = 0; c < 8; c++)
+            if (n0 + c < N) acc[c] += wv * __ldg(x + (size_t)(n0 + c) * K + k);
+    }
+    #pragma unroll
+    for (int c = 0; c < 8; c++) red[c][tid] = acc[c];
+    __syncthreads();
+    for (int stride = 512; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            #pragma unroll
+            for (int c = 0; c < 8; c++) red[c][tid] += red[c][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid < 8 && n0 + tid < N) out[(size_t)(n0 + tid) * M + m] = red[tid][0];
+}
+
 // ---- D.1 integration: wide projection via k_tq_fp6_wide_gemm (shared per-128K-block
 // activation scale: NOT bit-exact vs per-token for differing tokens -- validated by
 // needle, not bit-exact). Scratch grows lazily. ---------------------------------------
 static uint8_t *g_wproj_b = NULL; static float *g_wproj_bscale = NULL, *g_wproj_part = NULL;
 static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
+// EXL3: wide_quant_input only records the fp32 input (the transform depends on each Linear's suh);
+// exl3_wide_proj builds the fp16 fragments per projection.
+static const float *g_exl3_x = NULL; static int g_exl3_K = 0, g_exl3_N = 0;
+static uint32_t *g_exl3_b = NULL; static size_t g_exl3_b_words = 0;
+static int *g_exl3_ctr = NULL;                 // [2 + 2048] work/done/arrival counters, self-resetting
+static int g_exl3_grid[9][5];                  // resident blocks per (KB, log2 NG), 0 = not queried
+static int g_exl3_nsm = 0;
+
+// Resident block capacity of one instantiation (occupancy x SMs), cached.
+template <int KB, int NG>
+static int exl3_gemm_cap(void) {
+    int lg = (NG == 1) ? 0 : (NG == 2) ? 1 : (NG == 4) ? 2 : (NG == 8) ? 3 : 4;
+    int &cap = g_exl3_grid[KB][lg];
+    if (cap == 0) {
+        int nb = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_tq_exl3_wide_gemm<KB, NG>, 256, 0) != cudaSuccess || nb < 1) nb = 1;
+        if (g_exl3_nsm == 0) {
+            int dev = 0; cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&g_exl3_nsm, cudaDevAttrMultiProcessorCount, dev);
+            if (g_exl3_nsm <= 0) g_exl3_nsm = 1;
+        }
+        cap = nb * g_exl3_nsm;
+    }
+    return cap;
+}
+
+// Tokens per unit (8*NG). Decode-size N keeps small accumulator sets (occupancy). For wide N
+// one dequantized tile should feed as many MMAs as possible (the dequant is the cost there),
+// but a unit set must still fill the resident blocks: take the largest NG whose
+// (feature blocks x token groups) covers >= 3/4 of the capacity, else the smallest (NG=4).
+static int exl3_unit_ng(int N, int MB) {
+    int g = wide_ng(N);
+    if (g <= 4) return g;
+    const char *e = getenv("TQ_EXL3_WIDE_NG");          // A/B override
+    if (e && *e) { int v = atoi(e); if (v == 4 || v == 8 || v == 16) return v; }
+    // measured (5090, 128 tokens, fp16-accumulate MMAs): 64-token units are the best trade
+    // between dequant amortization and k-split partial traffic for every projection except the
+    // lm_head, whose 1940 feature blocks fill the GPU with 128-token units and no split
+    // (1.47 vs 1.63 ms); the k/v projections (8 feature blocks) need 32-token units.
+    int units16 = MB * ((N + 127) / 128);
+    if (units16 >= 1024) return 16;
+    int units8 = MB * ((N + 63) / 64);
+    if (units8 >= 64) return 8;
+    return 4;
+}
+
+// k-splits so that (feature blocks x token groups x splits) fills the resident blocks in ONE
+// round (a GEMM is only 1-2 rounds of the whole GPU, so any unit tail costs a large fraction),
+// with >= 32 tiles per split; ragged last split allowed. The y_hat partial traffic is capped
+// at half the weight bytes.
+static int exl3_pick_splits(int cap, int units, int Kt16, int N, int M, int KB, int *per_out) {
+    int fixed = qmma_sf_k_split();
+    int ks;
+    if (fixed >= 1) ks = fixed;
+    else {
+        ks = (cap + units / 2) / units;
+        if (ks < 1) ks = 1;
+        int ks_max = Kt16 / 32; if (ks_max < 1) ks_max = 1;
+        if (ks > ks_max) ks = ks_max;
+        double wbytes = (double)M * (double)Kt16 * 16.0 * KB / 8.0;
+        int ks_bw = (int)(wbytes / (2.0 * N * (double)M * 4.0));
+        if (ks_bw < 1) ks_bw = 1;
+        if (ks > ks_bw) ks = ks_bw;
+    }
+    int per = (Kt16 + ks - 1) / ks;
+    ks = (Kt16 + per - 1) / per;
+    *per_out = per;
+    return ks;
+}
+
+template <int KB, int NG>
+static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, const tq_qmma_weight_t *w,
+                            const uint32_t *bp, int M, int Kt16, int N, int Gt, cudaStream_t st) {
+    int cap = exl3_gemm_cap<KB, NG>();
+    int ntg = (N + 8 * NG - 1) / (8 * NG);
+    int units = (M / 128) * ntg;
+    if (units > 8192) return -117;                // arrival counters
+    int per = 1;
+    int ks = exl3_pick_splits(cap, units, Kt16, N, M, KB, &per);
+    float *pout = NULL;
+    if (ks > 1) {
+        size_t need = (size_t)ks * split_stride * sizeof(float);
+        if (need > g_wproj_part_bytes) {
+            if (g_wproj_part) cudaFree(g_wproj_part);
+            if (cudaMalloc(&g_wproj_part, need) != cudaSuccess) { g_wproj_part = NULL; g_wproj_part_bytes = 0; return -91; }
+            g_wproj_part_bytes = need;
+        }
+        pout = g_wproj_part;
+    }
+    int total = units * ks;
+    int grid = total < cap ? total : cap;
+    k_tq_exl3_wide_gemm<KB, NG><<<grid, 256, 0, st>>>(out, pout, split_stride, w->d_exl3_trellis, bp,
+                                                      w->d_exl3_svh, M, Kt16, N, (Gt + 1) / 2, ntg, ks, per, g_exl3_ctr);
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("TQ_EXL3_DEBUG") != NULL;
+    if (dbg) {   // counters must be back at zero after every launch
+        int h[2 + 64];
+        cudaStreamSynchronize(st);
+        cudaMemcpy(h, g_exl3_ctr, sizeof(h), cudaMemcpyDeviceToHost);
+        int bad = 0;
+        for (int i = 0; i < 2 + 64; i++) if (h[i]) bad++;
+        fprintf(stderr, "[exl3-gemm] KB=%d NG=%d M=%d K=%d N=%d ntg=%d ks=%d per=%d grid=%d units=%d ctr0=%d ctr1=%d nonzero=%d err=%s\n",
+                KB, NG, M, Kt16 * 16, N, ntg, ks, per, grid, units, h[0], h[1], bad, cudaGetErrorString(cudaGetLastError()));
+    }
+    return 0;
+}
+
+#define TQ_EXL3_LAUNCH(KB_, NG_) \
+    return exl3_launch_gemm<KB_, NG_>(out, NULL, split_stride, w, g_exl3_b, M, Kt16, N, Gt, st)
+#define TQ_EXL3_SWITCH_NG(KB_) \
+    switch (G) { \
+        case 1: TQ_EXL3_LAUNCH(KB_, 1); case 2: TQ_EXL3_LAUNCH(KB_, 2); \
+        case 4: TQ_EXL3_LAUNCH(KB_, 4); case 8: TQ_EXL3_LAUNCH(KB_, 8); \
+        case 16: TQ_EXL3_LAUNCH(KB_, 16); default: return -113; }
+
+static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
+    cudaStream_t st = g_qwen.stream;
+    int M = w->M, K = w->K;
+    if (!g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
+    if (w->exl3_kbits == 0) {
+        if (!w->d_exl3_bf16) return -111;
+        k_tq_exl3_bf16_wide<<<dim3(M, (N + 7) / 8), 1024, 0, st>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
+        return 0;
+    }
+    if (!g_exl3_ctr) {
+        if (cudaMalloc(&g_exl3_ctr, (2 + 8192) * sizeof(int)) != cudaSuccess) { g_exl3_ctr = NULL; return -116; }
+        cudaMemset(g_exl3_ctr, 0, (2 + 8192) * sizeof(int));
+    }
+    int Kt16 = K / 16;
+    int Gt = wide_ng(N), GP = (Gt + 1) / 2;
+    size_t need_w = (size_t)GP * Kt16 * 128;      // [kt][pair][32 lanes][4 words]
+    if (need_w > g_exl3_b_words) {
+        if (g_exl3_b) cudaFree(g_exl3_b);
+        if (cudaMalloc(&g_exl3_b, need_w * sizeof(uint32_t)) != cudaSuccess) { g_exl3_b = NULL; g_exl3_b_words = 0; return -112; }
+        g_exl3_b_words = need_w;
+    }
+    cudaMemsetAsync(g_exl3_b, 0, need_w * sizeof(uint32_t), st);
+    int nwarps = N * (K / 128);
+    k_tq_exl3_bfrag<<<(nwarps + 3) / 4, 128, 0, st>>>(g_exl3_b, g_exl3_x, w->d_exl3_suh, K, N, Kt16, GP);
+    size_t split_stride = (size_t)N * M;
+    int G = exl3_unit_ng(N, M / 128);
+    switch (w->exl3_kbits) {
+        case 2: TQ_EXL3_SWITCH_NG(2);
+        case 3: TQ_EXL3_SWITCH_NG(3);
+        case 4: TQ_EXL3_SWITCH_NG(4);
+        case 5: TQ_EXL3_SWITCH_NG(5);
+        case 6: TQ_EXL3_SWITCH_NG(6);
+        case 7: TQ_EXL3_SWITCH_NG(7);
+        case 8: TQ_EXL3_SWITCH_NG(8);
+        default: return -114;
+    }
+}
+#undef TQ_EXL3_LAUNCH
+#undef TQ_EXL3_SWITCH_NG
 
 // quantize activations [N x K] (token-major) -> B-frag groups in g_wproj_b (e4m3, shared
 // pow2 scale per 128-K block in g_wproj_bscale). Mirrors the bench path exactly.
 static int wide_quant_input(const float *d_x, int K, int N) {
+    if (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) {      // fp16 fragments are built per Linear (suh)
+        g_exl3_x = d_x; g_exl3_K = K; g_exl3_N = N;
+        return 0;
+    }
     int Kt = (K + 31) / 32, G = wide_ng(N), nblocks = (K + 127) / 128;  // NG groups (pow2); extras zeroed
     size_t need_b = (size_t)G * Kt * 256;
     if (need_b > g_wproj_b_bytes) {
@@ -19442,10 +20040,12 @@ static int wide_quant_input(const float *d_x, int K, int N) {
 // run one wide projection from the prepared B-frag (call wide_quant_input first).
 // wide path accepts E2M3 (6-bit) OR E2M1 (4-bit, throughput tier via TQ_W_E2M1 repack), both SF.
 static inline int tq_wide_fmt_ok(const tq_qmma_weight_t *w) {
+    if (w->exl3) return 1;
     return can_use_qmma_sf_weight(w) && !w->row_major && (w->e2m3 || w->e2m1);
 }
 
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
+    if (w->exl3) return exl3_wide_proj(w, out, N);
     if (!can_use_qmma_sf_weight(w) || w->row_major || !(w->e2m3 || w->e2m1)) return -90;
     int k_splits = qmma_sf_k_split_auto(w->Mt, w->Kt);
     if (k_splits > 1) {
@@ -19459,6 +20059,97 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (w->e2m1)
         return launch_fp4_wide_gemm(out, w, g_wproj_b, g_wproj_bscale, N, g_wproj_part, k_splits, g_qwen.stream);
     return launch_fp6_wide_gemm(out, w, g_wproj_b, g_wproj_bscale, N, g_wproj_part, k_splits, g_qwen.stream);
+}
+
+// Validation ABI: run one Linear of the loaded model through the wide path on host data.
+// which: 0 q_proj 1 k_proj 2 v_proj 3 o_proj 4 mlp_gate 5 mlp_up 6 mlp_down 7 linear_in_qkv
+// 8 linear_in_z 9 linear_in_b 10 linear_in_a 11 linear_out 12 lm_head (layer ignored).
+// h_x [N][K] fp32 token-major -> h_out [N][M]. With h_x == NULL only *out_M/*out_K are filled.
+extern "C" int qwn_wide_linear_test(int layer, int which, const float *h_x, int N, float *h_out,
+                                    int *out_M, int *out_K, int *out_kbits) {
+    if (!g_qwen.initialized) return -1;
+    const tq_qmma_weight_t *w = NULL;
+    if (which == 12) w = &g_qwen.lm_head;
+    else {
+        if (layer < 0 || layer >= g_qwen.L) return -2;
+        tq_layer_t *l = &g_qwen.layers[layer];
+        switch (which) {
+            case 0: w = &l->q_proj; break;      case 1: w = &l->k_proj; break;
+            case 2: w = &l->v_proj; break;      case 3: w = &l->o_proj; break;
+            case 4: w = &l->mlp_gate; break;    case 5: w = &l->mlp_up; break;
+            case 6: w = &l->mlp_down; break;    case 7: w = &l->linear_in_qkv; break;
+            case 8: w = &l->linear_in_z; break; case 9: w = &l->linear_in_b; break;
+            case 10: w = &l->linear_in_a; break; case 11: w = &l->linear_out; break;
+            default: return -3;
+        }
+    }
+    if (w->M <= 0) return -4;
+    if (out_M) *out_M = w->M;
+    if (out_K) *out_K = w->K;
+    if (out_kbits) *out_kbits = w->exl3 ? w->exl3_kbits : -1;
+    if (!h_x) return 0;
+    if (N < 1) return -5;
+    float *d_x = NULL, *d_out = NULL;
+    size_t xb = (size_t)N * w->K * sizeof(float), ob = (size_t)N * w->M * sizeof(float);
+    if (cudaMalloc(&d_x, xb) != cudaSuccess) return -6;
+    if (cudaMalloc(&d_out, ob) != cudaSuccess) { cudaFree(d_x); return -6; }
+    int ret = 0;
+    // g_qwen.stream is non-blocking: order the upload on it (a synchronous cudaMemcpy from
+    // pageable memory may return before the DMA lands, and the kernels would read a partial x).
+    if (cudaMemcpyAsync(d_x, h_x, xb, cudaMemcpyHostToDevice, g_qwen.stream) != cudaSuccess) ret = -7;
+    if (ret == 0 && cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) ret = -7;
+    if (ret == 0 && (ret = wide_quant_input(d_x, w->K, N)) != 0) ret = -100 + ret;
+    if (ret == 0 && (ret = wide_proj(w, d_out, N)) != 0) ret = -200 + ret;
+    if (ret == 0 && cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) ret = -8;
+    if (ret == 0 && cudaMemcpy(h_out, d_out, ob, cudaMemcpyDeviceToHost) != cudaSuccess) ret = -9;
+    cudaFree(d_x); cudaFree(d_out);
+    return ret;
+}
+
+// Timing ABI: ms per wide_quant_input + wide_proj of one Linear at N tokens (random-ish input).
+extern "C" int qwn_wide_linear_bench(int layer, int which, int N, int iters, float *out_ms, long long *out_wbytes) {
+    if (!g_qwen.initialized) return -1;
+    int M = 0, K = 0, kb = 0;
+    int r = qwn_wide_linear_test(layer, which, NULL, 0, NULL, &M, &K, &kb);
+    if (r != 0) return r;
+    const tq_qmma_weight_t *w = NULL;
+    if (which == 12) w = &g_qwen.lm_head;
+    else {
+        tq_layer_t *l = &g_qwen.layers[layer];
+        const tq_qmma_weight_t *tab[12] = {&l->q_proj, &l->k_proj, &l->v_proj, &l->o_proj, &l->mlp_gate, &l->mlp_up,
+                                           &l->mlp_down, &l->linear_in_qkv, &l->linear_in_z, &l->linear_in_b,
+                                           &l->linear_in_a, &l->linear_out};
+        w = tab[which];
+    }
+    float *d_x = NULL, *d_out = NULL;
+    if (cudaMalloc(&d_x, (size_t)N * K * sizeof(float)) != cudaSuccess) return -6;
+    if (cudaMalloc(&d_out, (size_t)N * M * sizeof(float)) != cudaSuccess) { cudaFree(d_x); return -6; }
+    cudaMemset(d_x, 0x3c, (size_t)N * K * sizeof(float));   // ~0.0107 everywhere
+    int ret = 0;
+    for (int i = 0; i < 3 && ret == 0; i++) {                // warm-up
+        if ((ret = wide_quant_input(d_x, K, N)) != 0) break;
+        if ((ret = wide_proj(w, d_out, N)) != 0) break;
+    }
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0, g_qwen.stream);
+    for (int i = 0; i < iters && ret == 0; i++) {
+        if ((ret = wide_quant_input(d_x, K, N)) != 0) break;
+        if ((ret = wide_proj(w, d_out, N)) != 0) break;
+    }
+    cudaEventRecord(e1, g_qwen.stream);
+    cudaEventSynchronize(e1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, e0, e1);
+    if (out_ms) *out_ms = ms / (iters > 0 ? iters : 1);
+    if (out_wbytes) {
+        long long wb = (w->exl3 && w->exl3_kbits > 0) ? (long long)M * K * w->exl3_kbits / 8
+                     : (w->exl3 ? (long long)M * K * 2 : (long long)w->Mt * w->Kt * (w->e2m3 ? 384 : 512));
+        *out_wbytes = wb;
+    }
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(d_x); cudaFree(d_out);
+    return ret;
 }
 
 static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
@@ -20414,8 +21105,9 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
         g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     int per_client_lm = getenv("TQ_BATCHED_LMHEAD_PERCLIENT") != NULL;
     if (!per_client_lm && !g_qwen.tie_word_embeddings &&
-        g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte && !g_qwen.lm_head.word_major &&
-        can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
+        (g_qwen.lm_head.exl3 ||
+         (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte && !g_qwen.lm_head.word_major &&
+          can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major))) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -40;
         if ((ret = wide_proj(&g_qwen.lm_head, g_bat_logits, N)) != 0) return -40;
         k_tq_batched_argmax<<<N, 256, 0, g_qwen.stream>>>(g_bat_argmax, g_bat_logits, g_qwen.V, N);
@@ -22129,8 +22821,10 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         }
     }
     k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
-    if (!g_qwen.tie_word_embeddings && g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
-        !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
+    if (!g_qwen.tie_word_embeddings &&
+        (g_qwen.lm_head.exl3 ||
+         (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
+          !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major))) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;
         if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) return -78;
         k_tq_batched_argmax<<<N, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, N);
@@ -22291,8 +22985,10 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
     }
     if (Kf > 0) {
         k_tq_qwen_rmsnorm_b<<<dim3(8, Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
-        if (!g_qwen.tie_word_embeddings && g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
-            !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
+        if (!g_qwen.tie_word_embeddings &&
+            (g_qwen.lm_head.exl3 ||
+             (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
+              !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major))) {
             if ((ret = wide_quant_input(g_wide_norm, H, Kf)) != 0) return -102;
             if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, Kf)) != 0) return -102;
             k_tq_batched_argmax<<<Kf, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, Kf);
