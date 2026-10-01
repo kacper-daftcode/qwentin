@@ -22162,6 +22162,8 @@ static int     *g_slot_ids = NULL, *g_iota = NULL;
 static int     *g_pf_colslot = NULL; static int g_pf_colslot_cap = 0;  // prefill wave column->slot
 static float   *g_pg_logits = NULL;
 static int     *g_pg_argmax = NULL;
+static float   *g_pg_sink = NULL;                                    // qwn_paged_logits_sink (caller-owned)
+static int      g_pg_sink_cap = 0, g_pg_sink_head = 0;
 static int     *h_free = NULL, *h_slot_nb = NULL;
 static int      g_pg_nfree = 0;
 static int      g_pg_page = 0, g_pg_plog = 0, g_pg_nblocks = 0, g_pg_maxslots = 0, g_pg_maxblk = 0;
@@ -22195,6 +22197,7 @@ static void paged_free_all(void) {
     if (h_slot_nb) { free(h_slot_nb); h_slot_nb = NULL; }
     g_pg_nfree = 0; g_pg_page = 0; g_pg_plog = 0; g_pg_nblocks = 0;
     g_pg_maxslots = 0; g_pg_maxblk = 0; g_pg_ready = 0;
+    g_pg_sink = NULL; g_pg_sink_cap = 0; g_pg_sink_head = 0;
 }
 
 static int paged_alloc_block(void) { return g_pg_nfree > 0 ? h_free[--g_pg_nfree] : -1; }
@@ -22771,6 +22774,15 @@ extern "C" int qwn_paged_slot_restore(int slot, int upto_pos, const void *host, 
     return 0;
 }
 
+// The paged paths hold every column's logits (g_pg_logits) only when the lm_head runs on the
+// wide path (EXL3, or E2M3 in the QMMA scale-factor layout); other layouts argmax per column.
+static inline int paged_lm_head_wide(void) {
+    return !g_qwen.tie_word_embeddings &&
+           (g_qwen.lm_head.exl3 ||
+            (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
+             !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major));
+}
+
 // One paged decode step over N active columns. column j -> slot_ids[j] (persistent slot);
 // tokens[j] is decoded at positions[j] (its own KV history via the block table).
 static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
@@ -22836,13 +22848,15 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         }
     }
     k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
-    if (!g_qwen.tie_word_embeddings &&
-        (g_qwen.lm_head.exl3 ||
-         (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
-          !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major))) {
+    if (paged_lm_head_wide()) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;
         if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) return -78;
         k_tq_batched_argmax<<<N, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, N);
+        if (g_pg_sink) {
+            if (N > g_pg_sink_cap) return -81;
+            cudaMemcpyAsync(g_pg_sink, g_pg_logits, (size_t)N * g_qwen.V * sizeof(float),
+                            cudaMemcpyDeviceToDevice, g_qwen.stream);
+        }
     } else {
         for (int j = 0; j < N; j++) {
             cudaMemcpyAsync(g_qwen.d_debug_norm, g_wide_norm + (size_t)j * H, (size_t)H * sizeof(float),
@@ -22874,6 +22888,20 @@ extern "C" int qwn_paged_stats(int *free_blocks, int *total_blocks, int *page, i
     if (total_blocks) *total_blocks = g_pg_nblocks;
     if (page) *page = g_pg_page;
     if (max_blocks_per_seq) *max_blocks_per_seq = g_pg_maxblk;
+    return 0;
+}
+
+// Test ABI (analysis/qwentin_e2e.py): while set, every paged prefill wave also writes the logits
+// of ALL its T columns, and every paged decode step those of its N columns, into dev_out
+// ([cols][V] fp32, caller-owned device memory with cap_cols rows). The wave's head runs head_cols
+// columns at a time: served lm_head calls are decode-sized (f32-accumulate units), a 128-column
+// head would take the fp16-accumulate EXL3 units instead. dev_out = NULL turns it off.
+extern "C" int qwn_paged_logits_sink(float *dev_out, int cap_cols, int head_cols) {
+    if (!g_pg_ready) return -1;
+    if (!dev_out) { g_pg_sink = NULL; g_pg_sink_cap = 0; g_pg_sink_head = 0; return 0; }
+    if (cap_cols < 1 || head_cols < 1) return -2;
+    if (!paged_lm_head_wide()) return -3;
+    g_pg_sink = dev_out; g_pg_sink_cap = cap_cols; g_pg_sink_head = head_cols;
     return 0;
 }
 
@@ -22986,6 +23014,15 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -101;
         }
     }
+    if (g_pg_sink) {     // every column's logits; the head in decode-size chunks (f32 accumulators)
+        if (T > g_pg_sink_cap) return -106;
+        k_tq_qwen_rmsnorm_b<<<dim3(8, T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+        for (int c0 = 0; c0 < T; c0 += g_pg_sink_head) {
+            int nc = T - c0 < g_pg_sink_head ? T - c0 : g_pg_sink_head;
+            if ((ret = wide_quant_input(g_wide_norm + (size_t)c0 * H, H, nc)) != 0) return -107;
+            if ((ret = wide_proj(&g_qwen.lm_head, g_pg_sink + (size_t)c0 * g_qwen.V, nc)) != 0) return -107;
+        }
+    }
     // seeds: gather each final client's last-token hidden -> final norm -> wide lm_head -> argmax.
     int Kf = 0;
     int fk[256];
@@ -23000,10 +23037,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
     }
     if (Kf > 0) {
         k_tq_qwen_rmsnorm_b<<<dim3(8, Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
-        if (!g_qwen.tie_word_embeddings &&
-            (g_qwen.lm_head.exl3 ||
-             (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
-              !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major))) {
+        if (paged_lm_head_wide()) {
             if ((ret = wide_quant_input(g_wide_norm, H, Kf)) != 0) return -102;
             if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, Kf)) != 0) return -102;
             k_tq_batched_argmax<<<Kf, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, Kf);
