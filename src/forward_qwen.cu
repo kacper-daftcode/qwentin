@@ -251,6 +251,7 @@ typedef struct {
     uint8_t layer_types[TQ_MAX_LAYERS];
 
     uint16_t *d_embed;
+    uint16_t *h_embed;       // TQ_EMBED_HOST: the bf16 table in mapped pinned host memory (d_embed aliases it)
     uint8_t *d_embed8;       // TQ_EMBED_FP8: quantized embed table (E4M3 mode 1, E2M3-6bit mode 2)
     float *d_embed_scale;    // per-row (per-token) absmax scale [V] for d_embed8
     int embed_fp8;           // 0=off (bf16), 1=E4M3, 2=E2M3-6bit (lookup dequant mode)
@@ -10670,6 +10671,27 @@ static int read_non_quant(FILE *f, uint16_t **dst, size_t count, const char *wha
     return upload_payload(f, (void **)dst, nbytes, what, upload);
 }
 
+// TQ_EMBED_HOST: the bf16 token-embedding table stays in pinned host memory mapped into the
+// device address space, so it costs no device memory and no quantization error; every lookup
+// kernel reads its row (H bf16 = 10 KB) over PCIe. Lookup-only, so tie_word_embeddings=FALSE.
+static int read_embed_host(FILE *f, size_t count) {
+    size_t nbytes = count * sizeof(uint16_t);
+    g_qwen.non_quant_count++;
+    void *h = NULL, *d = NULL;
+    if (cudaHostAlloc(&h, nbytes, cudaHostAllocMapped) != cudaSuccess) {
+        fprintf(stderr, "cudaHostAlloc failed for embed (%zu bytes)\n", nbytes);
+        return -1;
+    }
+    if (read_exact(f, h, nbytes, "embed") != 0 || cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+        cudaFreeHost(h);
+        return -1;
+    }
+    g_qwen.h_embed = (uint16_t *)h;
+    g_qwen.d_embed = (uint16_t *)d;
+    printf("TQ_EMBED_HOST=1: bf16 embed table in pinned host memory, %.0f MiB\n", nbytes / 1048576.0);
+    return 0;
+}
+
 static int read_f32(FILE *f, float **dst, size_t count, const char *what, int upload) {
     size_t nbytes = count * sizeof(float);
     g_qwen.f32_count++;
@@ -11002,10 +11024,11 @@ extern "C" void qwn_free(void) {
     if (g_qwen.d_decode_step) cudaFree(g_qwen.d_decode_step);
     if (g_qwen.d_decode_generated) cudaFree(g_qwen.d_decode_generated);
     if (g_qwen.d_qmma_work_counter) cudaFree(g_qwen.d_qmma_work_counter);
-    if (g_qwen.d_embed) cudaFree(g_qwen.d_embed);
+    if (g_qwen.h_embed) cudaFreeHost(g_qwen.h_embed);
+    else if (g_qwen.d_embed) cudaFree(g_qwen.d_embed);
     if (g_qwen.d_embed8) cudaFree(g_qwen.d_embed8);
     if (g_qwen.d_embed_scale) cudaFree(g_qwen.d_embed_scale);
-    g_qwen.d_embed = nullptr; g_qwen.d_embed8 = nullptr; g_qwen.d_embed_scale = nullptr;
+    g_qwen.d_embed = nullptr; g_qwen.h_embed = nullptr; g_qwen.d_embed8 = nullptr; g_qwen.d_embed_scale = nullptr;
     g_qwen.embed_fp8 = 0;
     if (g_qwen.d_norm) cudaFree(g_qwen.d_norm);
     free_qmma(&g_qwen.lm_head);
@@ -11210,7 +11233,10 @@ static int parse_tqf(const char *path, int upload) {
     int lin_value_dim = g_qwen.linear_num_value_heads * g_qwen.linear_value_head_dim;
     int lin_conv_dim = lin_key_dim * 2 + lin_value_dim;
 
-    if (read_non_quant(f, &g_qwen.d_embed, (size_t)g_qwen.V * g_qwen.H, "embed", upload) != 0) { fclose(f); return -1; }
+    const char *eh = getenv("TQ_EMBED_HOST");
+    if (upload && eh && eh[0] && eh[0] != '0' && !g_qwen.tie_word_embeddings) {
+        if (read_embed_host(f, (size_t)g_qwen.V * g_qwen.H) != 0) { fclose(f); return -1; }
+    } else if (read_non_quant(f, &g_qwen.d_embed, (size_t)g_qwen.V * g_qwen.H, "embed", upload) != 0) { fclose(f); return -1; }
     if (read_non_quant(f, &g_qwen.d_norm, (size_t)g_qwen.H, "norm", upload) != 0) { fclose(f); return -1; }
     if (!g_qwen.tie_word_embeddings) {
         if (read_qmma(f, &g_qwen.lm_head, g_qwen.V, g_qwen.H, "lm_head", upload, 0) != 0) { fclose(f); return -1; }
@@ -11228,6 +11254,10 @@ static int parse_tqf(const char *path, int upload) {
             emode = (ef[0] == '2' || ef[0] == 'e' || ef[0] == 'E') ? 2 : 1;
         if (emode && g_qwen.tie_word_embeddings) {
             fprintf(stderr, "TQ_EMBED_FP8 ignored: tie_word_embeddings=TRUE (embed feeds lm_head)\n");
+            emode = 0;
+        }
+        if (emode && g_qwen.h_embed) {
+            printf("TQ_EMBED_FP8 ignored: TQ_EMBED_HOST keeps the bf16 table in host memory\n");
             emode = 0;
         }
         if (emode && g_qwen.d_embed) {
@@ -11256,6 +11286,7 @@ static int parse_tqf(const char *path, int upload) {
                     g_qwen.d_embed_scale = d_sc;
                     g_qwen.embed_fp8 = emode;
                     g_qwen.device_bytes += qbytes + rows * sizeof(float);
+                    g_qwen.device_bytes -= rows * Hh * sizeof(uint16_t);   // the freed bf16 upload
                     printf("TQ_EMBED_FP8=%d: embed table -> %s, %.0f MiB (+%.0f MiB scale) "
                            "vs %.0f MiB bf16\n", emode,
                            emode == 2 ? "E2M3-6bit per-row" : "E4M3 per-row",
@@ -11329,7 +11360,12 @@ static int parse_tqf(const char *path, int upload) {
     // Native MTP head section (appended after the main payload when the converter
     // ran with TQ_EMIT_MTP=1). Read order MUST match mtp_tensor_specs() in
     // tools/convert_qwen_tqf.py. The MTP layer is one full_attention decoder layer.
+    // TQ_NO_MTP=1 skips it (servers without speculative decoding, e.g. serve_batched.py):
+    // the bytes are read past and the engine behaves as for a TQF without the section.
+    const char *nm = getenv("TQ_NO_MTP");
+    int no_mtp = upload && nm && nm[0] && nm[0] != '0';
     if (g_qwen.has_mtp_section) {
+        int mup = upload && !no_mtp;
         tq_layer_t *m = &g_qwen.mtp_layer;
         int q_m = g_qwen.nh * g_qwen.hd * 2;
         int kv_m = g_qwen.nkv * g_qwen.hd;
@@ -11338,15 +11374,15 @@ static int parse_tqf(const char *path, int upload) {
         // mtp_tensor_specs() in tools/convert_qwen_tqf.py.
         #define TQ_READ_MTP_BF16(W, MM, KK, NAME)                                              \
             do { (W).M = (MM); (W).K = (KK);                                                   \
-                 if (read_non_quant(f, &(W).d_w, (size_t)(MM) * (KK), NAME, upload) != 0) {     \
+                 if (read_non_quant(f, &(W).d_w, (size_t)(MM) * (KK), NAME, mup) != 0) {        \
                      fclose(f); return -1; } } while (0)
-        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_emb, g_qwen.H, "mtp.pre_fc_norm_emb", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_hidden, g_qwen.H, "mtp.pre_fc_norm_hidden", upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_emb, g_qwen.H, "mtp.pre_fc_norm_emb", mup) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_hidden, g_qwen.H, "mtp.pre_fc_norm_hidden", mup) != 0) { fclose(f); return -1; }
         TQ_READ_MTP_BF16(g_qwen.mtp_fc, g_qwen.H, 2 * g_qwen.H, "mtp.fc");
-        if (read_non_quant(f, &m->d_input_ln, g_qwen.H, "mtp.input_ln", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &m->d_post_ln, g_qwen.H, "mtp.post_ln", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &m->d_q_norm, g_qwen.hd, "mtp.q_norm", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &m->d_k_norm, g_qwen.hd, "mtp.k_norm", upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_input_ln, g_qwen.H, "mtp.input_ln", mup) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_post_ln, g_qwen.H, "mtp.post_ln", mup) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_q_norm, g_qwen.hd, "mtp.q_norm", mup) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_k_norm, g_qwen.hd, "mtp.k_norm", mup) != 0) { fclose(f); return -1; }
         TQ_READ_MTP_BF16(g_qwen.mtp_q_proj, q_m, g_qwen.H, "mtp.q_proj");
         TQ_READ_MTP_BF16(g_qwen.mtp_k_proj, kv_m, g_qwen.H, "mtp.k_proj");
         TQ_READ_MTP_BF16(g_qwen.mtp_v_proj, kv_m, g_qwen.H, "mtp.v_proj");
@@ -11354,15 +11390,19 @@ static int parse_tqf(const char *path, int upload) {
         TQ_READ_MTP_BF16(g_qwen.mtp_gate, g_qwen.I, g_qwen.H, "mtp.mlp_gate");
         TQ_READ_MTP_BF16(g_qwen.mtp_up, g_qwen.I, g_qwen.H, "mtp.mlp_up");
         TQ_READ_MTP_BF16(g_qwen.mtp_down, g_qwen.H, g_qwen.I, "mtp.mlp_down");
-        if (read_non_quant(f, &g_qwen.d_mtp_norm, g_qwen.H, "mtp.norm", upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &g_qwen.d_mtp_norm, g_qwen.H, "mtp.norm", mup) != 0) { fclose(f); return -1; }
         #undef TQ_READ_MTP_BF16
-        printf("  MTP head section loaded (BF16 projections)\n");
+        if (mup) printf("  MTP head section loaded (BF16 projections)\n");
+        else if (no_mtp) {
+            g_qwen.has_mtp_section = 0;
+            printf("  MTP head section skipped (TQ_NO_MTP)\n");
+        }
         // Calibrated-head side-load (TQ_MTP_WEIGHTS=<dir>): overwrite the MTP
         // buffers from raw BF16 .bin files named by HF tensor (the output of
         // tools/mtp_calib_train.py). Happens before the lazy E2M3 repack, so the
         // quantized wave path automatically uses the calibrated weights.
         const char *mwd = getenv("TQ_MTP_WEIGHTS");
-        if (mwd && *mwd) {
+        if (mup && mwd && *mwd) {
             int bad = 0;
             #define TQ_MTP_SIDELOAD(NAME, DST, COUNT)                                            \
                 do {                                                                             \

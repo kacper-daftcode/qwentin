@@ -1055,9 +1055,19 @@ def main():
                     help="host-RAM budget for parked sessions evicted from the GPU (KV blocks + DeltaNet "
                          "state, ~26 KiB/token + 155 MiB each; LRU). 0 disables the host tier. Needs the "
                          "qwn_paged_slot_save/restore ABI in the engine library.")
+    ap.add_argument("--embed-host", dest="embed_host", action="store_true", default=True,
+                    help="keep the bf16 token-embedding table in pinned host memory (TQ_EMBED_HOST=1): no device "
+                         "copy (0.95 GB as E2M3, 1.27 GB as E4M3) and no quantization error; each looked-up row "
+                         "(10 KB) is read over PCIe. Overrides TQ_EMBED_FP8.")
+    ap.add_argument("--no-embed-host", dest="embed_host", action="store_false")
+    ap.add_argument("--mtp", dest="mtp", action="store_true", default=False,
+                    help="load the tqf's MTP head (0.85 GB bf16). This server does no speculative decoding, so by "
+                         "default TQ_NO_MTP=1 skips it.")
     args = ap.parse_args()
-    # The engine lib reads this lazily on the first prefill wave; explicit env overrides the flag.
+    # The engine lib reads these at qwn_init / lazily on the first prefill wave; explicit env overrides the flags.
     os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
+    os.environ.setdefault("TQ_EMBED_HOST", "1" if args.embed_host else "0")
+    os.environ.setdefault("TQ_NO_MTP", "0" if args.mtp else "1")
     if args.bench:
         bench(args)
     elif args.selftest:
