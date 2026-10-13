@@ -19627,16 +19627,16 @@ static __device__ __forceinline__ void tq_had128_warp(float &v0, float &v1, floa
 // x fp32 [N][K] token-major -> fp16 B fragments of H128(x*suh) for mma.m16n8k16:
 // layout [k16 tile][group pair gp = n/16][lane][2 groups][2 words] (GP = ceil(Gt/2) pairs);
 // lane = (n%8)*4 + tig holds k = 2*tig+{0,1} (word 0) and k+8,+9 (word 1). A warp's 128-bit
-// load of a group pair is one contiguous 512-byte run. One warp per (token, 128-block of K).
-// Pad tokens are zeroed by the caller (memset).
+// load of a group pair is one contiguous 512-byte run. One warp per (token, 128-block of K);
+// tokens N..Npad-1 (the pad of the last group) are written as zeros, so no per-call memset.
 __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(uint32_t *bfrag, const float *x, const uint16_t *suh,
-                                                       int K, int N, int Kt16, int GP) {
+                                                       int K, int N, int Npad, int Kt16, int GP) {
     int wg = blockIdx.x * 4 + (threadIdx.x >> 5);
     int lane = threadIdx.x & 31;
     int nblk = K >> 7;
     int n = wg / nblk, bk = wg - n * nblk;
-    if (n >= N) return;
-    float4 v = *(const float4 *)(x + (size_t)n * K + bk * 128 + lane * 4);
+    if (n >= Npad) return;
+    float4 v = n < N ? *(const float4 *)(x + (size_t)n * K + bk * 128 + lane * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
     const uint16_t *sp = suh + bk * 128 + lane * 4;
     float v0 = v.x * tq_fp16_to_float(sp[0]), v1 = v.y * tq_fp16_to_float(sp[1]);
     float v2 = v.z * tq_fp16_to_float(sp[2]), v3 = v.w * tq_fp16_to_float(sp[3]);
@@ -19664,8 +19664,11 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(uint32_t *bfrag, const fl
 // Unit = (128 output features) x (8*NG tokens = one token group) x (one k-split); ntg token
 // groups. Wide N runs as several token groups over the same weights (L2 serves the re-reads)
 // instead of huge accumulator sets or deep k-splits.
+// KB=7 keeps 8 words per lane per tile in the prefetch ring (NCW=2): at 4 blocks/SM (64 registers)
+// it spills, and the local-memory traffic halves its decode bandwidth (750 vs ~1400 GB/s for KB=6);
+// 2 blocks/SM (128 registers) run it spill-free at ~1200 GB/s (3 blocks at 80 registers still spill).
 template <int KB, int NG>
-__global__ void __launch_bounds__(256, (NG <= 2) ? 4 : 2) k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
+__global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                                                            const uint16_t *trellis, const uint32_t *bfrag,
                                                            const uint16_t *svh, int M, int Kt16, int nvar,
                                                            int GP, int g_base, int ntg, int k_splits, int per, int *ctr) {
@@ -19892,6 +19895,47 @@ __global__ void __launch_bounds__(1024) k_tq_exl3_bf16_wide(float *out, const ui
     if (tid < 8 && n0 + tid < N) out[(size_t)(n0 + tid) * M + m] = red[tid][0];
 }
 
+// Decode-size N: the two bf16 Linears that share an input (GDN in_proj_b / in_proj_a, M rows each)
+// in one launch. Block = (row of either weight, group of 8 tokens), 256 threads x 4-wide K chunks,
+// warp shuffles + one smem pass to reduce (the block-per-row kernel above spends ~4 us per call in
+// its 1024-thread tree reduction). K % 1024 == 0.
+__global__ void __launch_bounds__(256) k_tq_exl3_bf16_pair(float *out0, const uint16_t *w0, float *out1,
+                                                           const uint16_t *w1, const float *x, int M, int K, int N) {
+    __shared__ float red[8][8];
+    int r = blockIdx.x, n0 = blockIdx.y * 8, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    int m = r < M ? r : r - M;
+    const uint16_t *wr = (r < M ? w0 : w1) + (size_t)m * K;
+    float *o = r < M ? out0 : out1;
+    int nn = N - n0 < 8 ? N - n0 : 8;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k = tid * 4; k < K; k += 1024) {
+        uint2 wv = __ldg((const uint2 *)(wr + k));
+        float w4[4] = {tq_bf16_to_float((uint16_t)(wv.x & 0xffffu)), tq_bf16_to_float((uint16_t)(wv.x >> 16)),
+                       tq_bf16_to_float((uint16_t)(wv.y & 0xffffu)), tq_bf16_to_float((uint16_t)(wv.y >> 16))};
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            if (c < nn) {
+                float4 xv = __ldg((const float4 *)(x + (size_t)(n0 + c) * K + k));
+                acc[c] += w4[0] * xv.x + w4[1] * xv.y + w4[2] * xv.z + w4[3] * xv.w;
+            }
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        float v = acc[c];
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) v += __shfl_xor_sync(0xffffffffu, v, s);
+        if (lane == 0) red[warp][c] = v;
+    }
+    __syncthreads();
+    if (tid < nn) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; w++) v += red[w][tid];
+        o[(size_t)(n0 + tid) * M + m] = v;
+    }
+}
+
 // ---- D.1 integration: wide projection via k_tq_fp6_wide_gemm (shared per-128K-block
 // activation scale: NOT bit-exact vs per-token for differing tokens -- validated by
 // needle, not bit-exact). Scratch grows lazily. ---------------------------------------
@@ -19946,15 +19990,20 @@ static int exl3_unit_ng(int N, int MB) {
 // k-splits so that (feature blocks x token groups x splits) fills the resident blocks in ONE
 // round (a GEMM is only 1-2 rounds of the whole GPU, so any unit tail costs a large fraction),
 // with >= 32 tiles per split; ragged last split allowed. The y_hat partial traffic is capped
-// at half the weight bytes.
+// at half the weight bytes. Decode-size N rounds down (no second round for a few blocks:
+// in_proj_qkv had 720 units on 680 blocks, KB=7 MLPs 408 on 340) and allows 16 tiles per split
+// where 32 would leave most of the GPU idle (k/v_proj: 80 of 680 blocks); at 40-48 feature
+// blocks (in_proj_z, o_proj) shorter splits cost more in partial reduction than the fill gains.
 static int exl3_pick_splits(int cap, int units, int Kt16, int N, int M, int KB, int *per_out) {
     int fixed = qmma_sf_k_split();
     int ks;
     if (fixed >= 1) ks = fixed;
     else {
-        ks = (cap + units / 2) / units;
+        bool decode = N <= 16;
+        ks = decode ? cap / units : (cap + units / 2) / units;
         if (ks < 1) ks = 1;
-        int ks_max = Kt16 / 32; if (ks_max < 1) ks_max = 1;
+        int min_per = (decode && 2 * units * (Kt16 / 32) < cap) ? 16 : 32;
+        int ks_max = Kt16 / min_per; if (ks_max < 1) ks_max = 1;
         if (ks > ks_max) ks = ks_max;
         double wbytes = (double)M * (double)Kt16 * 16.0 * KB / 8.0;
         int ks_bw = (int)(wbytes / (2.0 * N * (double)M * 4.0));
@@ -20048,9 +20097,8 @@ static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
         if (cudaMalloc(&g_exl3_b, need_w * sizeof(uint32_t)) != cudaSuccess) { g_exl3_b = NULL; g_exl3_b_words = 0; return -112; }
         g_exl3_b_words = need_w;
     }
-    cudaMemsetAsync(g_exl3_b, 0, need_w * sizeof(uint32_t), st);
-    int nwarps = N * (K / 128);
-    k_tq_exl3_bfrag<<<(nwarps + 3) / 4, 128, 0, st>>>(g_exl3_b, g_exl3_x, w->d_exl3_suh, K, N, Kt16, GP);
+    int nwarps = 8 * Gt * (K / 128);
+    k_tq_exl3_bfrag<<<(nwarps + 3) / 4, 128, 0, st>>>(g_exl3_b, g_exl3_x, w->d_exl3_suh, K, N, 8 * Gt, Kt16, GP);
     size_t split_stride = (size_t)N * M;
     // Ragged N (a mixed prefill wave = 128 prompt columns + a few decoders): full 8*G-token
     // units for the head, then the remainder with the narrowest units that cover it -- one
@@ -20114,6 +20162,20 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (w->e2m1)
         return launch_fp4_wide_gemm(out, w, g_wproj_b, g_wproj_bscale, N, g_wproj_part, k_splits, g_qwen.stream);
     return launch_fp6_wide_gemm(out, w, g_wproj_b, g_wproj_bscale, N, g_wproj_part, k_splits, g_qwen.stream);
+}
+
+// Two projections of the same input (call wide_quant_input first). The GDN in_proj_b / in_proj_a
+// pair that EXL3 checkpoints keep in bf16 runs as one kernel at decode-size N.
+static int wide_proj_pair(const tq_qmma_weight_t *w0, float *out0, const tq_qmma_weight_t *w1, float *out1, int N) {
+    if (w0->exl3 && w1->exl3 && w0->exl3_kbits == 0 && w1->exl3_kbits == 0 && w0->d_exl3_bf16 && w1->d_exl3_bf16 &&
+        w0->M == w1->M && w0->K == w1->K && (w0->K & 1023) == 0 && N <= 16 &&
+        g_exl3_x && g_exl3_K == w0->K && g_exl3_N >= N) {
+        k_tq_exl3_bf16_pair<<<dim3(2 * w0->M, (N + 7) / 8), 256, 0, g_qwen.stream>>>(
+            out0, w0->d_exl3_bf16, out1, w1->d_exl3_bf16, g_exl3_x, w0->M, w0->K, N);
+        return 0;
+    }
+    int ret = wide_proj(w0, out0, N);
+    return ret != 0 ? ret : wide_proj(w1, out1, N);
 }
 
 // Validation ABI: run one Linear of the loaded model through the wide path on host data.
@@ -22873,8 +22935,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -71;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, N)) != 0) return -71;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, N)) != 0) return -72;
-            if ((ret = wide_proj(&l->linear_in_b, g_wide_b, N)) != 0) return -73;
-            if ((ret = wide_proj(&l->linear_in_a, g_wide_a, N)) != 0) return -74;
+            if ((ret = wide_proj_pair(&l->linear_in_b, g_wide_b, &l->linear_in_a, g_wide_a, N)) != 0) return -73;
             k_tq_linear_conv_update_paged<<<dim3((conv_dim + 255) / 256, N), 256, 0, g_qwen.stream>>>(
                 g_wide_qkv, g_pg_conv[L], g_wide_qkv, l->d_linear_conv1d, conv_dim,
                 g_qwen.linear_conv_kernel_dim, g_slot_ids, conv_f);
@@ -23035,8 +23096,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
-            if ((ret = wide_proj(&l->linear_in_b, g_wide_b, T)) != 0) return -98;
-            if ((ret = wide_proj(&l->linear_in_a, g_wide_a, T)) != 0) return -98;
+            if ((ret = wide_proj_pair(&l->linear_in_b, g_wide_b, &l->linear_in_a, g_wide_a, T)) != 0) return -98;
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
                 k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
