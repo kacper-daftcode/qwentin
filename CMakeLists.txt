@@ -4,6 +4,13 @@ project(qwentin LANGUAGES C CXX CUDA)
 set(CMAKE_CUDA_ARCHITECTURES 120)
 set(CMAKE_C_STANDARD 11)
 
+# Without this FindCUDA (and CUDA::cudart_static after it) may pick another toolkit on the box, e.g. a
+# system CUDA under /usr: its runtime then fills cudaDeviceProp in its own layout (multiProcessorCount 1).
+if(NOT CUDA_TOOLKIT_ROOT_DIR)
+    get_filename_component(_tq_cuda_root "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+    get_filename_component(_tq_cuda_root "${_tq_cuda_root}" DIRECTORY)
+    set(CUDA_TOOLKIT_ROOT_DIR "${_tq_cuda_root}" CACHE PATH "CUDA toolkit of CMAKE_CUDA_COMPILER")
+endif()
 find_package(CUDA REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
