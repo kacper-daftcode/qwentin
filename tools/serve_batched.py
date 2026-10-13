@@ -62,7 +62,21 @@ def load_lib(path):
         L.has_parking = True
     except AttributeError:
         L.has_parking = False
+    try:
+        L.qwn_paged_token_bytes.restype = ctypes.c_size_t
+        L.has_token_bytes = True
+    except AttributeError:
+        L.has_token_bytes = False
     return L
+
+
+def kv_summary(L, total_blocks, page):
+    """'KV <format> <KiB>/token, <tokens> pooled tokens' for the startup line (needs qwn_paged_token_bytes)."""
+    fmt = "int4 K + int4 V" if os.environ.get("TQ_KV_V4", "0") not in ("", "0") else "int4 K + E4M3 V"
+    if not L.has_token_bytes:
+        return fmt
+    tb = int(L.qwn_paged_token_bytes())
+    return f"{fmt} {tb / 1024:.2f} KiB/token, {total_blocks * page} pooled tokens"
 
 
 def fast_prefill(L, ids, chunk=16):
@@ -946,7 +960,8 @@ def serve(args):
                         park_ram_bytes=int(args.park_ram_gb * 2**30),
                         decode_steps_per_wave=args.decode_steps_per_wave)
     fb, tb, pg, mb = eng._stats()
-    print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
+    print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
+          f"{kv_summary(eng.L, tb, pg)}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
     print(f"listening on {args.host}:{args.port}  (model={args.model_name})", flush=True)
     try:
@@ -1063,11 +1078,18 @@ def main():
     ap.add_argument("--mtp", dest="mtp", action="store_true", default=False,
                     help="load the tqf's MTP head (0.85 GB bf16). This server does no speculative decoding, so by "
                          "default TQ_NO_MTP=1 skips it.")
+    ap.add_argument("--kv-v4", dest="kv_v4", action="store_true", default=False,
+                    help="store V like K in the paged pool (TQ_KV_V4=1): FWHT-256 rotated int4, asymmetric per 32 "
+                         "channels, 20.0 instead of 26.2 KiB per token (+31%% pooled tokens in the same pool memory). "
+                         "With the EXL3 opt-6.0 weights KL stays below the FP8 checkpoint's at 4K-64K and long-context "
+                         "top-1 is 0.05-0.07 pt under it; with opt-5.75 it fails the FP8 gate at long context.")
+    ap.add_argument("--no-kv-v4", dest="kv_v4", action="store_false")
     args = ap.parse_args()
     # The engine lib reads these at qwn_init / lazily on the first prefill wave; explicit env overrides the flags.
     os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
     os.environ.setdefault("TQ_EMBED_HOST", "1" if args.embed_host else "0")
     os.environ.setdefault("TQ_NO_MTP", "0" if args.mtp else "1")
+    os.environ.setdefault("TQ_KV_V4", "1" if args.kv_v4 else "0")
     if args.bench:
         bench(args)
     elif args.selftest:

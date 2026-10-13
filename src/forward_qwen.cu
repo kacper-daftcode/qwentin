@@ -652,6 +652,32 @@ static __device__ __forceinline__ void tq_fwht256(float *buf, int tid) {
     __syncthreads();
 }
 
+// tq_fwht256 of one 256-vector held by a whole warp, no smem and no block sync: lane owns
+// elements lane + 32*e (e = 0..7). Same butterflies in the same order with the same 1/16, so
+// the result is bit-identical to tq_fwht256. Every lane of the warp must call it.
+static __device__ __forceinline__ void tq_fwht256_warp(float x[8], int lane) {
+    #pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            float b = __shfl_xor_sync(0xffffffffu, x[e], h);
+            x[e] = (lane & h) ? (b - x[e]) : (x[e] + b);
+        }
+    }
+    #pragma unroll
+    for (int h = 1; h < 8; h <<= 1) {
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            if (e & h) continue;
+            float a = x[e], b = x[e | h];
+            x[e] = a + b;
+            x[e | h] = a - b;
+        }
+    }
+    #pragma unroll
+    for (int e = 0; e < 8; e++) x[e] *= 0.0625f;
+}
+
 // ===== TQ_KV_Q4 K (scale, zp) group storage helpers =====
 // The d_k_q4s buffer holds (scale, zp) pairs as fp16 (default) or fp32 (escape
 // hatch). To keep every signature `float*`, these reinterpret the base by the
@@ -2933,7 +2959,9 @@ __global__ void k_tq_wide_attn(
 // unnormalized (m, l, O) partials to `part`; k_tq_wide_attn_mma_merge combines
 // them (same flash-decoding math as the verify path). S == 1 keeps the exact
 // single-pass epilogue (bit-identical to the pre-split kernel).
-template <int MODE, int QT = 1>                              // 1 = fp32 KV, 3 = contiguous Q4, 4 = paged Q4; QT = 16-row query tiles per block
+// VQ4 = 1 (MODE 4 only): the paged V is int4 like K (TQ_KV_V4, k_tq_paged_attn_kv_write_q4), so O
+// accumulates in the rotated space; the epilogue / merge run one FWHT-256 per row before the gate.
+template <int MODE, int QT = 1, int VQ4 = 0>                 // 1 = fp32 KV, 3 = contiguous Q4, 4 = paged Q4; QT = 16-row query tiles per block
 __global__ void k_tq_wide_attn_mma(
     float *out, const float *q_proj_base, const uint16_t *q_norm_w,
     const float *k_cache, const float *v_cache,
@@ -2961,6 +2989,7 @@ __global__ void k_tq_wide_attn_mma(
     constexpr int OFF_REDC = (QT == 2) ? 7072 : TQ_AMM_RED;
     constexpr int ZERCAP   = (QT == 2) ? 6144 : TQ_AMM_PST + 1024;
     constexpr int SMEM_W   = (QT == 2) ? 7104 : TQ_AMM_WORDS;
+    static_assert(!VQ4 || MODE == 4, "int4 V exists only in the paged pool");
     __shared__ uint32_t sm[SMEM_W];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int gr = lane >> 2, t4 = lane & 3;
@@ -2972,8 +3001,9 @@ __global__ void k_tq_wide_attn_mma(
     const float *vcb = v_cache ? v_cache + (size_t)kv_head * hd : NULL;
     const uint8_t *kcb4 = k4 ? k4 + (size_t)kv_head * (hd >> 1) : NULL;
     const float *ksz4 = kq4s ? q4s_adv(kq4s, (size_t)kv_head * 16) : NULL;
-    const uint8_t *vcb8 = v8 ? v8 + (size_t)kv_head * hd : NULL;
-    const float *vscb = vscale ? vscale + kv_head : NULL;
+    // VQ4: v8 / vscale hold int4 V codes / (scale, zp) pairs in K's layout
+    const uint8_t *vcb8 = v8 ? v8 + (size_t)kv_head * (VQ4 ? (hd >> 1) : hd) : NULL;
+    const float *vscb = vscale ? (VQ4 ? q4s_adv(vscale, (size_t)kv_head * 16) : vscale + kv_head) : NULL;
     const size_t cstride4 = cstride >> 1, szstride = (size_t)nkv * 16;
     float *qtmp = (float *)(sm + OFF_QTMP);
     float *red = (float *)(sm + OFF_REDC);
@@ -3186,7 +3216,7 @@ __global__ void k_tq_wide_attn_mma(
                 wsum[warp * QROWS + 16 + gr] = ls2_lo; wsum[warp * QROWS + 24 + gr] = ls2_hi;
             }
         }
-        if (MODE != 1) {                                  // fold per-key V scale into p (denom keeps unscaled)
+        if (MODE != 1 && !VQ4) {                          // fold per-key V scale into p (denom keeps unscaled)
             int p0c = t0 + warp * 16 + 2 * t4, p1c = p0c + 8;
             float v00 = vscb[TQ_PROW(p0c) * nkv];
             float v01 = vscb[TQ_PROW(p0c + 1) * nkv];
@@ -3229,6 +3259,33 @@ __global__ void k_tq_wide_attn_mma(
                 const uint32_t *pa2 = &sm[OFF_PST2 + (tt * 32 + lane) * 4];
                 a2[0] = pa2[0]; a2[1] = pa2[1]; a2[2] = pa2[2]; a2[3] = pa2[3];
             }
+            if constexpr (VQ4) {
+                // int4 V: the warp's 32 output channels are one (scale, zp) group (g = warp). MMA f's
+                // column gr carries channel warp*32 + 4*gr + f, so a thread's four columns are two
+                // adjacent code bytes of a key row: one 16-bit load per row.
+                const int r0 = t0 + tt * 16 + 2 * t4;
+                const size_t q0 = TQ_PROW(r0), q1 = TQ_PROW(r0 + 1), q8 = TQ_PROW(r0 + 8), q9 = TQ_PROW(r0 + 9);
+                const size_t cb = (size_t)(16 * warp + 2 * gr);
+                const uint32_t c0 = *(const uint16_t *)(vcb8 + q0 * cstride4 + cb);
+                const uint32_t c1 = *(const uint16_t *)(vcb8 + q1 * cstride4 + cb);
+                const uint32_t c8 = *(const uint16_t *)(vcb8 + q8 * cstride4 + cb);
+                const uint32_t c9 = *(const uint16_t *)(vcb8 + q9 * cstride4 + cb);
+                const float2 z0 = q4s_pair(q4s_adv(vscb, q0 * szstride), 2 * warp);
+                const float2 z1 = q4s_pair(q4s_adv(vscb, q1 * szstride), 2 * warp);
+                const float2 z8 = q4s_pair(q4s_adv(vscb, q8 * szstride), 2 * warp);
+                const float2 z9 = q4s_pair(q4s_adv(vscb, q9 * szstride), 2 * warp);
+                #pragma unroll
+                for (int f = 0; f < 4; f++) {
+                    const int sh = 4 * f;
+                    uint32_t b0 = tq_pack_bf16(((float)((c0 >> sh) & 15u) - z0.y) * z0.x,
+                                               ((float)((c1 >> sh) & 15u) - z1.y) * z1.x);
+                    uint32_t b1 = tq_pack_bf16(((float)((c8 >> sh) & 15u) - z8.y) * z8.x,
+                                               ((float)((c9 >> sh) & 15u) - z9.y) * z9.x);
+                    tq_mma_bf16_m16n8k16(oacc[f], a, b0, b1);
+                    if constexpr (QT == 2) tq_mma_bf16_m16n8k16(oacc2[f], a2, b0, b1);
+                }
+                continue;
+            }
             #pragma unroll
             for (int f = 0; f < 4; f++) {
                 int col = warp * 32 + f * 8 + gr;
@@ -3264,11 +3321,12 @@ __global__ void k_tq_wide_attn_mma(
             int col = warp * 32 + f * 8 + 2 * t4;
             #pragma unroll
             for (int j = 0; j < 2; j++) {
-                po[(size_t)gr * 256 + col + j] = oacc[f][j];
-                po[(size_t)(8 + gr) * 256 + col + j] = oacc[f][2 + j];
+                const int ch = VQ4 ? warp * 32 + 4 * (2 * t4 + j) + f : col + j;
+                po[(size_t)gr * 256 + ch] = oacc[f][j];
+                po[(size_t)(8 + gr) * 256 + ch] = oacc[f][2 + j];
                 if constexpr (QT == 2) {
-                    po[(size_t)(16 + gr) * 256 + col + j] = oacc2[f][j];
-                    po[(size_t)(24 + gr) * 256 + col + j] = oacc2[f][2 + j];
+                    po[(size_t)(16 + gr) * 256 + ch] = oacc2[f][j];
+                    po[(size_t)(24 + gr) * 256 + ch] = oacc2[f][2 + j];
                 }
             }
         }
@@ -3278,6 +3336,46 @@ __global__ void k_tq_wide_attn_mma(
     float inv_lo = 1.0f / lst[gr], inv_hi = 1.0f / lst[8 + gr];
     float inv2_lo, inv2_hi;
     if constexpr (QT == 2) { inv2_lo = 1.0f / lst[16 + gr]; inv2_hi = 1.0f / lst[24 + gr]; }
+    if constexpr (VQ4) {
+        // rotated rows of one 16-row tile -> smem (the main loop is done with it; lst lies above
+        // the 4096 words), one FWHT-256 per row by a warp, then the gate
+        float *ob = (float *)sm;
+        #pragma unroll
+        for (int tile = 0; tile < QT; tile++) {
+            __syncthreads();
+            #pragma unroll
+            for (int f = 0; f < 4; f++) {
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int ch = warp * 32 + 4 * (2 * t4 + j) + f;
+                    if (tile == 0) {
+                        ob[gr * 256 + ch] = oacc[f][j] * inv_lo;
+                        ob[(8 + gr) * 256 + ch] = oacc[f][2 + j] * inv_hi;
+                    } else if constexpr (QT == 2) {
+                        ob[gr * 256 + ch] = oacc2[f][j] * inv2_lo;
+                        ob[(8 + gr) * 256 + ch] = oacc2[f][2 + j] * inv2_hi;
+                    }
+                }
+            }
+            __syncthreads();
+            for (int rr = warp; rr < 16; rr += 8) {
+                const int row = 16 * tile + rr;
+                if (row >= nvalid) break;
+                float x[8];
+                #pragma unroll
+                for (int e = 0; e < 8; e++) x[e] = ob[rr * 256 + lane + 32 * e];
+                tq_fwht256_warp(x, lane);
+                const float *q_proj = q_proj_base + (size_t)(qtile_base + row) * q_m;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int d = lane + 32 * e;
+                    float gate = q_proj[head * (2 * hd) + hd + d];
+                    out[(size_t)(qtile_base + row) * attn_m + head * hd + d] = x[e] * (1.0f / (1.0f + expf(-gate)));
+                }
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int f = 0; f < 4; f++) {
         int col = warp * 32 + f * 8 + 2 * t4;
@@ -3318,16 +3416,55 @@ __global__ void k_tq_wide_attn_mma(
 // by exp(m_c - m*)) and run the same gate epilogue the single-pass kernel uses.
 // Fully-masked chunks wrote m = TQ_AMM_NINF, l = 0, O = 0 and vanish under the
 // exp underflow (row 0's chunk 0 always has at least key 0, so l* > 0).
-template <int QT = 1>
+// VQ4: the partials are in the rotated V space; rows are staged 16 at a time and each gets one
+// FWHT-256 (a warp per row) before the gate.
+template <int QT = 1, int VQ4 = 0>
 __global__ void k_tq_wide_attn_mma_merge(
     float *out, const float *q_proj_base, int N, int nh, int hd,
     int q_m, int attn_m, int S, const float *part) {
     constexpr int QROWS = 16 * QT;
     constexpr int PART_F = 2 * QROWS + QROWS * 256;
+    __shared__ float ob[VQ4 ? 16 * 256 : 1];
     int head = blockIdx.x, qtile = blockIdx.y, qtile_base = qtile * QROWS;
     int tid = threadIdx.x;
     int nvalid = N - qtile_base; if (nvalid > QROWS) nvalid = QROWS;
     const float *ps0 = part + (size_t)((head * gridDim.y + qtile) * S) * PART_F;
+    if constexpr (VQ4) {
+        const int warp = tid >> 5, lane = tid & 31;
+        for (int r0 = 0; r0 < nvalid; r0 += 16) {
+            const int nr = (nvalid - r0 < 16) ? nvalid - r0 : 16;
+            for (int rr = 0; rr < nr; rr++) {
+                const int r = r0 + rr;
+                float m_star = TQ_AMM_NINF;
+                for (int c = 0; c < S; c++)
+                    m_star = fmaxf(m_star, ps0[(size_t)c * PART_F + r]);
+                float l = 0.0f, o = 0.0f;
+                for (int c = 0; c < S; c++) {
+                    const float *ps = ps0 + (size_t)c * PART_F;
+                    float w = expf(ps[r] - m_star);
+                    l += w * ps[QROWS + r];
+                    o += w * ps[2 * QROWS + (size_t)r * 256 + tid];
+                }
+                ob[rr * 256 + tid] = o / l;
+            }
+            __syncthreads();
+            for (int rr = warp; rr < nr; rr += 8) {
+                float x[8];
+                #pragma unroll
+                for (int e = 0; e < 8; e++) x[e] = ob[rr * 256 + lane + 32 * e];
+                tq_fwht256_warp(x, lane);
+                const float *q_proj = q_proj_base + (size_t)(qtile_base + r0 + rr) * q_m;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int d = lane + 32 * e;
+                    float gate = q_proj[head * (2 * hd) + hd + d];
+                    out[(size_t)(qtile_base + r0 + rr) * attn_m + head * hd + d] = x[e] * (1.0f / (1.0f + expf(-gate)));
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
     for (int r = 0; r < nvalid; r++) {
         float m_star = TQ_AMM_NINF;
         for (int c = 0; c < S; c++)
@@ -21280,6 +21417,11 @@ extern "C" int qwn_batched_logits(int c, float *out_host) {
 // prefill paths untouched.
 
 // --- paged Q4 attention (block-table addressing; column j -> slot slot_ids[j]) ---
+// VQ4 = 1 (TQ_KV_V4): V is stored like K -- FWHT-256 rotated, asymmetric int4 per 32 channels --
+// with v8_pool / vscale_pool holding the codes / (scale, zp) pairs in K's layout (20.0 instead of
+// 26.2 KiB per token). Attention then accumulates P.V in the rotated space and undoes the
+// rotation once per (query, head): P.(V H) = (P.V) H, H self-inverse.
+template <int VQ4>
 __global__ void k_tq_paged_attn_kv_write_q4(
     uint8_t *k4_pool, float *kq4s_pool, uint8_t *v8_pool, float *vscale_pool,
     const float *k_proj_base, const float *v_proj_base,
@@ -21326,9 +21468,25 @@ __global__ void k_tq_paged_attn_kv_write_q4(
     size_t pr = (size_t)phys * page + (pos & (page - 1));   // physical KV row
     float vv = v_proj[kv_head * hd + tid];
     __syncthreads();
-    float vscl = tq_kv_block_scale(vv, partial, &k_sum_shared);
-    v8_pool[pr * kv_m + (size_t)kv_head * hd + tid] = tq_float_to_e4m3(vv / vscl);
-    if (tid == 0) vscale_pool[pr * nkv + kv_head] = vscl;
+    if constexpr (VQ4) {
+        rot[tid] = vv;
+        __syncthreads();
+        tq_fwht256(rot, tid);
+        float vrot = rot[tid];
+        __syncthreads();
+        uint8_t vcode = tq_k_q4_quant(vrot, tid, gsz);
+        unsigned vhi4 = __shfl_down_sync(0xffffffffu, (unsigned)vcode, 1);
+        if ((tid & 1) == 0)
+            v8_pool[pr * (kv_m >> 1) + (size_t)kv_head * (hd >> 1) + (tid >> 1)] =
+                (uint8_t)(vcode | ((vhi4 & 15u) << 4));
+        if (tid < 16)
+            q4s_put(vscale_pool, pr * (nkv * 16) + (size_t)kv_head * 16 + tid, gsz[tid]);
+        __syncthreads();                                   // rot / gsz are K's next
+    } else {
+        float vscl = tq_kv_block_scale(vv, partial, &k_sum_shared);
+        v8_pool[pr * kv_m + (size_t)kv_head * hd + tid] = tq_float_to_e4m3(vv / vscl);
+        if (tid == 0) vscale_pool[pr * nkv + kv_head] = vscl;
+    }
     rot[tid] = kv;
     __syncthreads();
     tq_fwht256(rot, tid);
@@ -21343,6 +21501,7 @@ __global__ void k_tq_paged_attn_kv_write_q4(
         q4s_put(kq4s_pool, pr * (nkv * 16) + (size_t)kv_head * 16 + tid, gsz[tid]);
 }
 
+template <int VQ4>
 __global__ void k_tq_paged_attn_q4(
     float *out, const float *q_proj_base, const uint16_t *q_norm_w,
     const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
@@ -21451,14 +21610,26 @@ __global__ void k_tq_paged_attn_q4(
         acc *= alpha;
         for (int j = 0; j < clen; j++) {
             size_t pr = (size_t)pr_chunk[j];
-            float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
-            float vscl = vscale_pool[pr * nkv + kv_head];
-            acc += s_chunk[j] * vcode * vscl;
+            if constexpr (VQ4) {
+                uint8_t byte = v8_pool[pr * k4_pp + (size_t)kv_head * (hd >> 1) + (tid >> 1)];
+                float2 z = q4s_pair(q4s_adv(vscale_pool, pr * kq4s_pp + (size_t)kv_head * 16), 2 * (tid >> 5));
+                acc += s_chunk[j] * (((float)((tid & 1) ? (byte >> 4) : (byte & 15)) - z.y) * z.x);
+            } else {
+                float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
+                float vscl = vscale_pool[pr * nkv + kv_head];
+                acc += s_chunk[j] * vcode * vscl;
+            }
         }
         if (tid == 0) { l_run = l_run * alpha + l_chunk; m_run = m_new; }
         __syncthreads();
     }
     float ratio = acc / l_run;
+    if constexpr (VQ4) {                                 // rotated V space -> back (red is free here)
+        red[tid] = ratio;
+        __syncthreads();
+        tq_fwht256(red, tid);
+        ratio = red[tid];
+    }
     float gate = q_proj[head * (2 * hd) + hd + tid];
     out[(size_t)col * attn_m + head * hd + tid] = ratio * (1.0f / (1.0f + expf(-gate)));
 }
@@ -21470,6 +21641,8 @@ __global__ void k_tq_paged_attn_q4(
 // (S*nh*N blocks -> fills the 170 SMs); each computes a partial online-softmax (m,l,acc) over
 // its position range. k_tq_paged_attn_q4_merge combines the S partials. Default-off below a
 // block threshold (S=1 -> the single kernel above; no short-ctx / high-N regression).
+// VQ4: partials stay in the rotated V space; k_tq_paged_attn_q4_merge<1> rotates back.
+template <int VQ4>
 __global__ void k_tq_paged_attn_q4_split(
     const float *q_proj_base, const uint16_t *q_norm_w,
     const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
@@ -21571,9 +21744,15 @@ __global__ void k_tq_paged_attn_q4_split(
         acc *= alpha;
         for (int j = 0; j < clen; j++) {
             size_t pr = (size_t)pr_chunk[j];
-            float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
-            float vscl = vscale_pool[pr * nkv + kv_head];
-            acc += s_chunk[j] * vcode * vscl;
+            if constexpr (VQ4) {
+                uint8_t byte = v8_pool[pr * k4_pp + (size_t)kv_head * (hd >> 1) + (tid >> 1)];
+                float2 z = q4s_pair(q4s_adv(vscale_pool, pr * kq4s_pp + (size_t)kv_head * 16), 2 * (tid >> 5));
+                acc += s_chunk[j] * (((float)((tid & 1) ? (byte >> 4) : (byte & 15)) - z.y) * z.x);
+            } else {
+                float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
+                float vscl = vscale_pool[pr * nkv + kv_head];
+                acc += s_chunk[j] * vcode * vscl;
+            }
         }
         if (tid == 0) { l_run = l_run * alpha + l_chunk; m_run = m_new; }
         __syncthreads();
@@ -21586,9 +21765,12 @@ __global__ void k_tq_paged_attn_q4_split(
 
 // combine S split partials per (head,col): m*=max m_s; acc*=sum exp(m_s-m*) acc_s; l* likewise;
 // out = (acc*/l*) * sigmoid(gate). One block per (head,col), thread tid = output channel.
+// VQ4: the partials are in the rotated V space; one FWHT-256 of acc*/l* before the gate.
+template <int VQ4>
 __global__ void k_tq_paged_attn_q4_merge(
     float *out, const float *q_proj_base, const int *positions, int nh, int hd, int q_m, int attn_m,
     int S, const float *part_acc, const float *part_ml) {
+    __shared__ float rbuf[VQ4 ? 256 : 1];
     int head = blockIdx.x, col = blockIdx.y, tid = threadIdx.x;
     if (head >= nh || tid >= hd) return;
     size_t base = (size_t)(head * gridDim.y + col) * S;
@@ -21605,6 +21787,12 @@ __global__ void k_tq_paged_attn_q4_merge(
     const float *q_proj = q_proj_base + (size_t)col * q_m;
     float gate = q_proj[head * (2 * hd) + hd + tid];
     float ratio = (l > 0.0f) ? acc / l : 0.0f;
+    if constexpr (VQ4) {
+        rbuf[tid] = ratio;
+        __syncthreads();
+        tq_fwht256(rbuf, tid);
+        ratio = rbuf[tid];
+    }
     out[(size_t)col * attn_m + head * hd + tid] = ratio * (1.0f / (1.0f + expf(-gate)));
 }
 
@@ -21750,6 +21938,8 @@ static int paged_sm_count(void) {
 // One 128-key super-tile of the GQA decode kernel. Force-inlined into both the dense walk and
 // the page-list walk so the dense instantiation (USE_TOPK=0) does not carry the list path.
 // `t0` is the logical position of the tile's first key; `phys` is its physical block.
+// VQ4: vcb8 / vscb point at int4 V codes / (scale, zp) pairs (K's layout, cstride4 / szstride).
+template <int VQ4>
 static __device__ __forceinline__ void tq_gqa_mma_supertile(
     float oacc[4][4], uint32_t *sm, float *wmax, float *wsum, float *mst, float *lst, float *alph,
     int tid, int warp, int lane, int gr, int t4,
@@ -21826,7 +22016,7 @@ static __device__ __forceinline__ void tq_gqa_mma_supertile(
         ls_hi += __shfl_xor_sync(0xffffffffu, ls_hi, o);
     }
     if (t4 == 0) { wsum[warp * 16 + gr] = ls_lo; wsum[warp * 16 + 8 + gr] = ls_hi; }
-    {   // fold the per-key V scale into p (the denominator keeps the unscaled p)
+    if constexpr (!VQ4) {   // fold the per-key V scale into p (the denominator keeps the unscaled p)
         int p0c = t0 + warp * 16 + 2 * t4, p1c = p0c + 8;
         float v00 = vscb[TQ_GROW(p0c) * nkv], v01 = vscb[TQ_GROW(p0c + 1) * nkv];
         float v10 = vscb[TQ_GROW(p1c) * nkv], v11 = vscb[TQ_GROW(p1c + 1) * nkv];
@@ -21848,6 +22038,32 @@ static __device__ __forceinline__ void tq_gqa_mma_supertile(
     for (int tt = 0; tt < 8; tt++) {
         const uint32_t *pa = &sm[TQ_AMM_PST + (tt * 32 + lane) * 4];
         uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
+        if constexpr (VQ4) {
+            // int4 V: the warp's 32 output channels are one (scale, zp) group (g = warp). MMA f's
+            // column gr carries channel warp*32 + 4*gr + f, so a thread's four columns are two
+            // adjacent code bytes of a key row: one 16-bit load per row.
+            const int r0 = t0 + tt * 16 + 2 * t4;
+            const size_t q0 = TQ_GROW(r0), q1 = TQ_GROW(r0 + 1), q8 = TQ_GROW(r0 + 8), q9 = TQ_GROW(r0 + 9);
+            const size_t cb = (size_t)(16 * warp + 2 * gr);
+            const uint32_t c0 = *(const uint16_t *)(vcb8 + q0 * cstride4 + cb);
+            const uint32_t c1 = *(const uint16_t *)(vcb8 + q1 * cstride4 + cb);
+            const uint32_t c8 = *(const uint16_t *)(vcb8 + q8 * cstride4 + cb);
+            const uint32_t c9 = *(const uint16_t *)(vcb8 + q9 * cstride4 + cb);
+            const float2 z0 = q4s_pair(q4s_adv(vscb, q0 * szstride), 2 * warp);
+            const float2 z1 = q4s_pair(q4s_adv(vscb, q1 * szstride), 2 * warp);
+            const float2 z8 = q4s_pair(q4s_adv(vscb, q8 * szstride), 2 * warp);
+            const float2 z9 = q4s_pair(q4s_adv(vscb, q9 * szstride), 2 * warp);
+            #pragma unroll
+            for (int f = 0; f < 4; f++) {
+                const int sh = 4 * f;
+                uint32_t b0 = tq_pack_bf16(((float)((c0 >> sh) & 15u) - z0.y) * z0.x,
+                                           ((float)((c1 >> sh) & 15u) - z1.y) * z1.x);
+                uint32_t b1 = tq_pack_bf16(((float)((c8 >> sh) & 15u) - z8.y) * z8.x,
+                                           ((float)((c9 >> sh) & 15u) - z9.y) * z9.x);
+                tq_mma_bf16_m16n8k16(oacc[f], a, b0, b1);
+            }
+            continue;
+        }
         #pragma unroll
         for (int f = 0; f < 4; f++) {
             int cidx = warp * 32 + f * 8 + gr;
@@ -21876,7 +22092,9 @@ static __device__ __forceinline__ void tq_gqa_mma_supertile(
 // USE_TOPK=0 is the dense walk. USE_TOPK=1 consumes a per-(client, kv head) page list
 // (Quest top-k; count 0 means this client stays dense). Separate instantiations so the dense
 // kernel's register count does not include the list path.
-template <int USE_TOPK>
+// VQ4 = 1: int4 V (TQ_KV_V4); O accumulates in the rotated space, rotated back once per q-head
+// in the epilogue (S == 1) or in k_tq_paged_attn_q4_merge<1> (S > 1).
+template <int USE_TOPK, int VQ4>
 __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
     float *out, const float *q_proj_base, const uint16_t *q_norm_w,
     const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
@@ -21894,8 +22112,8 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
     const size_t cstride = (size_t)nkv * hd, cstride4 = cstride >> 1, szstride = (size_t)nkv * 16;
     const uint8_t *kcb4 = k4_pool + (size_t)kv_head * (hd >> 1);
     const float *ksz4 = q4s_adv(kq4s_pool, (size_t)kv_head * 16);
-    const uint8_t *vcb8 = v8_pool + (size_t)kv_head * hd;
-    const float *vscb = vscale_pool + kv_head;
+    const uint8_t *vcb8 = v8_pool + (size_t)kv_head * (VQ4 ? (hd >> 1) : hd);
+    const float *vscb = VQ4 ? q4s_adv(vscale_pool, (size_t)kv_head * 16) : vscale_pool + kv_head;
     float *qtmp = (float *)(sm + TQ_AMM_QTMP);
     float *red = (float *)(sm + TQ_AMM_RED);
     float *wmax = (float *)(sm + TQ_AMM_WMAX), *wsum = (float *)(sm + TQ_AMM_WSUM);
@@ -21960,7 +22178,7 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
     for (int it = it_lo; it < nst; it++) { \
         int t0d = it << 7; \
         int physd = block_table[bt_base + (t0d >> page_log)]; \
-        tq_gqa_mma_supertile(oacc, sm, wmax, wsum, mst, lst, alph, \
+        tq_gqa_mma_supertile<VQ4>(oacc, sm, wmax, wsum, mst, lst, alph, \
             tid, warp, lane, gr, t4, t0d, physd, pos, page, group, nkv, rsc, \
             kcb4, cstride4, ksz4, szstride, vcb8, cstride, vscb); \
     }
@@ -21988,7 +22206,7 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
                 for (int sub = 0; sub < page; sub += 128) {
                     int t0 = page_base + sub;
                     if (t0 > pos) break;
-                    tq_gqa_mma_supertile(oacc, sm, wmax, wsum, mst, lst, alph,
+                    tq_gqa_mma_supertile<VQ4>(oacc, sm, wmax, wsum, mst, lst, alph,
                         tid, warp, lane, gr, t4, t0, phys, pos, page, group, nkv, rsc,
                         kcb4, cstride4, ksz4, szstride, vcb8, cstride, vscb);
                 }
@@ -22007,13 +22225,14 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
             int cidx = warp * 32 + f * 8 + 2 * t4;
             #pragma unroll
             for (int j = 0; j < 2; j++) {
+                const int ch = VQ4 ? warp * 32 + 4 * (2 * t4 + j) + f : cidx + j;
                 if (gr < group) {
                     size_t pidx = ((size_t)((kv_head * group + gr) * gridDim.y + col) * S + split);
-                    part_acc[pidx * hd + cidx + j] = oacc[f][j];
+                    part_acc[pidx * hd + ch] = oacc[f][j];
                 }
                 if (8 + gr < group) {
                     size_t pidx = ((size_t)((kv_head * group + 8 + gr) * gridDim.y + col) * S + split);
-                    part_acc[pidx * hd + cidx + j] = oacc[f][2 + j];
+                    part_acc[pidx * hd + ch] = oacc[f][2 + j];
                 }
             }
         }
@@ -22025,6 +22244,35 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
     }
     float inv_lo = (gr < group) ? 1.0f / lst[gr] : 0.0f;
     float inv_hi = (8 + gr < group) ? 1.0f / lst[8 + gr] : 0.0f;
+    if constexpr (VQ4) {
+        // rotated rows -> smem ([group][256] lies below lst), one FWHT-256 per q-head by a warp
+        float *ob = (float *)sm;
+        __syncthreads();
+        #pragma unroll
+        for (int f = 0; f < 4; f++) {
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int ch = warp * 32 + 4 * (2 * t4 + j) + f;
+                if (gr < group) ob[gr * 256 + ch] = oacc[f][j] * inv_lo;
+                if (8 + gr < group) ob[(8 + gr) * 256 + ch] = oacc[f][2 + j] * inv_hi;
+            }
+        }
+        __syncthreads();
+        for (int r = warp; r < group; r += 8) {
+            float x[8];
+            #pragma unroll
+            for (int e = 0; e < 8; e++) x[e] = ob[r * 256 + lane + 32 * e];
+            tq_fwht256_warp(x, lane);
+            const int hh = kv_head * group + r;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int d = lane + 32 * e;
+                float gate = q_proj[hh * (2 * hd) + hd + d];
+                out[(size_t)col * attn_m + hh * hd + d] = x[e] * (1.0f / (1.0f + expf(-gate)));
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int f = 0; f < 4; f++) {
         int cidx = warp * 32 + f * 8 + 2 * t4;
@@ -22115,6 +22363,36 @@ static int paged_topk_rank(int layer, const float *q_proj, const uint16_t *q_nor
                            const int *positions, const int *slot_ids, int N, int max_pos,
                            int kpages, cudaStream_t st);
 
+// TQ_KV_V4, read by qwn_paged_init: the pool's V is int4 like K (k_tq_paged_attn_kv_write_q4<1>);
+// every paged attention launch below takes its VQ4 instantiation from it.
+static int g_pg_v4 = 0;
+
+static void paged_kv_write(int ncol, uint8_t *k4_pool, float *kq4s_pool, uint8_t *v8_pool, float *vscale_pool,
+                           const float *k_proj, const float *v_proj, const uint16_t *k_norm_w,
+                           const int *positions, const int *slot_ids, const int *block_table,
+                           int max_blocks, int page, int page_log, cudaStream_t st) {
+    int nkv = g_qwen.nkv, hd = g_qwen.hd, kv_m = nkv * hd;
+    if (g_pg_v4)
+        k_tq_paged_attn_kv_write_q4<1><<<dim3(nkv, ncol), hd, 0, st>>>(
+            k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions, slot_ids,
+            block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
+    else
+        k_tq_paged_attn_kv_write_q4<0><<<dim3(nkv, ncol), hd, 0, st>>>(
+            k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions, slot_ids,
+            block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
+}
+
+static void paged_attn_merge(float *out, const float *q_proj, const int *positions, int N, int S,
+                             cudaStream_t st) {
+    int nh = g_qwen.nh, hd = g_qwen.hd, q_m = nh * hd * 2, attn_m = nh * hd;
+    if (g_pg_v4)
+        k_tq_paged_attn_q4_merge<1><<<dim3(nh, N), hd, 0, st>>>(
+            out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+    else
+        k_tq_paged_attn_q4_merge<0><<<dim3(nh, N), hd, 0, st>>>(
+            out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+}
+
 static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t *q_norm_w,
                                 const float *k_proj, const float *v_proj, const uint16_t *k_norm_w,
                                 uint8_t *k4_pool, float *kq4s_pool, uint8_t *v8_pool, float *vscale_pool,
@@ -22123,10 +22401,9 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
                                 int layer, const int *pos_host, const int *slot_host, int do_topk,
                                 cudaStream_t st) {
     int nh = g_qwen.nh, nkv = g_qwen.nkv, hd = g_qwen.hd;
-    int q_m = nh * hd * 2, kv_m = nkv * hd, attn_m = nh * hd;
-    k_tq_paged_attn_kv_write_q4<<<dim3(nkv, N), hd, 0, st>>>(
-        k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions, slot_ids,
-        block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
+    int q_m = nh * hd * 2, attn_m = nh * hd;
+    paged_kv_write(N, k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions,
+                   slot_ids, block_table, max_blocks, page, page_log, st);
     int kpages = paged_topk_pages();
     if (kpages > 0 && pos_host && slot_host) {
         if (paged_kmm_refresh(layer, pos_host, slot_host, N, st) != 0) return -3;
@@ -22150,37 +22427,46 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
             S = paged_gqa_split_S(N, max_pos);
         }
         if (S > 1 && ensure_attn_partials((size_t)nh * N * S) != 0) S = 1;
-        if (use_topk)
-            k_tq_paged_attn_q4_gqa_mma<1><<<dim3(nkv, N, S), 256, 0, st>>>(
-                out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
-                block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S,
-                g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml,
-                g_topk_list, g_topk_count, g_topk_cap);
-        else
-            k_tq_paged_attn_q4_gqa_mma<0><<<dim3(nkv, N, S), 256, 0, st>>>(
-                out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
-                block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S,
-                g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml,
-                NULL, NULL, 0);
-        if (S > 1)
-            k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
-                out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+#define TQ_GQA_LAUNCH(TK, VQ, LIST, CNT, CAP) \
+            k_tq_paged_attn_q4_gqa_mma<TK, VQ><<<dim3(nkv, N, S), 256, 0, st>>>( \
+                out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids, \
+                block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S, \
+                g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml, LIST, CNT, CAP)
+        if (use_topk) {
+            if (g_pg_v4) TQ_GQA_LAUNCH(1, 1, g_topk_list, g_topk_count, g_topk_cap);
+            else         TQ_GQA_LAUNCH(1, 0, g_topk_list, g_topk_count, g_topk_cap);
+        } else {
+            if (g_pg_v4) TQ_GQA_LAUNCH(0, 1, NULL, NULL, 0);
+            else         TQ_GQA_LAUNCH(0, 0, NULL, NULL, 0);
+        }
+#undef TQ_GQA_LAUNCH
+        if (S > 1) paged_attn_merge(out, q_proj, positions, N, S, st);
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
     }
     int S = paged_split_S(N, max_pos);
     if (S <= 1) {
-        k_tq_paged_attn_q4<<<dim3(nh, N), hd, 0, st>>>(
-            out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
-            block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta);
+        if (g_pg_v4)
+            k_tq_paged_attn_q4<1><<<dim3(nh, N), hd, 0, st>>>(
+                out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+                block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta);
+        else
+            k_tq_paged_attn_q4<0><<<dim3(nh, N), hd, 0, st>>>(
+                out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+                block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta);
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
     }
     if (ensure_attn_partials((size_t)nh * N * S) != 0) return -2;
-    k_tq_paged_attn_q4_split<<<dim3(nh, N, S), hd, 0, st>>>(
-        q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
-        block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
-        g_attn_pacc, g_attn_pml);
-    k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
-        out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+    if (g_pg_v4)
+        k_tq_paged_attn_q4_split<1><<<dim3(nh, N, S), hd, 0, st>>>(
+            q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+            block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
+            g_attn_pacc, g_attn_pml);
+    else
+        k_tq_paged_attn_q4_split<0><<<dim3(nh, N, S), hd, 0, st>>>(
+            q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+            block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
+            g_attn_pacc, g_attn_pml);
+    paged_attn_merge(out, q_proj, positions, N, S, st);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -22199,10 +22485,9 @@ static int launch_paged_attn_q4_mma_prefill(
     const int *col_pos_host, const int *col_slot_host, int layer, int K, int T,
     cudaStream_t st) {
     int nh = g_qwen.nh, nkv = g_qwen.nkv, hd = g_qwen.hd;
-    int q_m = nh * hd * 2, kv_m = nkv * hd, attn_m = nh * hd;
-    k_tq_paged_attn_kv_write_q4<<<dim3(nkv, T), hd, 0, st>>>(
-        k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions, slot_ids,
-        block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
+    int q_m = nh * hd * 2, attn_m = nh * hd;
+    paged_kv_write(T, k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions,
+                   slot_ids, block_table, max_blocks, page, page_log, st);
     // Prefill attention stays dense. Summaries of the pages this wave wrote are refreshed
     // so a later pure decode step can rank them. Decode columns inside a mixed wave are
     // covered here too (they share this KV write).
@@ -22224,30 +22509,25 @@ static int launch_paged_attn_q4_mma_prefill(
         int S = wide_attn_split_S(max_pos);
         if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * part_f) != 0)
             S = 1;
-        if (qr == 32)
-            k_tq_wide_attn_mma<4, 2><<<dim3(nh, nqt, S), 256, 0, st>>>(
-                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
-                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
-                positions + off, slot, block_table, max_blocks, page, page_log,
-                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
-                g_wide_attn_part);
-        else
-            k_tq_wide_attn_mma<4, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
-                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
-                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
-                positions + off, slot, block_table, max_blocks, page, page_log,
-                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
-                g_wide_attn_part);
+#define TQ_WIDE_PAGED(QTV, VQ) \
+            k_tq_wide_attn_mma<4, QTV, VQ><<<dim3(nh, nqt, S), 256, 0, st>>>( \
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w, \
+                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool, \
+                positions + off, slot, block_table, max_blocks, page, page_log, \
+                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta, \
+                g_wide_attn_part)
+#define TQ_WIDE_MERGE(QTV, VQ) \
+            k_tq_wide_attn_mma_merge<QTV, VQ><<<dim3(nh, nqt), 256, 0, st>>>( \
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, \
+                n, nh, hd, q_m, attn_m, S, g_wide_attn_part)
+        if (qr == 32) { if (g_pg_v4) TQ_WIDE_PAGED(2, 1); else TQ_WIDE_PAGED(2, 0); }
+        else          { if (g_pg_v4) TQ_WIDE_PAGED(1, 1); else TQ_WIDE_PAGED(1, 0); }
         if (S > 1) {
-            if (qr == 32)
-                k_tq_wide_attn_mma_merge<2><<<dim3(nh, nqt), 256, 0, st>>>(
-                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
-                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
-            else
-                k_tq_wide_attn_mma_merge<1><<<dim3(nh, nqt), 256, 0, st>>>(
-                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
-                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+            if (qr == 32) { if (g_pg_v4) TQ_WIDE_MERGE(2, 1); else TQ_WIDE_MERGE(2, 0); }
+            else          { if (g_pg_v4) TQ_WIDE_MERGE(1, 1); else TQ_WIDE_MERGE(1, 0); }
         }
+#undef TQ_WIDE_PAGED
+#undef TQ_WIDE_MERGE
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -22666,11 +22946,13 @@ static int paged_topk_rank(int layer, const float *q_proj, const uint16_t *q_nor
 
 // Allocate the shared paged pool: num_blocks blocks of `page` positions (Q4 KV for the 16
 // full-attn layers) + per-slot DeltaNet state for max_slots. page must be a power of two.
+// TQ_KV_V4=1 stores V like K (int4 codes + (scale, zp) pairs) instead of E4M3 + a per-head scale.
 extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (!g_qwen.initialized) return -1;
-    if (!g_qwen.kv_q4) return -2;                          // Q4(K)+E4M3(V) tier only
+    if (!g_qwen.kv_q4) return -2;                          // Q4(K) + E4M3(V) or Q4(V) tiers only
     if (max_slots < 1 || num_blocks < 1 || page < 1 || (page & (page - 1))) return -3;
     paged_free_all();
+    { const char *e = getenv("TQ_KV_V4"); g_pg_v4 = (e && atoi(e) != 0) ? 1 : 0; }
     int plog = 0; while ((1 << plog) < page) plog++;
     g_pg_page = page; g_pg_plog = plog; g_pg_nblocks = num_blocks; g_pg_maxslots = max_slots;
     g_pg_maxblk = (g_qwen.max_seq + page - 1) / page;
@@ -22680,7 +22962,8 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     size_t bp = (size_t)num_blocks * page;                // pool rows
     for (int L = 0; L < g_qwen.L; L++) {
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
-            size_t k4b = bp * (kv_m >> 1), kq4sb = bp * nkv * 16 * qe, v8b = bp * kv_m, vscb = bp * nkv * sizeof(float);
+            size_t k4b = bp * (kv_m >> 1), kq4sb = bp * nkv * 16 * qe;
+            size_t v8b = g_pg_v4 ? k4b : bp * kv_m, vscb = g_pg_v4 ? kq4sb : bp * nkv * sizeof(float);
             if (cudaMalloc(&g_pool_k4[L], k4b) != cudaSuccess) { paged_free_all(); return -4; }
             if (cudaMalloc(&g_pool_kq4s[L], kq4sb) != cudaSuccess) { paged_free_all(); return -4; }
             if (cudaMalloc(&g_pool_v8[L], v8b) != cudaSuccess) { paged_free_all(); return -4; }
@@ -22719,6 +23002,7 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     cudaStreamSynchronize(g_qwen.stream);
     free(hi);
     g_pg_ready = 1;
+    if (g_pg_v4) fprintf(stderr, "[paged] TQ_KV_V4: V stored as int4 like K\n");
     return 0;
 }
 
@@ -22748,6 +23032,7 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
     if (upto_pos < 0) return -2;
     if (!g_qwen.kv_q4) return -3;
+    if (g_pg_v4) return -9;                                      // the single-stream cache holds E4M3 V
     if (paged_ensure_blocks(slot, upto_pos) != 0) return -4;     // pool exhausted
     int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv, page = g_pg_page;
     size_t qe = batched_q4s_elem_bytes();
@@ -22790,15 +23075,20 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
 // ===== Session parking: a slot's paged KV + DeltaNet state <-> a host buffer =====
 // Host layout (bytes), logical-block order so a restore may land in different physical blocks:
 //   [for each FULL layer L][for each logical block lb < nb]: K4 rows | kq4s rows | V8 rows | vscale rows
+//   (TQ_KV_V4: V4 rows | vq4s rows in K's row sizes)
 //   [for each LINEAR layer L]: recur floats | conv floats
 // Rows per block = page except the last (cnt = n - lb*page). n = upto_pos + 1 consumed positions.
 // Pageable host memory is fine for v1 (the runtime stages it; ~1 GB per 40K tokens moves in
 // ~0.2-0.4 s); pinned buffers turn the copies async later.
+static size_t paged_layer_token_bytes(void) {             // one full-attention layer, one position
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
+    size_t k_tok = (size_t)(kv_m >> 1) + (size_t)nkv * 16 * batched_q4s_elem_bytes();
+    return k_tok + (g_pg_v4 ? k_tok : (size_t)kv_m + (size_t)nkv * sizeof(float));
+}
+
 static size_t paged_slot_bytes(int upto_pos) {
     int n = upto_pos + 1, page = g_pg_page;
-    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
-    size_t qe = batched_q4s_elem_bytes();
-    size_t per_tok = (size_t)(kv_m >> 1) + (size_t)nkv * 16 * qe + (size_t)kv_m + (size_t)nkv * sizeof(float);
+    size_t per_tok = paged_layer_token_bytes();
     size_t bytes = 0;
     int nfull = 0, nlin = 0;
     for (int L = 0; L < g_qwen.L; L++) {
@@ -22814,6 +23104,14 @@ static size_t paged_slot_bytes(int upto_pos) {
 extern "C" size_t qwn_paged_slot_bytes(int upto_pos) {
     if (!g_pg_ready || upto_pos < 0) return 0;
     return paged_slot_bytes(upto_pos);
+}
+
+// KV bytes per resident token over all full-attention layers (pool sizing / reporting).
+extern "C" size_t qwn_paged_token_bytes(void) {
+    if (!g_pg_ready) return 0;
+    int nfull = 0;
+    for (int L = 0; L < g_qwen.L; L++) nfull += g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION;
+    return (size_t)nfull * paged_layer_token_bytes();
 }
 
 // dir 0 = save (device -> host), 1 = restore (host -> device; the slot must already own the blocks)
@@ -22842,8 +23140,13 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
                 size_t bo = (size_t)phys * page;
                 TQ_XFER(g_pool_k4[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
                 TQ_XFER((char *)g_pool_kq4s[L] + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
-                TQ_XFER(g_pool_v8[L] + bo * kv_m, (size_t)cnt * kv_m);
-                TQ_XFER(g_pool_vscale[L] + bo * nkv, (size_t)cnt * nkv * sizeof(float));
+                if (g_pg_v4) {
+                    TQ_XFER(g_pool_v8[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                    TQ_XFER((char *)g_pool_vscale[L] + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+                } else {
+                    TQ_XFER(g_pool_v8[L] + bo * kv_m, (size_t)cnt * kv_m);
+                    TQ_XFER(g_pool_vscale[L] + bo * nkv, (size_t)cnt * nkv * sizeof(float));
+                }
             }
         } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
             TQ_XFER(g_pg_recur[L] + (size_t)slot * recur_f, recur_f * sizeof(float));
