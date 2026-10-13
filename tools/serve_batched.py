@@ -1078,11 +1078,11 @@ def main():
     ap.add_argument("--mtp", dest="mtp", action="store_true", default=False,
                     help="load the tqf's MTP head (0.85 GB bf16). This server does no speculative decoding, so by "
                          "default TQ_NO_MTP=1 skips it.")
-    ap.add_argument("--kv-v4", dest="kv_v4", action="store_true", default=False,
-                    help="store V like K in the paged pool (TQ_KV_V4=1): FWHT-256 rotated int4, asymmetric per 32 "
-                         "channels, 20.0 instead of 26.2 KiB per token (+31%% pooled tokens in the same pool memory). "
-                         "With the EXL3 opt-6.0 weights KL stays below the FP8 checkpoint's at 4K-64K and long-context "
-                         "top-1 is 0.05-0.07 pt under it; with opt-5.75 it fails the FP8 gate at long context.")
+    ap.add_argument("--kv-v4", dest="kv_v4", action="store_true", default=True,
+                    help="store V like K in the paged pool (TQ_KV_V4=1, default): FWHT-256 rotated int4, asymmetric "
+                         "per 32 channels, 20.0 instead of 26.2 KiB per token (+31%% pooled tokens in the same pool "
+                         "memory). The served stack is EXL3 opt-6.25 + int4 V (FP8 quality end to end, 3300 blocks with "
+                         "12 slots); opt-5.75 needs --no-kv-v4 (E4M3 V) to stay at FP8 quality at long context.")
     ap.add_argument("--no-kv-v4", dest="kv_v4", action="store_false")
     args = ap.parse_args()
     # The engine lib reads these at qwn_init / lazily on the first prefill wave; explicit env overrides the flags.
