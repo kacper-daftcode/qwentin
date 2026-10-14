@@ -1084,12 +1084,18 @@ def main():
                          "memory). The served stack is EXL3 opt-6.25 + int4 V (FP8 quality end to end, 3300 blocks with "
                          "12 slots); opt-5.75 needs --no-kv-v4 (E4M3 V) to stay at FP8 quality at long context.")
     ap.add_argument("--no-kv-v4", dest="kv_v4", action="store_false")
+    ap.add_argument("--pdl", dest="pdl", action="store_true", default=True,
+                    help="programmatic dependent launch in the decode step (TQ_PDL=1, default): each EXL3 GEMM and "
+                         "its bfrag launch while the predecessor drains and wait on the device; bit-identical outputs, "
+                         "-0.55..-0.61 ms per step at N = 1-8 @32K (5090 at 550 W, opt-6.25 + int4 V).")
+    ap.add_argument("--no-pdl", dest="pdl", action="store_false")
     args = ap.parse_args()
     # The engine lib reads these at qwn_init / lazily on the first prefill wave; explicit env overrides the flags.
     os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
     os.environ.setdefault("TQ_EMBED_HOST", "1" if args.embed_host else "0")
     os.environ.setdefault("TQ_NO_MTP", "0" if args.mtp else "1")
     os.environ.setdefault("TQ_KV_V4", "1" if args.kv_v4 else "0")
+    os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
     if args.bench:
         bench(args)
     elif args.selftest:
