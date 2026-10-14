@@ -19670,6 +19670,7 @@ static int ensure_wide_prefill_buffers(int N) {
 
 static int wide_quant_input(const float *d_x, int K, int N);
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N);
+static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs, int n, int N);
 // Q4(K)+E4M3(V) batched/wide attention (defined in the roadmap-E section below). With
 // {k4,kq4s,v8,vscale}_stride = 0 every column shares ONE cache -> wide-prefill Q4 attention.
 static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_t *q_norm_w,
@@ -19694,8 +19695,9 @@ static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) 
               g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
     int ret = wide_quant_input(g_wide_pn, H, n);
     if (ret != 0) return ret;
-    if ((ret = wide_proj(&l->mlp_gate, g_wide_gate, n)) != 0) return ret;
-    if ((ret = wide_proj(&l->mlp_up, g_wide_up, n)) != 0) return ret;
+    const tq_qmma_weight_t *gu[2] = {&l->mlp_gate, &l->mlp_up};
+    float *gu_out[2] = {g_wide_gate, g_wide_up};
+    if ((ret = wide_proj_group(gu, gu_out, 2, n)) != 0) return ret;
     tq_launch(g_pdl_small, k_tq_silu_mul, dim3(((size_t)n * I + 255) / 256), dim3(256), 0, g_qwen.stream,
               g_wide_mh, g_wide_gate, g_wide_up, (int)((size_t)n * I));
     if ((ret = wide_quant_input(g_wide_mh, I, n)) != 0) return ret;
@@ -19802,11 +19804,16 @@ static __device__ __forceinline__ void tq_had128_warp(float &v0, float &v1, floa
 // lane = (n%8)*4 + tig holds k = 2*tig+{0,1} (word 0) and k+8,+9 (word 1). A warp's 128-bit
 // load of a group pair is one contiguous 512-byte run. One warp per (token, 128-block of K);
 // tokens N..Npad-1 (the pad of the last group) are written as zeros, so no per-call memset.
-__global__ void __launch_bounds__(128) k_tq_exl3_bfrag(uint32_t *bfrag, const float *x, const uint16_t *suh,
+// Up to three Linears that share x (q/k/v, gate/up, qkv/z) in one launch: blockIdx.y picks the (buffer, suh) pair.
+struct tq_bfrag_set { uint32_t *b0, *b1, *b2; const uint16_t *s0, *s1, *s2; };
+
+__global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const float *x,
                                                        int K, int N, int Npad, int Kt16, int GP) {
     // the next GEMM may start fetching its weights; x comes from the predecessor and the previous GEMM
     // may still read bfrag, so wait before touching either
     tq_pdl_enter();
+    uint32_t *bfrag = blockIdx.y == 0 ? set.b0 : blockIdx.y == 1 ? set.b1 : set.b2;
+    const uint16_t *suh = blockIdx.y == 0 ? set.s0 : blockIdx.y == 1 ? set.s1 : set.s2;
     int wg = blockIdx.x * 4 + (threadIdx.x >> 5);
     int lane = threadIdx.x & 31;
     int nblk = K >> 7;
@@ -20241,7 +20248,7 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
 }
 
 #define TQ_EXL3_LAUNCH(KB_, NG_) \
-    return exl3_launch_gemm<KB_, NG_>(out + (size_t)n0 * M, NULL, split_stride, w, g_exl3_b, M, Kt16, nn, Gt, n0 / 8, st)
+    return exl3_launch_gemm<KB_, NG_>(out + (size_t)n0 * M, NULL, split_stride, w, bp, M, Kt16, nn, Gt, n0 / 8, st)
 #define TQ_EXL3_SWITCH_NG(KB_) \
     switch (G) { \
         case 1: TQ_EXL3_LAUNCH(KB_, 1); case 2: TQ_EXL3_LAUNCH(KB_, 2); \
@@ -20249,7 +20256,7 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
         case 16: TQ_EXL3_LAUNCH(KB_, 16); default: return -113; }
 
 // Tokens [n0, n0+nn) of the prepared fragments with NG-wide units.
-static int exl3_launch_part(const tq_qmma_weight_t *w, float *out, int n0, int nn, int G, int Gt,
+static int exl3_launch_part(const tq_qmma_weight_t *w, const uint32_t *bp, float *out, int n0, int nn, int G, int Gt,
                             int M, int Kt16, size_t split_stride, cudaStream_t st) {
     switch (w->exl3_kbits) {
         case 2: TQ_EXL3_SWITCH_NG(2);
@@ -20263,15 +20270,11 @@ static int exl3_launch_part(const tq_qmma_weight_t *w, float *out, int n0, int n
     }
 }
 
-static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
-    cudaStream_t st = g_qwen.stream;
-    int M = w->M, K = w->K;
-    if (!g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
-    if (w->exl3_kbits == 0) {
-        if (!w->d_exl3_bf16) return -111;
-        k_tq_exl3_bf16_wide<<<dim3(M, (N + 7) / 8), 1024, 0, st>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
-        return 0;
-    }
+// fp16 B fragments of g_exl3_x for n (<= 3) quantized Linears of the same K in one launch; Linear i's fragments
+// start at g_exl3_b + i * *need_w.
+static int exl3_build_frags(const tq_qmma_weight_t *const *ws, int n, int N, size_t *need_w_out) {
+    int K = ws[0]->K;
+    if (n < 1 || n > 3 || !g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
     if (!g_exl3_ctr) {
         size_t nb = (size_t)TQ_EXL3_CTR_SLOTS * TQ_EXL3_CTR_STRIDE * sizeof(int);
         if (cudaMalloc(&g_exl3_ctr, nb) != cudaSuccess) { g_exl3_ctr = NULL; return -116; }
@@ -20280,14 +20283,28 @@ static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     int Kt16 = K / 16;
     int Gt = wide_ng(N), GP = (Gt + 1) / 2;
     size_t need_w = (size_t)GP * Kt16 * 128;      // [kt][pair][32 lanes][4 words]
-    if (need_w > g_exl3_b_words) {
+    if (3 * need_w > g_exl3_b_words) {
         if (g_exl3_b) cudaFree(g_exl3_b);
-        if (cudaMalloc(&g_exl3_b, need_w * sizeof(uint32_t)) != cudaSuccess) { g_exl3_b = NULL; g_exl3_b_words = 0; return -112; }
-        g_exl3_b_words = need_w;
+        if (cudaMalloc(&g_exl3_b, 3 * need_w * sizeof(uint32_t)) != cudaSuccess) { g_exl3_b = NULL; g_exl3_b_words = 0; return -112; }
+        g_exl3_b_words = 3 * need_w;
     }
+    tq_bfrag_set set;
+    set.b0 = g_exl3_b; set.b1 = g_exl3_b + need_w; set.b2 = g_exl3_b + 2 * need_w;
+    set.s0 = ws[0]->d_exl3_suh;
+    set.s1 = n > 1 ? ws[1]->d_exl3_suh : ws[0]->d_exl3_suh;
+    set.s2 = n > 2 ? ws[2]->d_exl3_suh : ws[0]->d_exl3_suh;
     int nwarps = 8 * Gt * (K / 128);
-    tq_launch(g_pdl_on, k_tq_exl3_bfrag, dim3((nwarps + 3) / 4), dim3(128), 0, st, g_exl3_b, g_exl3_x,
-              (const uint16_t *)w->d_exl3_suh, K, N, 8 * Gt, Kt16, GP);
+    tq_launch(g_pdl_on, k_tq_exl3_bfrag, dim3((nwarps + 3) / 4, n), dim3(128), 0, g_qwen.stream, set, g_exl3_x,
+              K, N, 8 * Gt, Kt16, GP);
+    *need_w_out = need_w;
+    return 0;
+}
+
+static int exl3_gemm_frags(const tq_qmma_weight_t *w, const uint32_t *bp, float *out, int N) {
+    cudaStream_t st = g_qwen.stream;
+    int M = w->M, K = w->K;
+    int Kt16 = K / 16;
+    int Gt = wide_ng(N);
     size_t split_stride = (size_t)N * M;
     // Ragged N (a mixed prefill wave = 128 prompt columns + a few decoders): full 8*G-token
     // units for the head, then the remainder with the narrowest units that cover it -- one
@@ -20296,9 +20313,38 @@ static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     int unit_tokens = 8 * G;
     int n_main = (N >= unit_tokens) ? (N / unit_tokens) * unit_tokens : N;
     int r = 0;
-    if (n_main > 0) r = exl3_launch_part(w, out, 0, n_main, G, Gt, M, Kt16, split_stride, st);
+    if (n_main > 0) r = exl3_launch_part(w, bp, out, 0, n_main, G, Gt, M, Kt16, split_stride, st);
     if (r == 0 && n_main < N)
-        r = exl3_launch_part(w, out, n_main, N - n_main, wide_ng(N - n_main), Gt, M, Kt16, split_stride, st);
+        r = exl3_launch_part(w, bp, out, n_main, N - n_main, wide_ng(N - n_main), Gt, M, Kt16, split_stride, st);
+    return r;
+}
+
+static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
+    int M = w->M, K = w->K;
+    if (!g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
+    if (w->exl3_kbits == 0) {
+        if (!w->d_exl3_bf16) return -111;
+        k_tq_exl3_bf16_wide<<<dim3(M, (N + 7) / 8), 1024, 0, g_qwen.stream>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
+        return 0;
+    }
+    size_t need_w = 0;
+    int r = exl3_build_frags(&w, 1, N, &need_w);
+    return r != 0 ? r : exl3_gemm_frags(w, g_exl3_b, out, N);
+}
+
+// Linears sharing the recorded input: one fragment launch, then the GEMMs back to back (under PDL each GEMM
+// streams its first weights during its predecessor's tail). Other formats fall back to wide_proj one by one.
+static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs, int n, int N) {
+    bool grouped = n >= 2 && n <= 3;
+    for (int i = 0; i < n && grouped; i++)
+        grouped = ws[i]->exl3 && ws[i]->exl3_kbits > 0 && ws[i]->K == ws[0]->K;
+    if (!grouped) {
+        for (int i = 0; i < n; i++) { int r = wide_proj(ws[i], outs[i], N); if (r != 0) return r; }
+        return 0;
+    }
+    size_t need_w = 0;
+    int r = exl3_build_frags(ws, n, N, &need_w);
+    for (int i = 0; i < n && r == 0; i++) r = exl3_gemm_frags(ws[i], g_exl3_b + i * need_w, outs[i], N);
     return r;
 }
 #undef TQ_EXL3_LAUNCH
@@ -23270,9 +23316,9 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
             tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
                       g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -64;
-            if ((ret = wide_proj(&l->q_proj, g_wide_q, N)) != 0) return -64;
-            if ((ret = wide_proj(&l->k_proj, g_wide_k, N)) != 0) return -65;
-            if ((ret = wide_proj(&l->v_proj, g_wide_v, N)) != 0) return -66;
+            const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
+            float *qkv_out[3] = {g_wide_q, g_wide_k, g_wide_v};
+            if ((ret = wide_proj_group(qkv, qkv_out, 3, N)) != 0) return -64;
             if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_slot_ids, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
@@ -23290,8 +23336,9 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
             tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
                       g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -71;
-            if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, N)) != 0) return -71;
-            if ((ret = wide_proj(&l->linear_in_z, g_wide_z, N)) != 0) return -72;
+            const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
+            float *qz_out[2] = {g_wide_qkv, g_wide_z};
+            if ((ret = wide_proj_group(qz, qz_out, 2, N)) != 0) return -71;
             if ((ret = wide_proj_pair(&l->linear_in_b, g_wide_b, &l->linear_in_a, g_wide_a, N)) != 0) return -73;
             tq_launch(g_pdl_small, k_tq_linear_conv_update_paged, dim3((conv_dim + 255) / 256, N), dim3(256), 0,
                       g_qwen.stream, g_wide_qkv, g_pg_conv[L], g_wide_qkv, l->d_linear_conv1d, conv_dim,
