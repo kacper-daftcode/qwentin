@@ -27,7 +27,7 @@ Run (GPU7, prod Q4):
   CUDA_VISIBLE_DEVICES=7 TQ_CTX=131072 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --port 8100
 """
 from __future__ import annotations
-import argparse, ctypes, json, os, threading, time, queue, uuid
+import argparse, ctypes, json, os, sys, threading, time, queue, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,6 +85,8 @@ def load_lib(path):
 def kv_summary(L, total_blocks, page):
     """'KV <format> <KiB>/token, <tokens> pooled tokens' for the startup line (needs qwn_paged_token_bytes)."""
     fmt = "int4 K + int4 V" if os.environ.get("TQ_KV_V4", "0") not in ("", "0") else "int4 K + E4M3 V"
+    if os.environ.get("TQ_KV_T4", "0") not in ("", "0"):
+        fmt = "trellis-4 K + V (12-bit states, complete pages; newest page " + fmt + ")"
     if not L.has_token_bytes:
         return fmt
     tb = int(L.qwn_paged_token_bytes())
@@ -1267,6 +1269,14 @@ def main():
                          "memory). The served stack is EXL3 opt-6.25 + int4 V (FP8 quality end to end, 3300 blocks with "
                          "12 slots); opt-5.75 needs --no-kv-v4 (E4M3 V) to stay at FP8 quality at long context.")
     ap.add_argument("--no-kv-v4", dest="kv_v4", action="store_false")
+    ap.add_argument("--kv-t4", dest="kv_t4", action="store_true", default=False,
+                    help="B2 (session 10): trellis-coded K and V for every COMPLETE 128-token page (TQ_KV_T4=1; "
+                         "12-bit-state bitshift trellis, 4 bits per value, fp16 RMS scale per vector, trained codebook "
+                         "--kv-t4-codebook): 16.5 instead of 20.0 KiB per pooled token; the newest page of a slot stays "
+                         "int4 K+V (needs --kv-v4) in a per-slot staging area and is encoded when it completes "
+                         "(~3 ms per page). Size --num-blocks with analysis/pool_size.py (TQ_KV_T4=1).")
+    ap.add_argument("--kv-t4-codebook", default="/mnt/nvme/qwen256k/analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32",
+                    help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK)")
     ap.add_argument("--pdl", dest="pdl", action="store_true", default=True,
                     help="programmatic dependent launch in the decode step (TQ_PDL=1, default): each EXL3 GEMM and "
                          "its bfrag launch while the predecessor drains and wait on the device; bit-identical outputs, "
@@ -1293,6 +1303,11 @@ def main():
     os.environ.setdefault("TQ_EMBED_HOST", "1" if args.embed_host else "0")
     os.environ.setdefault("TQ_NO_MTP", "0" if args.mtp else "1")
     os.environ.setdefault("TQ_KV_V4", "1" if args.kv_v4 else "0")
+    os.environ.setdefault("TQ_KV_T4", "1" if args.kv_t4 else "0")
+    if os.environ.get("TQ_KV_T4", "0") not in ("", "0"):
+        os.environ.setdefault("TQ_KV_T4_CODEBOOK", args.kv_t4_codebook)
+        if os.environ.get("TQ_KV_V4", "0") in ("", "0"):
+            sys.exit("--kv-t4 needs --kv-v4 (the open page is staged as int4 K + V)")
     os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
     if args.bench:
         bench(args)
