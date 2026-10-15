@@ -20164,9 +20164,12 @@ static int exl3_gemm_cap(void) {
 // one dequantized tile should feed as many MMAs as possible (the dequant is the cost there),
 // but a unit set must still fill the resident blocks: take the largest NG whose
 // (feature blocks x token groups) covers >= 3/4 of the capacity, else the smallest (NG=4).
+// g_exl3_ng_max caps the unit width (the verify wave sets 4: fp32 accumulators at any T <= 64).
+static int g_exl3_ng_max = 16;
 static int exl3_unit_ng(int N, int MB) {
     int g = wide_ng(N);
     if (g <= 4) return g;
+    if (g_exl3_ng_max < 8) return g_exl3_ng_max;
     const char *e = getenv("TQ_EXL3_WIDE_NG");          // A/B override
     if (e && *e) { int v = atoi(e); if (v == 4 || v == 8 || v == 16) return v; }
     // measured (5090, 128 tokens, fp16-accumulate MMAs): 64-token units are the best trade
@@ -20401,16 +20404,25 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
 
 // Two projections of the same input (call wide_quant_input first). The GDN in_proj_b / in_proj_a
 // pair that EXL3 checkpoints keep in bf16 runs as one kernel at decode-size N.
+static int exl3_bf16_pair_ok(const tq_qmma_weight_t *w0, const tq_qmma_weight_t *w1, int N) {
+    return w0->exl3 && w1->exl3 && w0->exl3_kbits == 0 && w1->exl3_kbits == 0 && w0->d_exl3_bf16 && w1->d_exl3_bf16 &&
+           w0->M == w1->M && w0->K == w1->K && (w0->K & 1023) == 0 &&
+           g_exl3_x && g_exl3_K == w0->K && g_exl3_N >= N;
+}
+static void exl3_bf16_pair_launch(const tq_qmma_weight_t *w0, float *out0, const tq_qmma_weight_t *w1, float *out1, int N) {
+    tq_launch(g_pdl_small, k_tq_exl3_bf16_pair, dim3(2 * w0->M, (N + 7) / 8), dim3(256), 0, g_qwen.stream,
+              out0, w0->d_exl3_bf16, out1, w1->d_exl3_bf16, g_exl3_x, w0->M, w0->K, N);
+}
 static int wide_proj_pair(const tq_qmma_weight_t *w0, float *out0, const tq_qmma_weight_t *w1, float *out1, int N) {
-    if (w0->exl3 && w1->exl3 && w0->exl3_kbits == 0 && w1->exl3_kbits == 0 && w0->d_exl3_bf16 && w1->d_exl3_bf16 &&
-        w0->M == w1->M && w0->K == w1->K && (w0->K & 1023) == 0 && N <= 16 &&
-        g_exl3_x && g_exl3_K == w0->K && g_exl3_N >= N) {
-        tq_launch(g_pdl_small, k_tq_exl3_bf16_pair, dim3(2 * w0->M, (N + 7) / 8), dim3(256), 0, g_qwen.stream,
-                  out0, w0->d_exl3_bf16, out1, w1->d_exl3_bf16, g_exl3_x, w0->M, w0->K, N);
-        return 0;
-    }
+    if (N <= 16 && exl3_bf16_pair_ok(w0, w1, N)) { exl3_bf16_pair_launch(w0, out0, w1, out1, N); return 0; }
     int ret = wide_proj(w0, out0, N);
     return ret != 0 ? ret : wide_proj(w1, out1, N);
+}
+// The verify wave: the pair kernel at any N (per-column math identical to the decode step's; the
+// block-per-row wide kernel reduces in another order).
+static int wide_proj_pair_seq(const tq_qmma_weight_t *w0, float *out0, const tq_qmma_weight_t *w1, float *out1, int N) {
+    if (exl3_bf16_pair_ok(w0, w1, N)) { exl3_bf16_pair_launch(w0, out0, w1, out1, N); return 0; }
+    return wide_proj_pair(w0, out0, w1, out1, N);
 }
 
 // Validation ABI: run one Linear of the loaded model through the wide path on host data.
@@ -22412,11 +22424,15 @@ static int paged_attn_gqa_mma_enabled(void) {
 
 // key splits for the GQA MMA decode kernel: enough (nkv x N x S) blocks to cover the SMs ~2x,
 // each split >= 2 super-tiles, at most 64 (the merge reads S partials per head).
+// TQ_PAGED_GQA_SPLIT=s pins the split (clamped by the context only, so a column's partition is the
+// same at any N: the bitwise verify-vs-decode check of analysis/spec_paged_check.py). Default auto.
 static int paged_gqa_split_S(int N, int pos_max) {
+    static int forced = -2;
+    if (forced == -2) { const char *e = getenv("TQ_PAGED_GQA_SPLIT"); forced = (e && *e) ? atoi(e) : -1; }
     int nst = (pos_max + 128) >> 7;
     int sm = paged_sm_count();
     int blocks0 = g_qwen.nkv * N;
-    int S = (2 * sm + blocks0 - 1) / blocks0;
+    int S = forced >= 1 ? forced : (2 * sm + blocks0 - 1) / blocks0;
     if (S > nst / 2) S = nst / 2;
     if (S > 64) S = 64;
     return S < 1 ? 1 : S;
@@ -22647,8 +22663,10 @@ static int     *h_free = NULL, *h_slot_nb = NULL;
 static int      g_pg_nfree = 0;
 static int      g_pg_page = 0, g_pg_plog = 0, g_pg_nblocks = 0, g_pg_maxslots = 0, g_pg_maxblk = 0;
 static int      g_pg_ready = 0;
+static void vf_free_all(void);                                       // spec verify/commit buffers (below)
 
 static void paged_free_all(void) {
+    vf_free_all();
     for (int L = 0; L < TQ_MAX_LAYERS; L++) {
         if (g_pool_k4[L]) { cudaFree(g_pool_k4[L]); g_pool_k4[L] = NULL; }
         if (g_pool_kq4s[L]) { cudaFree(g_pool_kq4s[L]); g_pool_kq4s[L] = NULL; }
@@ -23583,6 +23601,410 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
         if (seg_len[k] < 1) return -5;
     }
     return run_paged_prefill_wave_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, seg_final, K, T, out_seed);
+}
+
+// ===================== Speculative decoding on the paged pool: verify + commit =====================
+// qwn_paged_verify runs ONE ragged wave of K segments (slot i: its K_i draft tokens after the last
+// committed token plus the bonus column, T = sum(K_i + 1) <= TQ_VF_MAX_T columns) through the paged
+// DECODE-step kernels (not the prefill ones), with lm_head logits + argmax for EVERY column:
+//  - full-attention layers: all T columns' KV go into the pool first (the decode kv-write kernel), then
+//    the decode GQA kernel attends per column over [0..pos], so column t of a segment sees the segment's
+//    columns < t exactly as K_i + 1 sequential decode steps would. A rejected position's KV is simply
+//    overwritten by a later wave (the server owns the slot length; nothing reads past a column's pos).
+//  - DeltaNet layers: g_pg_conv / g_pg_recur are READ, not advanced. k_tq_linear_conv_seq_paged and
+//    k_tq_linear_core_seq_paged carry the conv window / the recurrent state through the segment in
+//    registers, column by column, with the per-token kernels' exact FP order (bit-identical to running
+//    k_tq_linear_conv_update_paged + k_tq_linear_decode_core_hs_paged K_i + 1 times). The pre-conv
+//    in_proj_qkv output and (b, a) of every column are kept per layer (g_vf_x/b/a, ~40 KB per column
+//    per layer) so qwn_paged_commit can replay the accepted prefix into the slot state: one read + one
+//    write of the slot's state per commit whatever the accepted length. No per-slot scratch state.
+//  - GEMMs run at T columns with 32-token units at most (g_exl3_ng_max = 4: fp32 accumulators, the
+//    decode step's regime) and the in_proj_b/a pair kernel at any T.
+// With the split pickers pinned (TQ_QMMA_SF_K_SPLIT, TQ_PAGED_GQA_SPLIT) the column logits are
+// bit-identical to the decode step's (analysis/spec_paged_check.py); unpinned, a column's k-splits
+// follow T instead of N (the same "not batch-invariant" band as decode at different N).
+#define TQ_VF_MAX_T 64
+#define TQ_VF_MAX_SEG 256
+static int    g_vf_cap = 0;                          // columns the kept-input buffers hold
+static float *g_vf_x[TQ_MAX_LAYERS] = {0};           // per linear layer: pre-conv in_proj_qkv output [cap][conv_dim]
+static float *g_vf_b[TQ_MAX_LAYERS] = {0};           // [cap][lvh]
+static float *g_vf_a[TQ_MAX_LAYERS] = {0};
+static float *g_vf_logits = NULL;                    // [cap][V] every column's logits (fp32)
+static int   *g_vf_argmax = NULL;                    // [cap]
+static float *g_vf_hidden = NULL;                    // [cap][H] pre-final-norm hidden of every column (MTP seeding)
+static int   *g_vf_iota = NULL;                      // 0..cap-1 (gated-norm column ids)
+static int   *g_vf_seg_d = NULL;                     // device: [3][TQ_VF_MAX_SEG] slot/off/len of the verify wave
+static int   *g_vf_cseg_d = NULL;                    // device: [3][TQ_VF_MAX_SEG] slot/off/len of a commit list
+static int    g_vf_K = 0, g_vf_T = 0;                // the pending verify wave (0 = none)
+static int    h_vf_seg_slot[TQ_VF_MAX_SEG], h_vf_seg_off[TQ_VF_MAX_SEG], h_vf_seg_len[TQ_VF_MAX_SEG];
+static int    h_vf_done[TQ_VF_MAX_SEG];
+static int    h_vf_cseg[3][TQ_VF_MAX_SEG];
+
+static void vf_free_all(void) {
+    for (int L = 0; L < TQ_MAX_LAYERS; L++) {
+        if (g_vf_x[L]) { cudaFree(g_vf_x[L]); g_vf_x[L] = NULL; }
+        if (g_vf_b[L]) { cudaFree(g_vf_b[L]); g_vf_b[L] = NULL; }
+        if (g_vf_a[L]) { cudaFree(g_vf_a[L]); g_vf_a[L] = NULL; }
+    }
+    if (g_vf_logits) { cudaFree(g_vf_logits); g_vf_logits = NULL; }
+    if (g_vf_argmax) { cudaFree(g_vf_argmax); g_vf_argmax = NULL; }
+    if (g_vf_hidden) { cudaFree(g_vf_hidden); g_vf_hidden = NULL; }
+    if (g_vf_iota) { cudaFree(g_vf_iota); g_vf_iota = NULL; }
+    if (g_vf_seg_d) { cudaFree(g_vf_seg_d); g_vf_seg_d = NULL; }
+    if (g_vf_cseg_d) { cudaFree(g_vf_cseg_d); g_vf_cseg_d = NULL; }
+    g_vf_cap = 0; g_vf_K = 0; g_vf_T = 0;
+}
+
+// Kept-input + logits buffers for waves of up to T columns (grown on demand, never shrunk).
+static int vf_ensure(int T) {
+    if (g_vf_cap >= T) return 0;
+    int cap = (T + 15) & ~15;
+    if (cap > TQ_VF_MAX_T) cap = TQ_VF_MAX_T;
+    if (cap < T) return -1;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
+    int conv_dim = 2 * lkh * ld + lvh * ld;
+    vf_free_all();
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+        if (cudaMalloc(&g_vf_x[L], (size_t)cap * conv_dim * sizeof(float)) != cudaSuccess) { vf_free_all(); return -2; }
+        if (cudaMalloc(&g_vf_b[L], (size_t)cap * lvh * sizeof(float)) != cudaSuccess) { vf_free_all(); return -2; }
+        if (cudaMalloc(&g_vf_a[L], (size_t)cap * lvh * sizeof(float)) != cudaSuccess) { vf_free_all(); return -2; }
+    }
+    if (cudaMalloc(&g_vf_logits, (size_t)cap * g_qwen.V * sizeof(float)) != cudaSuccess) { vf_free_all(); return -3; }
+    if (cudaMalloc(&g_vf_argmax, (size_t)cap * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
+    if (cudaMalloc(&g_vf_hidden, (size_t)cap * g_qwen.H * sizeof(float)) != cudaSuccess) { vf_free_all(); return -3; }
+    if (cudaMalloc(&g_vf_iota, (size_t)cap * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
+    if (cudaMalloc(&g_vf_seg_d, (size_t)3 * TQ_VF_MAX_SEG * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
+    if (cudaMalloc(&g_vf_cseg_d, (size_t)3 * TQ_VF_MAX_SEG * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
+    int hi[TQ_VF_MAX_T];
+    for (int i = 0; i < cap; i++) hi[i] = i;
+    cudaMemcpyAsync(g_vf_iota, hi, (size_t)cap * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaStreamSynchronize(g_qwen.stream);
+    g_vf_cap = cap;
+    return 0;
+}
+
+// Causal conv over the columns of each segment (grid.y), window loaded from the slot's conv state;
+// same shift + append + sum order as k_tq_linear_conv_update_paged per column. write_state=0 leaves
+// the slot state untouched (verify), 1 stores the final window (commit replay).
+__global__ void k_tq_linear_conv_seq_paged(float *out, float *state_base, const float *x,
+                                           const uint16_t *conv_weight, int channels, int kernel_size,
+                                           const int *seg_slot, const int *seg_off, const int *seg_len,
+                                           int state_stride, int write_state) {
+    tq_pdl_enter();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels) return;
+    int seg = blockIdx.y;
+    int slot = seg_slot[seg], off = seg_off[seg], n = seg_len[seg];
+    float *s = state_base + (size_t)slot * state_stride + (size_t)i * kernel_size;
+    const uint16_t *wt = conv_weight + (size_t)i * kernel_size;
+    float win[8];
+    for (int j = 0; j < kernel_size; j++) win[j] = s[j];
+    for (int t = 0; t < n; t++) {
+        const float *xn = x + (size_t)(off + t) * channels;
+        float sum = 0.0f;
+        for (int j = 0; j < kernel_size - 1; j++) { win[j] = win[j + 1]; sum += win[j] * tq_bf16_to_float(wt[j]); }
+        win[kernel_size - 1] = xn[i];
+        sum += xn[i] * tq_bf16_to_float(wt[kernel_size - 1]);
+        out[(size_t)(off + t) * channels + i] = sum / (1.0f + expf(-sum));
+    }
+    if (write_state) for (int j = 0; j < kernel_size; j++) s[j] = win[j];
+}
+
+// The per-token DeltaNet recurrence of k_tq_linear_decode_core_hs_paged<G, HS> carried through the
+// columns of a segment (grid.y) with the state slice in registers: same thread layout, same per-column
+// math and reduction order, so the column outputs and the final state equal n sequential launches of
+// the per-token kernel. core_out = NULL skips the core (commit replay); write_state stores the state.
+template <int G, int HS>
+__global__ void k_tq_linear_core_seq_paged(float *core_out, float *recurrent_state,
+                                           const float *qkv_conv, const float *b_proj, const float *a_proj,
+                                           const float *A_log, const uint16_t *dt_bias,
+                                           int value_heads, int key_heads, int dim,
+                                           const int *seg_slot, const int *seg_off, const int *seg_len,
+                                           int recur_stride, int conv_dim, int core_stride, int write_state) {
+    tq_pdl_enter();
+    extern __shared__ float smem[];
+    float *qn = smem, *kn = smem + dim, *red = smem + 2 * dim;
+    int seg = blockIdx.y;
+    int slot = seg_slot[seg], off = seg_off[seg], n = seg_len[seg];
+    float *rstate = recurrent_state + (size_t)slot * recur_stride;
+    int blk = blockIdx.x, head = blk / HS, part = blk % HS;
+    if (head >= value_heads) return;
+    int t = threadIdx.x, bs = blockDim.x;
+    int tids_per = dim / HS, tid_local = t / G, klane = t % G;
+    int tid = part * tids_per + tid_local;
+    int group = value_heads / key_heads, key_head = head / group, key_dim = key_heads * dim;
+    float *state = rstate + (size_t)head * dim * dim;
+    float st[(128 + G - 1) / G];
+    int nkk = 0;
+    for (int kk = klane; kk < dim; kk += G) st[nkk++] = state[(size_t)kk * dim + tid];
+    for (int s = 0; s < n; s++) {
+        int col = off + s;
+        const float *qc = qkv_conv + (size_t)col * conv_dim;
+        const float *q = qc + key_head * dim;
+        const float *k = qc + key_dim + key_head * dim;
+        const float *v = qc + 2 * key_dim + head * dim;
+        for (int i = t; i < dim; i += bs) red[i] = q[i] * q[i];
+        __syncthreads();
+        float qsum = tq_block_reduce_sum_sh(red, dim, t);
+        __syncthreads();
+        for (int i = t; i < dim; i += bs) red[i] = k[i] * k[i];
+        __syncthreads();
+        float ksum = tq_block_reduce_sum_sh(red, dim, t);
+        __syncthreads();
+        for (int i = t; i < dim; i += bs) {
+            qn[i] = q[i] * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
+            kn[i] = k[i] * rsqrtf(ksum + 1.0e-6f);
+        }
+        __syncthreads();
+        float beta = 1.0f / (1.0f + expf(-b_proj[(size_t)col * value_heads + head]));
+        float softplus_arg = a_proj[(size_t)col * value_heads + head] + tq_bf16_to_float(dt_bias[head]);
+        float softplus = log1pf(expf(-fabsf(softplus_arg))) + fmaxf(softplus_arg, 0.0f);
+        float gg = -expf(A_log[head]) * softplus;
+        float decay = expf(gg);
+        float psum = 0.0f;
+        nkk = 0;
+        for (int kk = klane; kk < dim; kk += G) {
+            float sval = st[nkk++];
+            psum += sval * kn[kk];
+        }
+        #pragma unroll
+        for (int o = G >> 1; o > 0; o >>= 1) psum += __shfl_down_sync(0xffffffffu, psum, o, G);
+        float kv_mem = __shfl_sync(0xffffffffu, psum, 0, G) * decay;
+        float delta = (v[tid] - kv_mem) * beta;
+        float pcore = 0.0f;
+        nkk = 0;
+        for (int kk = klane; kk < dim; kk += G) {
+            float newv = st[nkk] * decay + kn[kk] * delta;
+            st[nkk] = newv;
+            pcore += newv * qn[kk];
+            nkk++;
+        }
+        #pragma unroll
+        for (int o = G >> 1; o > 0; o >>= 1) pcore += __shfl_down_sync(0xffffffffu, pcore, o, G);
+        float core = __shfl_sync(0xffffffffu, pcore, 0, G);
+        if (core_out && klane == 0) core_out[(size_t)col * core_stride + head * dim + tid] = core;
+        __syncthreads();                                  // qn/kn/red are rebuilt for the next column
+    }
+    if (write_state) {
+        nkk = 0;
+        for (int kk = klane; kk < dim; kk += G) state[(size_t)kk * dim + tid] = st[nkk++];
+    }
+}
+
+// Launch the sequential core over nseg segments (device seg arrays). core_out NULL = state replay only.
+static int vf_linear_core_seq(tq_layer_t *l, float *core_out, float *recur_base, const float *qkv_conv,
+                              const float *bp, const float *ap, const int *seg_slot, const int *seg_off,
+                              const int *seg_len, int nseg, int recur_f, int conv_dim, int value_dim, int write_state) {
+    int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
+    int dim = g_qwen.linear_value_head_dim;
+    int lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
+    bool lc_par_ok = lc_g > 0 && dim > 0 && dim <= 128 && (dim & (dim - 1)) == 0 && dim * lc_g <= 1024;
+    bool lc_hs_ok = lc_par_ok && lc_hs >= 2 && (dim % lc_hs) == 0 && lc_g >= lc_hs &&
+                    ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) ||
+                     (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
+    if (!lc_hs_ok) return -1;
+    size_t shA = (size_t)3 * dim * sizeof(float);
+    int blkA = (dim / lc_hs) * lc_g;
+    dim3 gridA(heads * lc_hs, nseg);
+    #define VF_CORE_HS(GG, HH)                                                                    \
+        tq_launch(g_pdl_small, k_tq_linear_core_seq_paged<GG, HH>, gridA, dim3(blkA), shA, g_qwen.stream, \
+                  core_out, recur_base, qkv_conv, bp, ap, l->d_linear_A_log, l->d_linear_dt_bias,   \
+                  heads, key_heads, dim, seg_slot, seg_off, seg_len, recur_f, conv_dim, value_dim, write_state)
+    if (lc_g == 8 && lc_hs == 8) VF_CORE_HS(8, 8);
+    else if (lc_g == 8 && lc_hs == 4) VF_CORE_HS(8, 4);
+    else if (lc_g == 8 && lc_hs == 2) VF_CORE_HS(8, 2);
+    else if (lc_g == 4 && lc_hs == 4) VF_CORE_HS(4, 4);
+    else VF_CORE_HS(4, 2);
+    #undef VF_CORE_HS
+    return 0;
+}
+
+static int run_paged_verify_core(const int *tokens, const int *col_slot, const int *col_pos,
+                                 const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T) {
+    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
+    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
+    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
+    int ret;
+    if (ensure_wide_prefill_buffers(T) != 0) return -90;
+    if (ensure_pf_colslot(T) != 0) return -90;
+    if (vf_ensure(T) != 0) return -90;
+    int vf_maxpos = 0;
+    for (int k = 0; k < K; k++) {
+        int last_pos = col_pos[seg_off[k] + seg_len[k] - 1];
+        if (paged_ensure_blocks(seg_slot[k], last_pos) != 0) return -91;     // pool full
+        if (last_pos > vf_maxpos) vf_maxpos = last_pos;
+    }
+    for (int k = 0; k < K; k++) { h_vf_seg_slot[k] = seg_slot[k]; h_vf_seg_off[k] = seg_off[k]; h_vf_seg_len[k] = seg_len[k]; }
+    cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
+                    cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_vf_seg_d, h_vf_seg_slot, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_vf_seg_d + TQ_VF_MAX_SEG, h_vf_seg_off, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_vf_seg_d + 2 * TQ_VF_MAX_SEG, h_vf_seg_len, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    const int *d_sslot = g_vf_seg_d, *d_soff = g_vf_seg_d + TQ_VF_MAX_SEG, *d_slen = g_vf_seg_d + 2 * TQ_VF_MAX_SEG;
+    for (int j = 0; j < T; j++)
+        k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
+            g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    for (int L = 0; L < g_qwen.L; L++) {
+        tq_layer_t *l = &g_qwen.layers[L];
+        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
+            if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
+                  tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
+            tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                      g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -64;
+            const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
+            float *qkv_out[3] = {g_wide_q, g_wide_k, g_wide_v};
+            if ((ret = wide_proj_group(qkv, qkv_out, 3, T)) != 0) return -64;
+            if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
+                                     g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
+                                     g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
+                                     T, vf_maxpos, L, col_pos, col_slot, 1, g_qwen.stream) != 0) return -67;
+            if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -68;
+            if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -68;
+            tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)T * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                      g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)T * H));
+            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -69;
+        } else {
+            if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
+                  tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
+                  tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
+                  tq_wide_fmt_ok(&l->mlp_down))) return -70;
+            tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                      g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -71;
+            const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
+            float *qz_out[2] = {g_vf_x[L], g_wide_z};                  // pre-conv input kept for the commit
+            if ((ret = wide_proj_group(qz, qz_out, 2, T)) != 0) return -71;
+            if ((ret = wide_proj_pair_seq(&l->linear_in_b, g_vf_b[L], &l->linear_in_a, g_vf_a[L], T)) != 0) return -73;
+            tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged, dim3((conv_dim + 255) / 256, K), dim3(256), 0,
+                      g_qwen.stream, g_wide_qkv, g_pg_conv[L], (const float *)g_vf_x[L], l->d_linear_conv1d, conv_dim,
+                      g_qwen.linear_conv_kernel_dim, d_sslot, d_soff, d_slen, conv_f, 0);
+            if (vf_linear_core_seq(l, g_wide_lcore, g_pg_recur[L], g_wide_qkv, g_vf_b[L], g_vf_a[L],
+                                   d_sslot, d_soff, d_slen, K, recur_f, conv_dim, value_dim, 0) != 0) return -75;
+            tq_launch(g_pdl_small, k_tq_linear_decode_gated_norm_b, dim3(lvh, T), dim3(ld), (size_t)ld * sizeof(float),
+                      g_qwen.stream, g_wide_lcore, g_wide_z, l->d_linear_norm, lvh, ld, g_qwen.eps, g_vf_iota, value_dim);
+            if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -76;
+            if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -76;
+            tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)T * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                      g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)T * H));
+            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -77;
+        }
+    }
+    cudaMemcpyAsync(g_vf_hidden, g_wide_h, (size_t)T * H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+    tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+              g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+    if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -78;
+    if ((ret = wide_proj(&g_qwen.lm_head, g_vf_logits, T)) != 0) return -78;
+    tq_launch(g_pdl_small, k_tq_batched_argmax, dim3(T), dim3(256), 0, g_qwen.stream,
+              g_vf_argmax, g_vf_logits, g_qwen.V, T);
+    if (g_pg_sink) {
+        if (T > g_pg_sink_cap) return -81;
+        cudaMemcpyAsync(g_pg_sink, g_vf_logits, (size_t)T * g_qwen.V * sizeof(float),
+                        cudaMemcpyDeviceToDevice, g_qwen.stream);
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -80;
+}
+
+// ABI. tokens/col_slot/col_pos: T concatenated columns; seg_slot/seg_off/seg_len: K segments covering
+// them in order (one segment per slot, columns of a segment at consecutive positions). out_argmax[T]
+// = greedy token after every column. The DeltaNet slot states are left untouched: call
+// qwn_paged_commit for the accepted prefix of every segment before anything else touches these slots.
+// Needs the wide (EXL3) lm_head; T <= 64.
+extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const int *col_pos,
+                                const int *seg_slot, const int *seg_off, const int *seg_len,
+                                int K, int T, int *out_argmax) {
+    if (!g_pg_ready) return -1;
+    if (!g_qwen.kv_q4) return -2;
+    if (!paged_lm_head_wide()) return -3;
+    if (K < 1 || K > TQ_VF_MAX_SEG || K > g_pg_maxslots || T < 1 || T > TQ_VF_MAX_T || K > T) return -4;
+    int next = 0;
+    for (int k = 0; k < K; k++) {
+        int slot = seg_slot[k], off = seg_off[k], n = seg_len[k];
+        if (slot < 0 || slot >= g_pg_maxslots) return -5;
+        if (n < 1 || off != next || off + n > T) return -6;
+        for (int j = 0; j < k; j++) if (seg_slot[j] == slot) return -7;      // one segment per slot
+        for (int t = 0; t < n; t++) {
+            if (col_slot[off + t] != slot || col_pos[off + t] != col_pos[off] + t) return -8;
+            if (col_pos[off + t] < 0 || col_pos[off + t] >= g_qwen.max_seq) return -9;
+        }
+        next = off + n;
+    }
+    if (next != T) return -6;
+    int pdl = tq_pdl_enabled();
+    g_pdl_on = pdl != 0;
+    g_pdl_small = pdl == 2;
+    g_exl3_ng_max = 4;
+    g_vf_K = 0;
+    int ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    g_exl3_ng_max = 16;
+    g_pdl_on = g_pdl_small = 0;
+    if (ret != 0) { cudaStreamSynchronize(g_qwen.stream); return ret; }
+    g_vf_K = K; g_vf_T = T;
+    for (int k = 0; k < K; k++) h_vf_done[k] = 0;
+    if (out_argmax)
+        cudaMemcpyAsync(out_argmax, g_vf_argmax, (size_t)T * sizeof(int), cudaMemcpyDeviceToHost, g_qwen.stream);
+    return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -10;
+}
+
+// Commit the first n_accept[i] columns of segment seg_idx[i] of the pending verify wave into the slot's
+// DeltaNet state (conv window + recurrence replayed from the kept inputs; the KV is already in the
+// pool). n_accept = 0 discards the segment. Each segment commits at most once; the wave stays pending
+// until the next qwn_paged_verify.
+extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) {
+    if (!g_pg_ready) return -1;
+    if (g_vf_K <= 0) return -2;
+    if (M < 1 || M > g_vf_K) return -3;
+    int m = 0;
+    for (int i = 0; i < M; i++) {
+        int k = seg_idx[i], n = n_accept[i];
+        if (k < 0 || k >= g_vf_K) return -4;
+        if (h_vf_done[k]) return -5;
+        if (n < 0 || n > h_vf_seg_len[k]) return -6;
+        for (int j = 0; j < i; j++) if (seg_idx[j] == k) return -5;
+    }
+    for (int i = 0; i < M; i++) {
+        int k = seg_idx[i], n = n_accept[i];
+        h_vf_done[k] = 1;
+        if (n == 0) continue;
+        h_vf_cseg[0][m] = h_vf_seg_slot[k]; h_vf_cseg[1][m] = h_vf_seg_off[k]; h_vf_cseg[2][m] = n;
+        m++;
+    }
+    if (m == 0) return 0;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
+    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
+    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
+    for (int c = 0; c < 3; c++)
+        cudaMemcpyAsync(g_vf_cseg_d + c * TQ_VF_MAX_SEG, h_vf_cseg[c], (size_t)m * sizeof(int),
+                        cudaMemcpyHostToDevice, g_qwen.stream);
+    const int *d_cslot = g_vf_cseg_d, *d_coff = g_vf_cseg_d + TQ_VF_MAX_SEG, *d_clen = g_vf_cseg_d + 2 * TQ_VF_MAX_SEG;
+    int pdl = tq_pdl_enabled();
+    g_pdl_small = pdl == 2;
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+        tq_layer_t *l = &g_qwen.layers[L];
+        tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged, dim3((conv_dim + 255) / 256, m), dim3(256), 0,
+                  g_qwen.stream, g_wide_conv, g_pg_conv[L], (const float *)g_vf_x[L], l->d_linear_conv1d, conv_dim,
+                  g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f, 1);
+        if (vf_linear_core_seq(l, NULL, g_pg_recur[L], g_wide_conv, g_vf_b[L], g_vf_a[L],
+                               d_cslot, d_coff, d_clen, m, recur_f, conv_dim, value_dim, 1) != 0) {
+            g_pdl_small = 0;
+            return -7;
+        }
+    }
+    g_pdl_small = 0;
+    if (cudaGetLastError() != cudaSuccess) return -8;
+    return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -9;
+}
+
+// Device pointer to the pending wave's pre-final-norm hidden states ([T][H] fp32; column c of the
+// last qwn_paged_verify) for the MTP drafter; NULL when no wave is pending.
+extern "C" const float *qwn_paged_verify_hidden(int *out_T) {
+    if (out_T) *out_T = g_vf_K > 0 ? g_vf_T : 0;
+    return g_vf_K > 0 ? g_vf_hidden : NULL;
 }
 
 // ============================ Chunked prefill ============================
