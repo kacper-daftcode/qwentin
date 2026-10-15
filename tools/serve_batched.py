@@ -683,7 +683,11 @@ class BatchedEngine:
                             self._mixed_wave(); did_decode = True
                             for _ in range(self.decode_steps_per_wave):
                                 if self.active:
-                                    self._step()
+                                    # with --spec a round (3-5 tokens per slot) instead of a step
+                                    if self.spec and self.spec_on:
+                                        self._round()
+                                    else:
+                                        self._step()
                         else:
                             self._prefill_step(self.prefill_waves_per_step if self.active else 8)
                     except Exception as e:
@@ -1027,6 +1031,9 @@ def make_handler(eng, tok, args):
                 ids = tok(body.get("prompt", ""), add_special_tokens=False).input_ids
             req = eng.submit(list(ids), max_new, eos)
             cid = f"chatcmpl-{int(time.time()*1000)}"
+            if eng.log_admits:
+                print(f"[req] {self.client_address[0]}:{self.client_address[1]} prompt {len(ids)} max_new {max_new} "
+                      f"stream {int(stream)} queued {len(eng.q)} active {len(eng.active)}", flush=True)
             include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
             if stream and is_chat and not tools:
                 self._stream_tokens(req, cid, max_new, include_usage); return
@@ -1199,7 +1206,8 @@ def main():
     ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
     ap.add_argument("--decode-steps-per-wave", type=int, default=0,
                     help="extra pure decode steps after each mixed prefill wave (decoders get 1+k tokens "
-                         "per wave; prefill slows by ~k x 25%%). 0 = one token per wave.")
+                         "per wave; prefill slows by ~k x 25%%). 0 = one token per wave. With --spec each extra "
+                         "step is a speculative round (3-5 tokens per slot for ~20-30 ms).")
     ap.add_argument("--park-ram-gb", type=float, default=64.0,
                     help="host-RAM budget for parked sessions evicted from the GPU (KV blocks + DeltaNet "
                          "state, ~26 KiB/token + 155 MiB each; LRU). 0 disables the host tier. Needs the "
