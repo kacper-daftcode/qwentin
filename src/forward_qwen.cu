@@ -21965,7 +21965,7 @@ __global__ void k_tq_paged_attn_kv_write_q4(
 #define TQ_T4_L       12
 #define TQ_T4_NT      256                     // threads = predecessor classes = 2^(L-4)
 #define TQ_T4_MROW    20
-#define TQ_T4_CHUNK   1536                    // tiles per launch (48 MB traceback scratch; a 128-column wave layer = 1024, a decode step N x 128)
+#define TQ_T4_CHUNK   65536                   // tiles per launch (grid.x; no scratch since the fused kernel)
 #define TQ_T4_MAXL    16                      // full-attention layers per job
 #define TQ_T4_MAXR    64                      // position ranges per job (slots x page straddles)
 struct tq_t4_job {
@@ -22012,23 +22012,24 @@ static __device__ __forceinline__ void tq_t4_tile_coords(const tq_t4_job &jb, in
     srow = (size_t)jb.src_row0[r] + t;
     drow = (size_t)jb.dst_row0[r] + t;
 }
-// forward pass: x from the fp16 staging row (unit RMS, fp16-rounded scale as kv_fakequant), traceback
-// rows to tb [tile][256][32 words], best end state + scale bits per tile
-__global__ void __launch_bounds__(TQ_T4_NT, 5)
-k_t4_forward(const tq_t4_job jb, const float *__restrict__ cb, uint32_t *__restrict__ tb,
-             int32_t *__restrict__ best, uint16_t *__restrict__ scale_bits) {
+// Fused encode, one CTA per tile: the Viterbi forward pass with the traceback in SHARED memory (256 steps x 256
+// classes x 4 bits = 32 KB) and the walk by one thread right after the block argmin (255 dependent smem reads,
+// ~3 us) -- the two-kernel version with the traceback in global memory was latency-bound at ~100 us per launch for
+// the small batches of a verify wave / decode step (255 dependent L2 loads per tile). x from the fp16 staging row,
+// unit RMS with the fp16-rounded scale (kv_fakequant), codes + side word straight into the pool rows.
+__global__ void __launch_bounds__(TQ_T4_NT, 2)
+k_t4_encode(const tq_t4_job jb, const float *__restrict__ cb) {
     constexpr int NT = TQ_T4_NT, NG = NT / 16, NW = NT / 32, SH = TQ_T4_L - 4;
     __shared__ float xs[256];
     __shared__ __align__(16) float ms[2][NG * TQ_T4_MROW];
     __shared__ float rv[NW];
     __shared__ int rs[NW];
+    __shared__ uint32_t tbs[256 * (NT / 8)];           // traceback nibbles: [step][class / 8]
     const int tile = blockIdx.x, i = threadIdx.x, lane = i & 31, warp = i >> 5, g = i >> 4;
     int fl, h, kv;
     size_t srow, drow;
     tq_t4_tile_coords(jb, jb.tile0 + tile, fl, srow, drow, h, kv);
     const uint16_t *src = jb.src[fl] + ((srow * jb.nkv + h) << 9) + kv * 256;
-    uint32_t *tbt = tb + (size_t)tile * 256 * (NT / 8) + (i >> 3);
-    // unit-RMS input: rms = fp16(sqrt(mean(x^2))) (clamped), x /= rms  -- as kv_fakequant._bitshift_rows
     const float xi = __half2float(__ushort_as_half(src[i]));
     float ss = xi * xi;
     #pragma unroll
@@ -22041,7 +22042,6 @@ k_t4_forward(const tq_t4_job jb, const float *__restrict__ cb, uint32_t *__restr
     float rms = __half2float(__float2half(sqrtf(tot * (1.0f / 256.0f))));
     if (!(rms > 1e-12f)) rms = 1e-12f;
     xs[i] = xi / rms;
-    if (i == 0) scale_bits[tile] = __half_as_ushort(__float2half(rms));
     float cbv[16], cost[16];
     #pragma unroll
     for (int j = 0; j < 16; ++j) cbv[j] = cb[(j << SH) | i];
@@ -22065,7 +22065,7 @@ k_t4_forward(const tq_t4_job jb, const float *__restrict__ cb, uint32_t *__restr
         w |= __shfl_down_sync(0xffffffffu, w, 1) << 4;
         w |= __shfl_down_sync(0xffffffffu, w, 2) << 8;
         w |= __shfl_down_sync(0xffffffffu, w, 4) << 16;
-        if ((lane & 7) == 0) tbt[(size_t)st * (NT / 8)] = w;
+        if ((lane & 7) == 0) tbs[st * (NT / 8) + (i >> 3)] = w;
         __syncthreads();
         const float xt = xs[st];
         const float4 *mr = par ? mrow1 : mrow0;
@@ -22097,35 +22097,22 @@ k_t4_forward(const tq_t4_job jb, const float *__restrict__ cb, uint32_t *__restr
             const int s2 = rs[k];
             if (v2 < v || (v2 == v && s2 < s)) { v = v2; s = s2; }
         }
-        best[tile] = s;
+        // the walk: 128 code bytes (symbol pairs, low nibble first) + the side word (prefix | fp16 scale << 8)
+        uint8_t *codes = (kv ? jb.dv[fl] : jb.dk[fl]) + (drow * jb.nkv + h) * 128;
+        uint8_t *side = (kv ? jb.sv[fl] : jb.sk[fl]) + (drow * jb.nkv + h) * 4;
+        uint32_t byte = 0;
+        for (int st = 255; st > 0; --st) {
+            const uint32_t b = (uint32_t)(s & 15);
+            if (st & 1) byte = b << 4; else codes[st >> 1] = (uint8_t)(byte | b);
+            const int c = s >> 4;
+            const uint32_t w = tbs[st * (NT / 8) + (c >> 3)];
+            const int nib = (int)((w >> ((c & 7) * 4)) & 15u);
+            s = c | (nib << SH);
+        }
+        codes[0] = (uint8_t)(byte | (uint32_t)(s & 15));                       // b_1 << 4 | b_0
+        const uint32_t prefix = (uint32_t)((s >> 8) & 15) | ((uint32_t)((s >> 4) & 15) << 4);
+        *(uint32_t *)side = prefix | ((uint32_t)__half_as_ushort(__float2half(rms)) << 8);
     }
-}
-// traceback walk, one thread per tile: the 128 code bytes (symbol pairs, low nibble first) into the
-// page's pool rows, the side word (prefix | fp16 scale << 8)
-__global__ void k_t4_walk(const tq_t4_job jb, const uint32_t *__restrict__ tb, const int32_t *__restrict__ best,
-                          const uint16_t *__restrict__ scale_bits, int ntiles) {
-    constexpr int NT = TQ_T4_NT, SH = TQ_T4_L - 4;
-    const int tile = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tile >= ntiles) return;
-    int fl, h, kv;
-    size_t srow, row;
-    tq_t4_tile_coords(jb, jb.tile0 + tile, fl, srow, row, h, kv);
-    uint8_t *codes = (kv ? jb.dv[fl] : jb.dk[fl]) + (row * jb.nkv + h) * 128;
-    uint8_t *side = (kv ? jb.sv[fl] : jb.sk[fl]) + (row * jb.nkv + h) * 4;
-    const uint32_t *tbt = tb + (size_t)tile * 256 * (NT / 8);
-    int s = best[tile];
-    uint32_t byte = 0;
-    for (int st = 255; st > 0; --st) {
-        const uint32_t b = (uint32_t)(s & 15);
-        if (st & 1) byte = b << 4; else codes[st >> 1] = (uint8_t)(byte | b);
-        const int c = s >> 4;
-        const uint32_t w = tbt[(size_t)st * (NT / 8) + (c >> 3)];
-        const int nib = (int)((w >> ((c & 7) * 4)) & 15u);
-        s = c | (nib << SH);
-    }
-    codes[0] = (uint8_t)(byte | (uint32_t)(s & 15));                       // b_1 << 4 | b_0
-    const uint32_t prefix = (uint32_t)((s >> 8) & 15) | ((uint32_t)((s >> 4) & 15) << 4);
-    *(uint32_t *)side = prefix | ((uint32_t)scale_bits[tile] << 8);
 }
 
 // T4 = 1 (TQ_KV_T4): rows of complete pages are trellis codes (pr_chunk >= 0), rows of the slot's open
@@ -24944,8 +24931,6 @@ static uint8_t *g_t4_kside[TQ_MAX_LAYERS] = {0}, *g_t4_vside[TQ_MAX_LAYERS] = {0
 static uint16_t *g_t4_stg_f16[TQ_MAX_LAYERS] = {0};
 static float   *g_t4_cb = NULL;                       // [4096] fp32 codebook (analysis order)
 static uint16_t *g_t4_tab = NULL;                     // [4096] fp16 table (engine nibble order)
-static uint32_t *g_t4_tb = NULL;                      // encoder traceback scratch (TQ_T4_CHUNK tiles)
-static int32_t *g_t4_best = NULL;  static uint16_t *g_t4_scale = NULL;
 static int     *h_slot_encl = NULL, *h_t4_encl_tmp = NULL;   // per slot: encoded length (host), wave view
 static int     *g_t4_encl_d = NULL;                          // device copy read by the T4 attention kernels
 static int g_t4_stg_rows = 0;
@@ -25336,8 +25321,7 @@ static int paged_t4_encode_ranges(const tq_t4_ranges &rg, int only_layer, cudaSt
     for (int t0 = 0; t0 < ntiles; t0 += TQ_T4_CHUNK) {
         int n = ntiles - t0 < TQ_T4_CHUNK ? ntiles - t0 : TQ_T4_CHUNK;
         jb.tile0 = t0;
-        k_t4_forward<<<n, TQ_T4_NT, 0, st>>>(jb, g_t4_cb, g_t4_tb, g_t4_best, g_t4_scale);
-        k_t4_walk<<<(n + 127) / 128, 128, 0, st>>>(jb, g_t4_tb, g_t4_best, g_t4_scale, n);
+        k_t4_encode<<<n, TQ_T4_NT, 0, st>>>(jb, g_t4_cb);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -4;
 }
@@ -25446,9 +25430,6 @@ static void paged_t4_free(void) {
     }
     if (g_t4_cb) { cudaFree(g_t4_cb); g_t4_cb = NULL; }
     if (g_t4_tab) { cudaFree(g_t4_tab); g_t4_tab = NULL; }
-    if (g_t4_tb) { cudaFree(g_t4_tb); g_t4_tb = NULL; }
-    if (g_t4_best) { cudaFree(g_t4_best); g_t4_best = NULL; }
-    if (g_t4_scale) { cudaFree(g_t4_scale); g_t4_scale = NULL; }
     if (g_t4_encl_d) { cudaFree(g_t4_encl_d); g_t4_encl_d = NULL; }
     if (g_t4_stream) { cudaStreamSynchronize(g_t4_stream); cudaStreamDestroy(g_t4_stream); g_t4_stream = NULL; }
     if (g_t4_ev) { cudaEventDestroy(g_t4_ev); g_t4_ev = NULL; }
@@ -25503,9 +25484,6 @@ static int paged_t4_alloc(int max_slots, int num_blocks, int page) {
         cudaMemsetAsync(g_t4_stg_f16[L], 0, f16b, g_qwen.stream);
     }
     if (cudaMalloc(&g_t4_cb, 4096 * sizeof(float)) != cudaSuccess || cudaMalloc(&g_t4_tab, 4096 * sizeof(uint16_t)) != cudaSuccess ||
-        cudaMalloc(&g_t4_tb, (size_t)TQ_T4_CHUNK * 256 * (TQ_T4_NT / 8) * sizeof(uint32_t)) != cudaSuccess ||
-        cudaMalloc(&g_t4_best, (size_t)TQ_T4_CHUNK * sizeof(int32_t)) != cudaSuccess ||
-        cudaMalloc(&g_t4_scale, (size_t)TQ_T4_CHUNK * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&g_t4_encl_d, (size_t)max_slots * sizeof(int)) != cudaSuccess) return -2;
     cudaMemsetAsync(g_t4_encl_d, 0, (size_t)max_slots * sizeof(int), g_qwen.stream);
     { const char *e = getenv("TQ_KV_T4_ASYNC"); g_t4_async = (e && *e) ? (atoi(e) != 0) : 1; }
