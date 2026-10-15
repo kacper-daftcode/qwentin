@@ -57,6 +57,9 @@ FLAG_HAS_MTP = 1 << 10  # native MTP head section appended after the payload (en
 # holds <IIII kbits K M codebook> + suh fp16[K] + svh fp16[M] + trellis int16[K/16][M/16][16*kbits];
 # kbits == 0 means the checkpoint kept that Linear unquantized -> bf16 [M][K] follows instead.
 FLAG_EXL3_WEIGHTS = 1 << 11
+# The MTP section's 8 projections (fc, q/k/v/o, gate/up/down) are EXL3 trellis records from the EXL3 checkpoint
+# (--mtp-exl3; the norms stay bf16) instead of bf16 matrices: 0.85 -> ~0.25 GB on the device for the paged drafter.
+FLAG_MTP_EXL3 = 1 << 12
 
 COMMON_SUFFIXES = (
     "input_layernorm.weight",
@@ -882,8 +885,12 @@ def mtp_tensor_specs(config) -> list[TensorSpec]:
     ]
 
 
+def mtp_is_projection(spec: TensorSpec) -> bool:
+    return len(spec.shape) == 2
+
+
 def build_header(config, dtype_id: int, names: set[str], block_scaled: bool, block_layout: str,
-                 emit_mtp: bool = False, exl3: bool = False) -> bytes:
+                 emit_mtp: bool = False, exl3: bool = False, mtp_exl3: bool = False) -> bytes:
     text = as_text_config(config)
     rope = getattr(text, "rope_parameters", {}) or {}
     layer_types = list(text.layer_types)
@@ -914,6 +921,8 @@ def build_header(config, dtype_id: int, names: set[str], block_scaled: bool, blo
         flags |= FLAG_SPARSE_24_E2M3
     if emit_mtp:
         flags |= FLAG_HAS_MTP
+        if mtp_exl3:
+            flags |= FLAG_MTP_EXL3
     if exl3:
         flags |= FLAG_EXL3_WEIGHTS
 
@@ -982,6 +991,7 @@ def write_tqf(
     block_layout: str,
     exl3_mode: str = "auto",
     mtp_source: str | None = None,
+    mtp_exl3: bool = False,
 ) -> dict[str, Any]:
     model_dir = Path(model_path)
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -1028,12 +1038,24 @@ def write_tqf(
         # section from --mtp-source (the original bf16 model directory) when given.
         mtp_store = mtp_store_cm.__enter__() if mtp_store_cm is not None else store
         mtp_specs = mtp_tensor_specs(cfg)
-        emit_mtp = mtp_emit_enabled() and all(s.name in mtp_store.names() for s in mtp_specs)
-        if mtp_emit_enabled() and not emit_mtp:
+        if mtp_exl3:
+            # --mtp-exl3: the 8 projections as EXL3 records from the EXL3 checkpoint itself (norms bf16 from it too)
+            if not exl3 or mtp_store is not store:
+                raise ValueError("--mtp-exl3 needs an EXL3 source checkpoint and no --mtp-source")
+            def _mtp_present(s):
+                return exl3_has_linear(store.names(), s) if mtp_is_projection(s) else s.name in store.names()
+            emit_mtp = mtp_emit_enabled() and all(_mtp_present(s) for s in mtp_specs)
+            missing_mtp = [s.name for s in mtp_specs if not _mtp_present(s)]
+        else:
+            emit_mtp = mtp_emit_enabled() and all(s.name in mtp_store.names() for s in mtp_specs)
             missing_mtp = [s.name for s in mtp_specs if s.name not in mtp_store.names()]
+        if mtp_emit_enabled() and not emit_mtp:
             print(f"  TQ_EMIT_MTP set but model lacks MTP tensors {missing_mtp}; MTP section NOT emitted")
+        if emit_mtp and mtp_exl3:
+            print(f"  MTP projections as EXL3 records (flag 0x{FLAG_MTP_EXL3:x})")
 
-        header = build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp, exl3)
+        header = build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp, exl3,
+                              emit_mtp and mtp_exl3)
         bytes_written = len(header)
         kind_counts: dict[str, int] = {}
         output_file = None
@@ -1090,6 +1112,11 @@ def write_tqf(
             if emit_mtp:
                 print("  -- MTP head section (TQ_EMIT_MTP) --")
                 for spec in mtp_specs:
+                    if mtp_exl3 and mtp_is_projection(spec):
+                        kind_counts["qm8"] = kind_counts.get("qm8", 0) + 1
+                        size = write_exl3_record(output_file, store, spec, dry_run)
+                        bytes_written += size
+                        continue
                     kind_counts[spec.kind] = kind_counts.get(spec.kind, 0) + 1
                     # FP8 checkpoints quantize most mtp.layers.0 projections
                     # (weight + weight_scale_inv); deblock so the stored BF16
@@ -1138,6 +1165,7 @@ def write_tqf(
         "block_scale_policy": block_scale_policy if block_scaled else None,
         "block_layout": block_layout if block_scaled else None,
         "emit_mtp": emit_mtp,
+        "mtp_exl3": bool(emit_mtp and mtp_exl3),
         "mtp_tensor_count": len(mtp_specs) if emit_mtp else 0,
     }
 
@@ -1192,6 +1220,12 @@ def main() -> None:
         default=None,
         help="Model directory to take the bf16 MTP head from (an EXL3 checkpoint quantizes it); with TQ_EMIT_MTP=1",
     )
+    parser.add_argument(
+        "--mtp-exl3",
+        action="store_true",
+        help="With TQ_EMIT_MTP=1 on an EXL3 source: store the MTP projections as its EXL3 records (flag 0x1000) "
+             "instead of bf16 matrices (the batched server's paged drafter reads them; the single-stream MTP path cannot)",
+    )
     args = parser.parse_args()
 
     summary = write_tqf(
@@ -1204,6 +1238,7 @@ def main() -> None:
         args.block_layout,
         args.exl3,
         args.mtp_source,
+        args.mtp_exl3,
     )
     print(json.dumps(summary, indent=2))
     if not args.dry_run:

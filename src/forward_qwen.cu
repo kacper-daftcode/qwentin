@@ -36,6 +36,8 @@
 // Linear weights are EXL3 trellis records copied from an exllamav3 checkpoint (see
 // tools/convert_qwen_tqf.py write_exl3_record); dequantized per 16x16 tile at run time.
 #define TQ_FLAG_EXL3_WEIGHTS (1u << 11)
+// The MTP section's 8 projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3) instead of bf16.
+#define TQ_FLAG_MTP_EXL3 (1u << 12)
 #define TQ_MTP_TOPK_MAX 64
 #define TQ_MTP_MAX_DEPTH 15  // max MTP covering-tree depth (16-slot KV archive: root + 15)
 
@@ -279,6 +281,12 @@ typedef struct {
     // fc, q, k, v, o, gate, up, down.
     tq_qmma_weight_t mtp_qw[8];
     int mtp_quant_ready;
+    // TQ_FLAG_MTP_EXL3 (tqf from convert_qwen_tqf.py --mtp-exl3): the 8 projections are EXL3 records
+    // loaded into mtp_layer.{q,k,v,o}_proj / mlp_{gate,up,down} and mtp_fc_x, read by the paged drafter
+    // (qwn_paged_mtp_*) through the wide path; the bf16 buffers above stay NULL and the single-stream
+    // MTP entry points refuse (-40).
+    tq_qmma_weight_t mtp_fc_x;
+    int mtp_exl3;
     uint16_t *d_mtp_pre_fc_norm_emb;
     uint16_t *d_mtp_pre_fc_norm_hidden;
     uint16_t *d_mtp_norm;
@@ -11227,6 +11235,12 @@ extern "C" void qwn_free(void) {
         if (g_qwen.mtp_gate.d_w) cudaFree(g_qwen.mtp_gate.d_w);
         if (g_qwen.mtp_up.d_w) cudaFree(g_qwen.mtp_up.d_w);
         if (g_qwen.mtp_down.d_w) cudaFree(g_qwen.mtp_down.d_w);
+        if (g_qwen.mtp_exl3) {                     // EXL3 MTP projections (paged drafter)
+            free_qmma(&g_qwen.mtp_fc_x);
+            free_qmma(&m->q_proj); free_qmma(&m->k_proj); free_qmma(&m->v_proj); free_qmma(&m->o_proj);
+            free_qmma(&m->mlp_gate); free_qmma(&m->mlp_up); free_qmma(&m->mlp_down);
+            g_qwen.mtp_exl3 = 0;
+        }
         if (g_qwen.d_mtp_pre_fc_norm_emb) cudaFree(g_qwen.d_mtp_pre_fc_norm_emb);
         if (g_qwen.d_mtp_pre_fc_norm_hidden) cudaFree(g_qwen.d_mtp_pre_fc_norm_hidden);
         if (g_qwen.d_mtp_norm) cudaFree(g_qwen.d_mtp_norm);
@@ -11540,29 +11554,36 @@ static int parse_tqf(const char *path, int upload) {
         int q_m = g_qwen.nh * g_qwen.hd * 2;
         int kv_m = g_qwen.nkv * g_qwen.hd;
         int attn_m = g_qwen.nh * g_qwen.hd;
-        // All 8 MTP projections are FULL-PRECISION BF16 (non_quant). Order MUST match
-        // mtp_tensor_specs() in tools/convert_qwen_tqf.py.
+        // All 8 MTP projections are FULL-PRECISION BF16 (non_quant), or EXL3 records with
+        // TQ_FLAG_MTP_EXL3 (--mtp-exl3). Order MUST match mtp_tensor_specs() in tools/convert_qwen_tqf.py.
+        int mtp_exl3 = (g_qwen.flags & TQ_FLAG_MTP_EXL3) != 0;
         #define TQ_READ_MTP_BF16(W, MM, KK, NAME)                                              \
             do { (W).M = (MM); (W).K = (KK);                                                   \
                  if (read_non_quant(f, &(W).d_w, (size_t)(MM) * (KK), NAME, mup) != 0) {        \
                      fclose(f); return -1; } } while (0)
+        #define TQ_READ_MTP_PROJ(W, XW, MM, KK, NAME)                                          \
+            do { if (mtp_exl3) { if (read_exl3(f, &(XW), (MM), (KK), NAME, mup) != 0) { fclose(f); return -1; } } \
+                 else TQ_READ_MTP_BF16(W, MM, KK, NAME); } while (0)
         if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_emb, g_qwen.H, "mtp.pre_fc_norm_emb", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_hidden, g_qwen.H, "mtp.pre_fc_norm_hidden", mup) != 0) { fclose(f); return -1; }
-        TQ_READ_MTP_BF16(g_qwen.mtp_fc, g_qwen.H, 2 * g_qwen.H, "mtp.fc");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_fc, g_qwen.mtp_fc_x, g_qwen.H, 2 * g_qwen.H, "mtp.fc");
         if (read_non_quant(f, &m->d_input_ln, g_qwen.H, "mtp.input_ln", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &m->d_post_ln, g_qwen.H, "mtp.post_ln", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &m->d_q_norm, g_qwen.hd, "mtp.q_norm", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &m->d_k_norm, g_qwen.hd, "mtp.k_norm", mup) != 0) { fclose(f); return -1; }
-        TQ_READ_MTP_BF16(g_qwen.mtp_q_proj, q_m, g_qwen.H, "mtp.q_proj");
-        TQ_READ_MTP_BF16(g_qwen.mtp_k_proj, kv_m, g_qwen.H, "mtp.k_proj");
-        TQ_READ_MTP_BF16(g_qwen.mtp_v_proj, kv_m, g_qwen.H, "mtp.v_proj");
-        TQ_READ_MTP_BF16(g_qwen.mtp_o_proj, g_qwen.H, attn_m, "mtp.o_proj");
-        TQ_READ_MTP_BF16(g_qwen.mtp_gate, g_qwen.I, g_qwen.H, "mtp.mlp_gate");
-        TQ_READ_MTP_BF16(g_qwen.mtp_up, g_qwen.I, g_qwen.H, "mtp.mlp_up");
-        TQ_READ_MTP_BF16(g_qwen.mtp_down, g_qwen.H, g_qwen.I, "mtp.mlp_down");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_q_proj, m->q_proj, q_m, g_qwen.H, "mtp.q_proj");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_k_proj, m->k_proj, kv_m, g_qwen.H, "mtp.k_proj");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_v_proj, m->v_proj, kv_m, g_qwen.H, "mtp.v_proj");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_o_proj, m->o_proj, g_qwen.H, attn_m, "mtp.o_proj");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_gate, m->mlp_gate, g_qwen.I, g_qwen.H, "mtp.mlp_gate");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_up, m->mlp_up, g_qwen.I, g_qwen.H, "mtp.mlp_up");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_down, m->mlp_down, g_qwen.H, g_qwen.I, "mtp.mlp_down");
         if (read_non_quant(f, &g_qwen.d_mtp_norm, g_qwen.H, "mtp.norm", mup) != 0) { fclose(f); return -1; }
+        #undef TQ_READ_MTP_PROJ
         #undef TQ_READ_MTP_BF16
-        if (mup) printf("  MTP head section loaded (BF16 projections)\n");
+        g_qwen.mtp_exl3 = mup && mtp_exl3;
+        if (mup) printf(mtp_exl3 ? "  MTP head section loaded (EXL3 projections: paged drafter only)\n"
+                                 : "  MTP head section loaded (BF16 projections)\n");
         else if (no_mtp) {
             g_qwen.has_mtp_section = 0;
             printf("  MTP head section skipped (TQ_NO_MTP)\n");
@@ -11572,7 +11593,7 @@ static int parse_tqf(const char *path, int upload) {
         // tools/mtp_calib_train.py). Happens before the lazy E2M3 repack, so the
         // quantized wave path automatically uses the calibrated weights.
         const char *mwd = getenv("TQ_MTP_WEIGHTS");
-        if (mup && mwd && *mwd) {
+        if (mup && mwd && *mwd && !mtp_exl3) {
             int bad = 0;
             #define TQ_MTP_SIDELOAD(NAME, DST, COUNT)                                            \
                 do {                                                                             \
@@ -14980,6 +15001,7 @@ static int run_mtp_forward(const float *d_hidden, int token_id, int pos, int k) 
         fprintf(stderr, "qwn_mtp: model has no MTP section\n");
         return -1;
     }
+    if (g_qwen.mtp_exl3) return -40;             // EXL3 MTP projections: paged drafter only
     if (token_id < 0 || token_id >= g_qwen.V) { fprintf(stderr, "qwn_mtp: bad token %d\n", token_id); return -2; }
     if (pos < 0 || pos >= g_qwen.max_seq) { fprintf(stderr, "qwn_mtp: bad pos %d\n", pos); return -3; }
     int ret = ensure_mtp_buffers();
@@ -15217,6 +15239,7 @@ static int mtp_vocab_cap(void) {
 // instead of 2 B/elem. Requires the global e2m3 weight format (gc_weight_e2m3).
 static int ensure_mtp_quant(void) {
     if (g_qwen.mtp_quant_ready) return 0;
+    if (g_qwen.mtp_exl3) return -40;             // EXL3 MTP projections: paged drafter only
     const tq_bf16_weight_t *srcs[8] = {&g_qwen.mtp_fc, &g_qwen.mtp_q_proj, &g_qwen.mtp_k_proj,
                                        &g_qwen.mtp_v_proj, &g_qwen.mtp_o_proj, &g_qwen.mtp_gate,
                                        &g_qwen.mtp_up, &g_qwen.mtp_down};
@@ -15562,6 +15585,7 @@ static int ensure_mtp_tree_buffers(void) {
 // lm_head cost the trunk does not need.
 extern "C" int qwn_mtp_advance(int token_id, int pos) {
     if (!g_qwen.has_mtp_section) return -1;
+    if (g_qwen.mtp_exl3) return -40;
     if (!g_qwen.d_debug_x) return -30;
     if (token_id < 0 || token_id >= g_qwen.V) return -2;
     if (pos < 0 || pos >= g_qwen.max_seq) return -3;
@@ -15585,6 +15609,7 @@ extern "C" int qwn_mtp_advance(int token_id, int pos) {
 // MTP "advance" (write KV slot `pos`) from an arbitrary device hidden (no lm_head).
 static int mtp_advance_with_hidden(const float *hidden, int token_id, int pos) {
     if (!g_qwen.has_mtp_section) return -1;
+    if (g_qwen.mtp_exl3) return -40;
     if (token_id < 0 || token_id >= g_qwen.V) return -2;
     if (pos < 0 || pos >= g_qwen.max_seq) return -3;
     int ret = ensure_mtp_buffers();
@@ -22663,10 +22688,21 @@ static int     *h_free = NULL, *h_slot_nb = NULL;
 static int      g_pg_nfree = 0;
 static int      g_pg_page = 0, g_pg_plog = 0, g_pg_nblocks = 0, g_pg_maxslots = 0, g_pg_maxblk = 0;
 static int      g_pg_ready = 0;
+// paged MTP drafter (qwn_paged_mtp_init): the MTP layer's KV pool rows + per-slot last hidden
+static int      g_mtp_on = 0;
+static uint8_t *g_mtp_k4 = NULL;  static float *g_mtp_kq4s = NULL;
+static uint8_t *g_mtp_v8 = NULL;  static float *g_mtp_vscale = NULL;
+static float   *g_mtp_last_h = NULL;                 // [max_slots][H]
+static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *positions, int N);
+static int mtp_hook_prefill(const int *tokens, const int *col_pos, const int *seg_slot, const int *seg_off,
+                            const int *seg_len, int K, int T);
+static int mtp_hook_commit(int m);
 static void vf_free_all(void);                                       // spec verify/commit buffers (below)
+static void mtp_paged_free(void);                                    // paged MTP drafter pool (below)
 
 static void paged_free_all(void) {
     vf_free_all();
+    mtp_paged_free();
     for (int L = 0; L < TQ_MAX_LAYERS; L++) {
         if (g_pool_k4[L]) { cudaFree(g_pool_k4[L]); g_pool_k4[L] = NULL; }
         if (g_pool_kq4s[L]) { cudaFree(g_pool_kq4s[L]); g_pool_kq4s[L] = NULL; }
@@ -23212,6 +23248,7 @@ static size_t paged_slot_bytes(int upto_pos) {
     }
     bytes += (size_t)nfull * (size_t)n * per_tok;
     bytes += (size_t)nlin * ((size_t)batched_recur_floats() + (size_t)batched_conv_floats()) * sizeof(float);
+    if (g_mtp_on) bytes += (size_t)n * per_tok + (size_t)g_qwen.H * sizeof(float);   // MTP KV rows + last hidden
     (void)page;
     return bytes;
 }
@@ -23267,6 +23304,24 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
             TQ_XFER(g_pg_recur[L] + (size_t)slot * recur_f, recur_f * sizeof(float));
             TQ_XFER(g_pg_conv[L] + (size_t)slot * conv_f, conv_f * sizeof(float));
         }
+    }
+    if (g_mtp_on) {                                  // the MTP layer's KV rows + the slot's last hidden
+        for (int lb = 0; lb < nb; lb++) {
+            int phys = row[lb], t0 = lb * page, cnt = n - t0;
+            if (cnt > page) cnt = page;
+            if (cnt <= 0) break;
+            size_t bo = (size_t)phys * page;
+            TQ_XFER(g_mtp_k4 + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+            TQ_XFER((char *)g_mtp_kq4s + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+            if (g_pg_v4) {
+                TQ_XFER(g_mtp_v8 + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                TQ_XFER((char *)g_mtp_vscale + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+            } else {
+                TQ_XFER(g_mtp_v8 + bo * kv_m, (size_t)cnt * kv_m);
+                TQ_XFER(g_mtp_vscale + bo * nkv, (size_t)cnt * nkv * sizeof(float));
+            }
+        }
+        TQ_XFER(g_mtp_last_h + (size_t)slot * g_qwen.H, (size_t)g_qwen.H * sizeof(float));
     }
     #undef TQ_XFER
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -5;
@@ -23392,6 +23447,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                             cudaMemcpyDeviceToDevice, g_qwen.stream);
         }
     }
+    if (g_mtp_on && mtp_hook_decode(tokens, slot_ids_h, positions, N) != 0) return -82;   // MTP trunk slot pos-1
     return cudaGetLastError() == cudaSuccess ? 0 : -80;
 }
 
@@ -23584,6 +23640,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         cudaStreamSynchronize(g_qwen.stream);
         for (int f = 0; f < Kf; f++) out_seed[fk[f]] = htmp[f];
     }
+    if (g_mtp_on && mtp_hook_prefill(tokens, col_pos, seg_slot, seg_off, seg_len, K, T) != 0) return -108;
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -104;
 }
 
@@ -23639,6 +23696,7 @@ static int    g_vf_K = 0, g_vf_T = 0;                // the pending verify wave 
 static int    h_vf_seg_slot[TQ_VF_MAX_SEG], h_vf_seg_off[TQ_VF_MAX_SEG], h_vf_seg_len[TQ_VF_MAX_SEG];
 static int    h_vf_done[TQ_VF_MAX_SEG];
 static int    h_vf_cseg[3][TQ_VF_MAX_SEG];
+static int    h_vf_tok[TQ_VF_MAX_T], h_vf_pos[TQ_VF_MAX_T];   // the pending wave's tokens / positions (MTP trunk)
 
 static void vf_free_all(void) {
     for (int L = 0; L < TQ_MAX_LAYERS; L++) {
@@ -23837,6 +23895,7 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
         if (last_pos > vf_maxpos) vf_maxpos = last_pos;
     }
     for (int k = 0; k < K; k++) { h_vf_seg_slot[k] = seg_slot[k]; h_vf_seg_off[k] = seg_off[k]; h_vf_seg_len[k] = seg_len[k]; }
+    for (int j = 0; j < T; j++) { h_vf_tok[j] = tokens[j]; h_vf_pos[j] = col_pos[j]; }
     cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
                     cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
@@ -23996,6 +24055,7 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
         }
     }
     g_pdl_small = 0;
+    if (g_mtp_on && mtp_hook_commit(m) != 0) return -10;      // MTP trunk over the accepted columns
     if (cudaGetLastError() != cudaSuccess) return -8;
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -9;
 }
@@ -24005,6 +24065,258 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
 extern "C" const float *qwn_paged_verify_hidden(int *out_T) {
     if (out_T) *out_T = g_vf_K > 0 ? g_vf_T : 0;
     return g_vf_K > 0 ? g_vf_hidden : NULL;
+}
+
+// ===================== Paged MTP drafter (stage 3) =====================
+// The MTP head (fc + one full-attention layer + mtp.norm, the shared lm_head) runs over its own paged
+// KV pool on the slots' block tables (one more "layer" of pool rows, FP4 like the main pool). MTP KV
+// slot p of a slot <- (h_p, x_{p+1}): the main model's pre-final-norm hidden at p and the token that
+// followed (the single-stream trunk convention); the MTP forward at slot p predicts x_{p+2}.
+// Trunk maintenance, only with qwn_paged_mtp_init(1): prefill waves write the in-wave pairs (col t,
+// col t+1) of every segment plus the cross-wave pair from the slot's remembered last hidden; the decode
+// step writes (last hidden, token) -> slot pos-1; the commit writes the pairs over the accepted columns.
+// Each path then stores the slot's new last hidden (g_mtp_last_h). qwn_paged_mtp_draft runs K chained
+// MTP steps per slot from (last hidden, next token), each step's post-norm hidden + argmax feeding the
+// next; it writes MTP slots pos..pos+K-1 on the way (re-written from the main hiddens at the next
+// commit). A stale or missing MTP slot (prefix-cache truncation, position 0) only costs acceptance,
+// never correctness: the verify decides every token.
+#define TQ_MTP_CTL_ROWS 24
+#define TQ_MTP_CTL_COLS 128
+#define TQ_MTP_MAX_K 16
+static float   *g_mtp_fc_in = NULL, *g_mtp_x = NULL, *g_mtp_hid = NULL, *g_mtp_e = NULL;   // [128][2H], [128][H] x 3
+static int     *g_mtp_ctl = NULL;                    // device ints [TQ_MTP_CTL_ROWS][TQ_MTP_CTL_COLS]
+static int     *g_mtp_draft_d = NULL;                // [TQ_MTP_MAX_K][max_slots]
+static int      h_mtp_ctl[TQ_MTP_CTL_ROWS][TQ_MTP_CTL_COLS];
+
+static void mtp_paged_free(void) {
+    if (g_mtp_k4) { cudaFree(g_mtp_k4); g_mtp_k4 = NULL; }
+    if (g_mtp_kq4s) { cudaFree(g_mtp_kq4s); g_mtp_kq4s = NULL; }
+    if (g_mtp_v8) { cudaFree(g_mtp_v8); g_mtp_v8 = NULL; }
+    if (g_mtp_vscale) { cudaFree(g_mtp_vscale); g_mtp_vscale = NULL; }
+    if (g_mtp_last_h) { cudaFree(g_mtp_last_h); g_mtp_last_h = NULL; }
+    if (g_mtp_fc_in) { cudaFree(g_mtp_fc_in); g_mtp_fc_in = NULL; }
+    if (g_mtp_x) { cudaFree(g_mtp_x); g_mtp_x = NULL; }
+    if (g_mtp_hid) { cudaFree(g_mtp_hid); g_mtp_hid = NULL; }
+    if (g_mtp_e) { cudaFree(g_mtp_e); g_mtp_e = NULL; }
+    if (g_mtp_ctl) { cudaFree(g_mtp_ctl); g_mtp_ctl = NULL; }
+    if (g_mtp_draft_d) { cudaFree(g_mtp_draft_d); g_mtp_draft_d = NULL; }
+    g_mtp_on = 0;
+}
+
+// Bytes of one MTP pool row set (K codes + scales + V codes + scales) per position = one full layer's.
+extern "C" int qwn_paged_mtp_init(int on) {
+    if (!g_pg_ready) return -1;
+    mtp_paged_free();
+    if (!on) return 0;
+    if (!g_qwen.has_mtp_section) return -2;
+    if (!g_qwen.mtp_exl3) return -3;                     // needs a --mtp-exl3 tqf (EXL3 MTP projections)
+    if (!paged_lm_head_wide()) return -4;
+    if (g_pg_maxslots > TQ_MTP_CTL_COLS) return -9;
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv, H = g_qwen.H;
+    size_t qe = batched_q4s_elem_bytes();
+    size_t bp = (size_t)g_pg_nblocks * g_pg_page;
+    size_t k4b = bp * (kv_m >> 1), kq4sb = bp * nkv * 16 * qe;
+    size_t v8b = g_pg_v4 ? k4b : bp * kv_m, vscb = g_pg_v4 ? kq4sb : bp * nkv * sizeof(float);
+    if (cudaMalloc(&g_mtp_k4, k4b) != cudaSuccess || cudaMalloc(&g_mtp_kq4s, kq4sb) != cudaSuccess ||
+        cudaMalloc(&g_mtp_v8, v8b) != cudaSuccess || cudaMalloc(&g_mtp_vscale, vscb) != cudaSuccess) {
+        mtp_paged_free(); return -5;
+    }
+    cudaMemsetAsync(g_mtp_k4, 0, k4b, g_qwen.stream); cudaMemsetAsync(g_mtp_kq4s, 0, kq4sb, g_qwen.stream);
+    cudaMemsetAsync(g_mtp_v8, 0, v8b, g_qwen.stream); cudaMemsetAsync(g_mtp_vscale, 0, vscb, g_qwen.stream);
+    if (cudaMalloc(&g_mtp_last_h, (size_t)g_pg_maxslots * H * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_fc_in, (size_t)TQ_MTP_CTL_COLS * 2 * H * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_x, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_hid, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_e, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_ctl, (size_t)TQ_MTP_CTL_ROWS * TQ_MTP_CTL_COLS * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_draft_d, (size_t)TQ_MTP_MAX_K * g_pg_maxslots * sizeof(int)) != cudaSuccess) {
+        mtp_paged_free(); return -6;
+    }
+    cudaMemsetAsync(g_mtp_last_h, 0, (size_t)g_pg_maxslots * H * sizeof(float), g_qwen.stream);
+    if (ensure_wide_prefill_buffers(g_pg_maxslots) != 0) { mtp_paged_free(); return -7; }
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) { mtp_paged_free(); return -8; }
+    g_mtp_on = 1;
+    fprintf(stderr, "[paged-mtp] MTP KV pool %.1f MB (%zu rows), drafter on\n",
+            (double)(k4b + kq4sb + v8b + vscb) / 1048576.0, bp);
+    return 0;
+}
+
+static int *mtp_ctl_row(int r) { return g_mtp_ctl + (size_t)r * TQ_MTP_CTL_COLS; }
+static void mtp_ctl_upload(int rows) {
+    cudaMemcpyAsync(g_mtp_ctl, h_mtp_ctl, (size_t)rows * TQ_MTP_CTL_COLS * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+}
+
+__global__ void k_tq_scatter_rows_nk(float *dst, const int *dst_idx, const float *src, const int *src_idx, int H) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= H) return;
+    int s = src_idx ? src_idx[blockIdx.y] : (int)blockIdx.y;
+    dst[(size_t)dst_idx[blockIdx.y] * H + i] = src[(size_t)s * H + i];
+}
+
+// fc_in = [norm_emb(embed(tok)), norm_hidden(hidden)] -> x = fc(fc_in) for m columns (device arrays:
+// tokens d_tok, hidden rows d_hidx of hsrc, or hsrc rows 0..m-1 when d_hidx == NULL).
+static int mtp_fc_forward(const float *hsrc, const int *d_hidx, const int *d_tok, int m) {
+    int H = g_qwen.H;
+    cudaStream_t st = g_qwen.stream;
+    k_tq_embed_lookup_nk<<<dim3((H + 255) / 256, m), 256, 0, st>>>(g_mtp_e, g_qwen.d_embed, d_tok, H);
+    k_tq_qwen_rmsnorm_b_out<<<dim3(8, m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, 0, g_mtp_e, g_qwen.d_mtp_pre_fc_norm_emb, H, g_qwen.eps);
+    const float *hid = hsrc;
+    if (d_hidx) {
+        k_tq_gather_rows_nk<<<dim3((H + 255) / 256, m), 256, 0, st>>>(g_mtp_hid, hsrc, d_hidx, H);
+        hid = g_mtp_hid;
+    }
+    k_tq_qwen_rmsnorm_b_out<<<dim3(8, m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, H, hid, g_qwen.d_mtp_pre_fc_norm_hidden, H, g_qwen.eps);
+    int ret = wide_quant_input(g_mtp_fc_in, 2 * H, m);
+    if (ret != 0) return ret;
+    return wide_proj(&g_qwen.mtp_fc_x, g_mtp_x, m);
+}
+
+// MTP KV slot d_pos[j] of slot d_slot[j] <- (hidden, token) pairs, j < m (KV write only, no attention).
+static int mtp_trunk_write(const float *hsrc, const int *d_hidx, const int *d_tok, const int *d_pos, const int *d_slot, int m) {
+    if (m < 1) return 0;
+    int H = g_qwen.H;
+    tq_layer_t *mt = &g_qwen.mtp_layer;
+    if (ensure_wide_prefill_buffers(m) != 0) return -1;
+    int ret = mtp_fc_forward(hsrc, d_hidx, d_tok, m);
+    if (ret != 0) return ret;
+    k_tq_qwen_rmsnorm_b<<<dim3(8, m), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_mtp_x, mt->d_input_ln, H, g_qwen.eps);
+    if ((ret = wide_quant_input(g_wide_norm, H, m)) != 0) return ret;
+    const tq_qmma_weight_t *kv[2] = {&mt->k_proj, &mt->v_proj};
+    float *kv_out[2] = {g_wide_k, g_wide_v};
+    if ((ret = wide_proj_group(kv, kv_out, 2, m)) != 0) return ret;
+    paged_kv_write(m, g_mtp_k4, g_mtp_kq4s, g_mtp_v8, g_mtp_vscale, g_wide_k, g_wide_v, mt->d_k_norm,
+                   d_pos, d_slot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog, g_qwen.stream);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+// Decode step: (last hidden of the slot, tokens[j]) -> MTP slot positions[j]-1; then last hidden = g_wide_h[j].
+static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
+    int m = 0;
+    for (int j = 0; j < N; j++) {
+        if (positions[j] <= 0) continue;
+        h_mtp_ctl[0][m] = tokens[j]; h_mtp_ctl[1][m] = slot_ids_h[j]; h_mtp_ctl[2][m] = positions[j] - 1;
+        h_mtp_ctl[3][m] = slot_ids_h[j]; m++;
+    }
+    for (int j = 0; j < N; j++) h_mtp_ctl[4][j] = slot_ids_h[j];
+    mtp_ctl_upload(5);
+    int ret = mtp_trunk_write(g_mtp_last_h, mtp_ctl_row(1), mtp_ctl_row(0), mtp_ctl_row(2), mtp_ctl_row(3), m);
+    if (ret != 0) return ret;
+    k_tq_scatter_rows_nk<<<dim3((g_qwen.H + 255) / 256, N), 256, 0, g_qwen.stream>>>(
+        g_mtp_last_h, mtp_ctl_row(4), g_wide_h, NULL, g_qwen.H);
+    return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+
+// Prefill wave: in-wave pairs (col t -> token of col t+1) of every segment, the cross-wave pair of each
+// continuing segment from the slot's last hidden, then last hidden = the segment's last column.
+static int mtp_hook_prefill(const int *tokens, const int *col_pos, const int *seg_slot, const int *seg_off,
+                            const int *seg_len, int K, int T) {
+    if (T > TQ_MTP_CTL_COLS || K > TQ_MTP_CTL_COLS) return -1;
+    int m = 0, c = 0;
+    for (int k = 0; k < K; k++) {
+        int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
+        for (int t = 0; t + 1 < n; t++) {
+            int col = off + t;
+            h_mtp_ctl[0][m] = tokens[col + 1]; h_mtp_ctl[1][m] = col; h_mtp_ctl[2][m] = col_pos[col]; h_mtp_ctl[3][m] = slot; m++;
+        }
+        if (col_pos[off] > 0) {
+            h_mtp_ctl[4][c] = tokens[off]; h_mtp_ctl[5][c] = slot; h_mtp_ctl[6][c] = col_pos[off] - 1; h_mtp_ctl[7][c] = slot; c++;
+        }
+        h_mtp_ctl[8][k] = slot; h_mtp_ctl[9][k] = off + n - 1;
+    }
+    mtp_ctl_upload(10);
+    int ret = mtp_trunk_write(g_wide_h, mtp_ctl_row(1), mtp_ctl_row(0), mtp_ctl_row(2), mtp_ctl_row(3), m);
+    if (ret != 0) return ret;
+    ret = mtp_trunk_write(g_mtp_last_h, mtp_ctl_row(5), mtp_ctl_row(4), mtp_ctl_row(6), mtp_ctl_row(7), c);
+    if (ret != 0) return ret;
+    k_tq_scatter_rows_nk<<<dim3((g_qwen.H + 255) / 256, K), 256, 0, g_qwen.stream>>>(
+        g_mtp_last_h, mtp_ctl_row(8), g_wide_h, mtp_ctl_row(9), g_qwen.H);
+    return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+
+// Commit: over the m committed segments of the pending wave (h_vf_cseg): pairs (col t -> token of col t+1)
+// for the accepted columns but the last, hiddens from g_vf_hidden; last hidden = the last accepted column.
+static int mtp_hook_commit(int m) {
+    int p = 0;
+    for (int i = 0; i < m; i++) {
+        int slot = h_vf_cseg[0][i], off = h_vf_cseg[1][i], n = h_vf_cseg[2][i];
+        for (int t = 0; t + 1 < n; t++) {
+            int col = off + t;
+            h_mtp_ctl[0][p] = h_vf_tok[col + 1]; h_mtp_ctl[1][p] = col; h_mtp_ctl[2][p] = h_vf_pos[col]; h_mtp_ctl[3][p] = slot; p++;
+        }
+        h_mtp_ctl[4][i] = slot; h_mtp_ctl[5][i] = off + n - 1;
+    }
+    mtp_ctl_upload(6);
+    int ret = mtp_trunk_write(g_vf_hidden, mtp_ctl_row(1), mtp_ctl_row(0), mtp_ctl_row(2), mtp_ctl_row(3), p);
+    if (ret != 0) return ret;
+    k_tq_scatter_rows_nk<<<dim3((g_qwen.H + 255) / 256, m), 256, 0, g_qwen.stream>>>(
+        g_mtp_last_h, mtp_ctl_row(4), g_vf_hidden, mtp_ctl_row(5), g_qwen.H);
+    return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+
+// K chained MTP draft steps for N slots. positions[i] = the slot's last committed position (its hidden is
+// the slot's last hidden), seeds[i] = the token that follows it (the next token to feed). Step k runs at
+// MTP slot positions[i] + k on (hidden_k, token_k): hidden_0 = last hidden, token_0 = seed, then the
+// step's post-norm hidden and argmax. drafts[i*K + k] = the argmax of step k (the guess for position
+// positions[i] + 2 + k). The verify wave for the round is [seed, drafts...] at positions[i]+1 ...
+extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, const int *seeds, int N, int K, int *drafts) {
+    if (!g_pg_ready || !g_mtp_on) return -1;
+    if (N < 1 || N > g_pg_maxslots || N > TQ_MTP_CTL_COLS || K < 1 || K > TQ_MTP_MAX_K) return -2;
+    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
+    tq_layer_t *mt = &g_qwen.mtp_layer;
+    int max_pos = 0;
+    for (int i = 0; i < N; i++) {
+        int slot = slot_ids[i], pos = positions[i];
+        if (slot < 0 || slot >= g_pg_maxslots) return -3;
+        if (pos < 0 || pos + K + 1 >= g_qwen.max_seq) return -4;
+        if (seeds[i] < 0 || seeds[i] >= g_qwen.V) return -5;
+        for (int j = 0; j < i; j++) if (slot_ids[j] == slot) return -6;
+        if (paged_ensure_blocks(slot, pos + K - 1) != 0) return -7;
+        if (pos > max_pos) max_pos = pos;
+    }
+    for (int i = 0; i < N; i++) { h_mtp_ctl[0][i] = slot_ids[i]; h_mtp_ctl[1][i] = seeds[i]; h_mtp_ctl[2][i] = slot_ids[i]; }
+    for (int k = 0; k < K; k++) for (int i = 0; i < N; i++) h_mtp_ctl[3 + k][i] = positions[i] + k;
+    cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
+                    cudaMemcpyHostToDevice, g_qwen.stream);
+    mtp_ctl_upload(3 + K);
+    const int *d_slot = mtp_ctl_row(0);
+    int pdl = tq_pdl_enabled();
+    g_pdl_on = pdl != 0; g_pdl_small = pdl == 2;
+    int ret = 0;
+    for (int k = 0; k < K && ret == 0; k++) {
+        const int *d_tok = k == 0 ? mtp_ctl_row(1) : g_mtp_draft_d + (size_t)(k - 1) * g_pg_maxslots;
+        const int *d_pos = mtp_ctl_row(3 + k);
+        if ((ret = mtp_fc_forward(k == 0 ? g_mtp_last_h : g_mtp_hid, k == 0 ? mtp_ctl_row(2) : NULL, d_tok, N)) != 0) { ret = -10; break; }
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                  g_wide_norm, g_mtp_x, mt->d_input_ln, H, g_qwen.eps);
+        if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) { ret = -11; break; }
+        const tq_qmma_weight_t *qkv[3] = {&mt->q_proj, &mt->k_proj, &mt->v_proj};
+        float *qkv_out[3] = {g_wide_q, g_wide_k, g_wide_v};
+        if ((ret = wide_proj_group(qkv, qkv_out, 3, N)) != 0) { ret = -11; break; }
+        if (launch_paged_attn_q4(g_wide_core, g_wide_q, mt->d_q_norm, g_wide_k, g_wide_v, mt->d_k_norm,
+                                 g_mtp_k4, g_mtp_kq4s, g_mtp_v8, g_mtp_vscale,
+                                 d_pos, d_slot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
+                                 N, max_pos + k, 0, NULL, NULL, 0, g_qwen.stream) != 0) { ret = -12; break; }
+        if ((ret = wide_quant_input(g_wide_core, attn_m, N)) != 0) { ret = -13; break; }
+        if ((ret = wide_proj(&mt->o_proj, g_wide_o, N)) != 0) { ret = -13; break; }
+        tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)N * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                  g_wide_resid, g_mtp_x, g_wide_o, (int)((size_t)N * H));
+        if ((ret = wide_mlp(mt, g_wide_resid, g_wide_h, N)) != 0) { ret = -14; break; }
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                  g_mtp_hid, g_wide_h, g_qwen.d_mtp_norm, H, g_qwen.eps);         // post-norm hidden: next step + head
+        if ((ret = wide_quant_input(g_mtp_hid, H, N)) != 0) { ret = -15; break; }
+        if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) { ret = -15; break; }
+        tq_launch(g_pdl_small, k_tq_batched_argmax, dim3(N), dim3(256), 0, g_qwen.stream,
+                  g_mtp_draft_d + (size_t)k * g_pg_maxslots, g_pg_logits, g_qwen.V, N);
+    }
+    g_pdl_on = g_pdl_small = 0;
+    if (ret != 0) { cudaStreamSynchronize(g_qwen.stream); return ret; }
+    int tmp[TQ_MTP_MAX_K * TQ_MTP_CTL_COLS];
+    for (int k = 0; k < K; k++)
+        cudaMemcpyAsync(tmp + k * N, g_mtp_draft_d + (size_t)k * g_pg_maxslots, (size_t)N * sizeof(int),
+                        cudaMemcpyDeviceToHost, g_qwen.stream);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -16;
+    for (int i = 0; i < N; i++) for (int k = 0; k < K; k++) drafts[i * K + k] = tmp[k * N + i];
+    return cudaGetLastError() == cudaSuccess ? 0 : -17;
 }
 
 // ============================ Chunked prefill ============================
