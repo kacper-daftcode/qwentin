@@ -187,6 +187,7 @@ class BatchedEngine:
                 raise RuntimeError(f"qwn_paged_mtp_init failed: {rc} (needs --mtp and a --mtp-exl3 tqf, e.g. ...-mtp4.tqf)")
         self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
         self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
+        self.log_admits = os.environ.get("TQ_SERVE_LOG_ADMITS", "1") not in ("", "0")   # one line per admitted request
         self.free_slots = list(range(max_slots))
         self.active = {}            # slot -> Request
         self.q = []                 # pending Requests (FIFO)
@@ -544,6 +545,9 @@ class BatchedEngine:
             self.q.pop(0)
             req.start = start
             free_blk -= need
+            if self.log_admits:
+                print(f"[admit] slot {slot} prompt {req.n_prompt} cached {start} new {n_new} max_new {req.max_new} "
+                      f"tier {tier or 'none'} free_blk {free_blk} active {len(self.active)} prefilling {len(self.prefills)}", flush=True)
             if n_new == 0:
                 # the prompt IS the consumed history: the parked slot's pending token is the seed
                 self._activate(req, slot, pending)
