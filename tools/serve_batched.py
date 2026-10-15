@@ -67,6 +67,18 @@ def load_lib(path):
         L.has_token_bytes = True
     except AttributeError:
         L.has_token_bytes = False
+    # speculative decoding (task 10): verify / commit waves + the paged MTP drafter; older builds lack these
+    try:
+        L.qwn_paged_verify.argtypes = [ctypes.POINTER(ctypes.c_int)] * 6 + [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        L.qwn_paged_verify.restype = ctypes.c_int
+        L.qwn_paged_commit.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        L.qwn_paged_commit.restype = ctypes.c_int
+        L.qwn_paged_mtp_init.argtypes = [ctypes.c_int]; L.qwn_paged_mtp_init.restype = ctypes.c_int
+        L.qwn_paged_mtp_draft.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3 + [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        L.qwn_paged_mtp_draft.restype = ctypes.c_int
+        L.has_spec = True
+    except AttributeError:
+        L.has_spec = False
     return L
 
 
@@ -142,15 +154,39 @@ class Request:
         self.t_submit = time.time()
 
 
+SPEC_MAX_T = 64      # verify wave column cap (qwn_paged_verify)
+
+
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, prefill_waves_per_step=2,
-                 mixed_prefill=True, prefix_cache=True, park_ram_bytes=0, decode_steps_per_wave=0):
+                 mixed_prefill=True, prefix_cache=True, park_ram_bytes=0, decode_steps_per_wave=0,
+                 spec=False, spec_k="auto"):
         self.L = lib
         ck(self.L.qwn_init(tqf.encode()), "init")
         self.page = page; self.max_slots = max_slots
         ck(self.L.qwn_paged_init(max_slots, num_blocks, page), "paged_init")
         fb, tb, pg, mb = self._stats()
         self.num_blocks = tb; self.max_blocks_per_seq = mb
+        # Speculative decoding (task 10): in decode-only phases every engine iteration runs a ROUND
+        # instead of a step -- the paged MTP drafter guesses K tokens per slot (qwn_paged_mtp_draft),
+        # one verify wave scores [next, d_1..d_K] per slot (qwn_paged_verify), the longest matching
+        # prefix plus the bonus token is committed (qwn_paged_commit replays the DeltaNet state over
+        # the accepted columns; the KV is already in the pool). Needs the MTP section loaded (--mtp)
+        # from a --mtp-exl3 tqf; the drafter keeps its own KV rows on the pool blocks (+1.25 KiB/token)
+        # and a per-slot last hidden, both parked/restored with the slot. Mixed prefill waves keep
+        # the 1-token decode columns (the drafter's trunk is maintained there too). spec_on can be
+        # toggled at run time (/spec?on=0|1) for A/B: off = plain steps with the drafter idle.
+        self.spec = bool(spec)
+        self.spec_on = self.spec
+        self.spec_k = spec_k
+        if self.spec:
+            if not getattr(lib, "has_spec", False):
+                raise RuntimeError("--spec needs an engine library with qwn_paged_verify/commit/mtp_* (build >= eae20ab)")
+            rc = self.L.qwn_paged_mtp_init(1)
+            if rc != 0:
+                raise RuntimeError(f"qwn_paged_mtp_init failed: {rc} (needs --mtp and a --mtp-exl3 tqf, e.g. ...-mtp4.tqf)")
+        self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
+        self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
         self.free_slots = list(range(max_slots))
         self.active = {}            # slot -> Request
         self.q = []                 # pending Requests (FIFO)
@@ -551,6 +587,76 @@ class BatchedEngine:
         for s in finished:
             self._detach(s)
 
+    def _spec_k_for(self, n):
+        """Draft depth for n active slots: auto = 4 at n <= 2, 3 at n <= 8, 2 above (measured 10-15: deeper
+        drafts pay at few clients, the verify's per-column attention at many); capped by the wave width."""
+        if self.spec_k == "auto":
+            k = 4 if n <= 2 else (3 if n <= 8 else 2)
+        else:
+            k = int(self.spec_k)
+        while k > 0 and n * (k + 1) > SPEC_MAX_T:
+            k -= 1
+        return k
+
+    def _round(self):
+        """One speculative round over all active slots (decode-only phase): draft K per slot, verify
+        [next_tok, d_1..d_K] at positions pos..pos+K, commit the longest matching prefix + the bonus
+        token. Per accepted token the usual bookkeeping (stream, EOS, max_tokens): a request that stops
+        inside the accepted prefix commits exactly the columns that produced its emitted tokens, so the
+        slot is left as plain decode would (the stop token itself is never fed). Falls back to a plain
+        step when the drafter/verify cannot get pool blocks for the draft positions."""
+        slots = list(self.active.keys())
+        n = len(slots)
+        K = self._spec_k_for(n)
+        if K < 1:
+            return self._step()
+        L = self.L
+        reqs = [self.active[s] for s in slots]
+        t0 = time.time()
+        drafts = (ctypes.c_int * (n * K))()
+        rc = L.qwn_paged_mtp_draft(_ci(slots), _ci([r.pos - 1 for r in reqs]), _ci([r.next_tok for r in reqs]), n, K, drafts)
+        if rc == -7:                                    # pool exhausted for the draft positions
+            self.spec_fallbacks += 1
+            return self._step()
+        ck(rc, "mtp_draft")
+        t1 = time.time()
+        toks = []; cslot = []; cpos = []; soff = []
+        for i, (s, r) in enumerate(zip(slots, reqs)):
+            soff.append(len(toks))
+            toks.append(r.next_tok); toks += [int(drafts[i * K + k]) for k in range(K)]
+            cslot += [s] * (K + 1); cpos += [r.pos + j for j in range(K + 1)]
+        T = len(toks)
+        am = (ctypes.c_int * T)()
+        rc = L.qwn_paged_verify(_ci(toks), _ci(cslot), _ci(cpos), _ci(slots), _ci(soff), _ci([K + 1] * n), n, T, am)
+        if rc == -91:
+            self.spec_fallbacks += 1
+            return self._step()
+        ck(rc, "paged_verify")
+        t2 = time.time()
+        n_acc = []; finished = []
+        for i, (s, r) in enumerate(zip(slots, reqs)):
+            off = soff[i]
+            d = toks[off: off + K + 1]
+            j = 0
+            while j < K and am[off + j] == d[j + 1]:
+                j += 1
+            cand = d[1: j + 1] + [int(am[off + j])]  # j accepted drafts + the bonus token
+            e = 0
+            for t in cand:
+                r.out.append(t); r.tokens.put(t); e += 1
+                if t in r.eos or len(r.out) >= r.max_new:
+                    finished.append(s)
+                    break
+            r.pos += e; r.next_tok = r.out[-1]
+            n_acc.append(e)
+        ck(L.qwn_paged_commit(_ci(list(range(n))), _ci(n_acc), n), "paged_commit")
+        t3 = time.time()
+        tot = sum(n_acc)
+        self.rounds += 1; self.steps += 1; self.decoded_tokens += tot; self.spec_tokens += tot; self.spec_cols += T
+        self.spec_draft_s += t1 - t0; self.spec_verify_s += t2 - t1; self.spec_commit_s += t3 - t2
+        for s in finished:
+            self._detach(s)
+
     def _loop(self):
         while True:
             with self.cv:
@@ -583,7 +689,10 @@ class BatchedEngine:
                 have = bool(self.active) and not did_decode
             if have:
                 try:
-                    self._step()
+                    if self.spec and self.spec_on:
+                        self._round()
+                    else:
+                        self._step()
                 except Exception as e:                  # never let the engine thread die
                     print(f"[engine] step error: {e}", flush=True)
                     with self.cv:
@@ -800,7 +909,26 @@ def make_handler(eng, tok, args):
                                  "host_save_s": round(eng.host_save_s, 2),
                                  "host_restore_s": round(eng.host_restore_s, 2),
                                  "prefilled_tokens": eng.prefilled_tokens,
-                                 "decoded_tokens": eng.decoded_tokens, "steps": eng.steps})
+                                 "decoded_tokens": eng.decoded_tokens, "steps": eng.steps,
+                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k,
+                                 "rounds": eng.rounds, "spec_tokens": eng.spec_tokens,
+                                 "tokens_per_round": round(eng.spec_tokens / eng.rounds, 3) if eng.rounds else None,
+                                 "spec_verify_cols": eng.spec_cols, "spec_fallbacks": eng.spec_fallbacks,
+                                 "spec_ms_per_round": {"draft": round(1000 * eng.spec_draft_s / eng.rounds, 2),
+                                                       "verify": round(1000 * eng.spec_verify_s / eng.rounds, 2),
+                                                       "commit": round(1000 * eng.spec_commit_s / eng.rounds, 2)}
+                                 if eng.rounds else None})
+            elif self.path.startswith("/spec"):
+                # run-time A/B switch: /spec?on=0 -> plain decode steps (the drafter idles), /spec?on=1 -> rounds
+                if not eng.spec:
+                    self._json(400, {"error": "server started without --spec"}); return
+                q = self.path.split("?", 1)[1] if "?" in self.path else ""
+                for kv in q.split("&"):
+                    if kv.startswith("on="):
+                        eng.spec_on = kv[3:] not in ("0", "false", "off")
+                    elif kv.startswith("k="):
+                        eng.spec_k = "auto" if kv[2:] == "auto" else str(int(kv[2:]))
+                self._json(200, {"spec_on": eng.spec_on, "spec_k": eng.spec_k})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -958,10 +1086,12 @@ def serve(args):
                         prefill_waves_per_step=args.prefill_waves_per_step,
                         mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
                         park_ram_bytes=int(args.park_ram_gb * 2**30),
-                        decode_steps_per_wave=args.decode_steps_per_wave)
+                        decode_steps_per_wave=args.decode_steps_per_wave,
+                        spec=args.spec, spec_k=args.spec_k)
     fb, tb, pg, mb = eng._stats()
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
-          f"{kv_summary(eng.L, tb, pg)}", flush=True)
+          f"{kv_summary(eng.L, tb, pg)}"
+          + (f"; speculative decoding ON (MTP drafter, K={args.spec_k})" if args.spec else ""), flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
     print(f"listening on {args.host}:{args.port}  (model={args.model_name})", flush=True)
     try:
@@ -1076,7 +1206,7 @@ def main():
                          "(10 KB) is read over PCIe. Overrides TQ_EMBED_FP8.")
     ap.add_argument("--no-embed-host", dest="embed_host", action="store_false")
     ap.add_argument("--mtp", dest="mtp", action="store_true", default=False,
-                    help="load the tqf's MTP head (0.85 GB bf16). This server does no speculative decoding, so by "
+                    help="load the tqf's MTP head (0.85 GB bf16, 0.21 GB as EXL3 records). Only --spec uses it, so by "
                          "default TQ_NO_MTP=1 skips it.")
     ap.add_argument("--kv-v4", dest="kv_v4", action="store_true", default=True,
                     help="store V like K in the paged pool (TQ_KV_V4=1, default): FWHT-256 rotated int4, asymmetric "
@@ -1089,7 +1219,22 @@ def main():
                          "its bfrag launch while the predecessor drains and wait on the device; bit-identical outputs, "
                          "-0.55..-0.61 ms per step at N = 1-8 @32K (5090 at 550 W, opt-6.25 + int4 V).")
     ap.add_argument("--no-pdl", dest="pdl", action="store_false")
+    ap.add_argument("--spec", dest="spec", action="store_true", default=False,
+                    help="speculative decoding with the paged MTP drafter (task 10): in decode-only phases each "
+                         "engine iteration drafts K tokens per slot, verifies them in one wave and commits the "
+                         "longest matching prefix + 1 (greedy-equivalent outside near-ties). Implies --mtp; needs "
+                         "a tqf with EXL3 MTP projections (convert_qwen_tqf.py --mtp-exl3, e.g. ...-opt6.25-mtp4.tqf) "
+                         "and ~6%% of the pool for the drafter's KV rows (12 slots: --num-blocks 3000 instead of 3300). "
+                         "Measured 10-15 (5090, 550 W, code): 2.9-3.5x per stream at N=1 @32K, 2.1x at N=4, 1.6x at N=8.")
+    ap.add_argument("--spec-k", default="auto",
+                    help="draft depth: auto = 4 at <= 2 active slots, 3 at <= 8, 2 above; or a fixed number (1..16).")
     args = ap.parse_args()
+    if args.spec:
+        args.mtp = True
+        if args.spec_k != "auto":
+            k = int(args.spec_k)
+            if not 1 <= k <= 16:
+                raise SystemExit("--spec-k must be auto or 1..16")
     # The engine lib reads these at qwn_init / lazily on the first prefill wave; explicit env overrides the flags.
     os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
     os.environ.setdefault("TQ_EMBED_HOST", "1" if args.embed_host else "0")

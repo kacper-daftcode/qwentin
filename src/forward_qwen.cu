@@ -20215,9 +20215,14 @@ static int exl3_unit_ng(int N, int MB) {
 // in_proj_qkv had 720 units on 680 blocks, KB=7 MLPs 408 on 340) and allows 16 tiles per split
 // where 32 would leave most of the GPU idle (k/v_proj: 80 of 680 blocks); at 40-48 feature
 // blocks (in_proj_z, o_proj) shorter splits cost more in partial reduction than the fill gains.
+// g_split_n_override > 0: the k-split / key-split pickers see this client count instead of the column count
+// (the verify wave sets its slot count, so a column's splits -- and bits -- equal the decode step's at that
+// many clients; the attention launches T x S blocks instead of the fewer a T-column step would pick).
+static int g_split_n_override = 0;
 static int exl3_pick_splits(int cap, int units, int Kt16, int N, int M, int KB, int *per_out) {
     int fixed = qmma_sf_k_split();
     int ks;
+    if (g_split_n_override > 0) N = g_split_n_override;
     if (fixed >= 1) ks = fixed;
     else {
         bool decode = N <= 16;
@@ -20237,6 +20242,18 @@ static int exl3_pick_splits(int cap, int units, int Kt16, int N, int M, int KB, 
     return ks;
 }
 
+// Resident-block capacity of the instantiation a decode step at N clients would run (NG = wide_ng(N)).
+template <int KB>
+static int exl3_gemm_cap_decode(int N) {
+    switch (wide_ng(N)) {
+        case 1: return exl3_gemm_cap<KB, 1>();
+        case 2: return exl3_gemm_cap<KB, 2>();
+        case 4: return exl3_gemm_cap<KB, 4>();
+        case 8: return exl3_gemm_cap<KB, 8>();
+        default: return exl3_gemm_cap<KB, 16>();
+    }
+}
+
 template <int KB, int NG>
 static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, const tq_qmma_weight_t *w,
                             const uint32_t *bp, int M, int Kt16, int N, int Gt, int g_base, cudaStream_t st) {
@@ -20245,7 +20262,11 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
     int units = (M / 128) * ntg;
     if (units > 8192) return -117;                // arrival counters
     int per = 1;
-    int ks = exl3_pick_splits(cap, units, Kt16, N, M, KB, &per);
+    // g_split_n_override: pick the k-splits as the decode step at that many clients does (its instantiation's
+    // capacity, one token group), so the per-column numerics equal that step's; the launch keeps this grid.
+    int ks = g_split_n_override > 0
+        ? exl3_pick_splits(exl3_gemm_cap_decode<KB>(g_split_n_override), M / 128, Kt16, N, M, KB, &per)
+        : exl3_pick_splits(cap, units, Kt16, N, M, KB, &per);
     float *pout = NULL;
     if (ks > 1) {
         size_t need = (size_t)ks * split_stride * sizeof(float);
@@ -22454,6 +22475,7 @@ static int paged_attn_gqa_mma_enabled(void) {
 static int paged_gqa_split_S(int N, int pos_max) {
     static int forced = -2;
     if (forced == -2) { const char *e = getenv("TQ_PAGED_GQA_SPLIT"); forced = (e && *e) ? atoi(e) : -1; }
+    if (g_split_n_override > 0) N = g_split_n_override;
     int nst = (pos_max + 128) >> 7;
     int sm = paged_sm_count();
     int blocks0 = g_qwen.nkv * N;
@@ -23682,6 +23704,14 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
 // follow T instead of N (the same "not batch-invariant" band as decode at different N).
 #define TQ_VF_MAX_T 64
 #define TQ_VF_MAX_SEG 256
+// TQ_VF_SPLIT_BY_SLOTS=1 (default): the verify's GEMM k-splits and attention key-splits are picked for its slot
+// count, not its column count, so the committed tokens equal plain decode's at that client count bit for bit
+// (except a wave crossing a 128-key tile boundary); 0 = pick by columns (slightly faster at T >= 16).
+static int vf_split_by_slots(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_VF_SPLIT_BY_SLOTS"); c = (e && *e) ? (atoi(e) != 0) : 1; }
+    return c;
+}
 static int    g_vf_cap = 0;                          // columns the kept-input buffers hold
 static float *g_vf_x[TQ_MAX_LAYERS] = {0};           // per linear layer: pre-conv in_proj_qkv output [cap][conv_dim]
 static float *g_vf_b[TQ_MAX_LAYERS] = {0};           // [cap][lvh]
@@ -23997,8 +24027,10 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
     g_exl3_ng_max = 4;
+    g_split_n_override = vf_split_by_slots() ? K : 0;
     g_vf_K = 0;
     int ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    g_split_n_override = 0;
     g_exl3_ng_max = 16;
     g_pdl_on = g_pdl_small = 0;
     if (ret != 0) { cudaStreamSynchronize(g_qwen.stream); return ret; }
