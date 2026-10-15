@@ -21927,16 +21927,18 @@ __global__ void k_tq_paged_attn_q4_split(
 template <int VQ4>
 __global__ void k_tq_paged_attn_q4_merge(
     float *out, const float *q_proj_base, const int *positions, int nh, int hd, int q_m, int attn_m,
-    int S, const float *part_acc, const float *part_ml) {
+    int S, const float *part_acc, const float *part_ml, const int *col_S) {
     tq_pdl_enter();
     __shared__ float rbuf[VQ4 ? 256 : 1];
     int head = blockIdx.x, col = blockIdx.y, tid = threadIdx.x;
     if (head >= nh || tid >= hd) return;
+    const int Sc = col_S ? col_S[col] : S;              // per-column split count (verify waves); layout stride S
+    if (Sc <= 1) return;                                // the kernel wrote this column's rows directly
     size_t base = (size_t)(head * gridDim.y + col) * S;
     float mstar = -3.402823466e38f;
-    for (int s = 0; s < S; s++) mstar = fmaxf(mstar, part_ml[(base + s) * 2 + 0]);
+    for (int s = 0; s < Sc; s++) mstar = fmaxf(mstar, part_ml[(base + s) * 2 + 0]);
     float acc = 0.0f, l = 0.0f;
-    for (int s = 0; s < S; s++) {
+    for (int s = 0; s < Sc; s++) {
         float ms = part_ml[(base + s) * 2 + 0];
         float ls = part_ml[(base + s) * 2 + 1];
         float sc = (ms <= -3.0e38f) ? 0.0f : expf(ms - mstar);
@@ -22263,12 +22265,16 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
     const int *block_table, int max_blocks, int page, int page_log,
     int nh, int nkv, int hd, int q_m, int attn_m, int S,
     float eps, float rope_theta, float *part_acc, float *part_ml,
-    const int *topk_list, const int *topk_count, int topk_cap) {
+    const int *topk_list, const int *topk_count, int topk_cap, const int *col_S) {
     tq_pdl_enter();
     __shared__ uint32_t sm[TQ_AMM_WORDS];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int gr = lane >> 2, t4 = lane & 3;
     const int kv_head = blockIdx.x, col = blockIdx.y, split = blockIdx.z;
+    // col_S (verify waves): this column's own key-split count Sc <= S (the grid's); the partial layout keeps the
+    // grid stride S. NULL = every column uses S (the decode step; unchanged arithmetic).
+    const int Sc = col_S ? col_S[col] : S;
+    if (split >= Sc) return;
     const int group = nh / nkv;                                 // q-heads per kv head = tile rows
     const int pos = positions[col], slot = slot_ids[col];
     const size_t cstride = (size_t)nkv * hd, cstride4 = cstride >> 1, szstride = (size_t)nkv * 16;
@@ -22329,8 +22335,8 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
     const float rsc = rsqrtf((float)hd);
     const int nst_all = (pos + 128) >> 7;                        // ceil((pos+1)/128)
     int it_lo = 0, nst = nst_all;
-    if (S > 1) {
-        int per = (nst_all + S - 1) / S;
+    if (Sc > 1) {
+        int per = (nst_all + Sc - 1) / Sc;
         it_lo = split * per;
         int hi = it_lo + per;
         nst = hi < nst_all ? hi : nst_all;
@@ -22357,7 +22363,7 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
         if (list_cnt <= 0) {
             TQ_GQA_DENSE_WALK
         } else {
-            int per = (list_cnt + S - 1) / S;
+            int per = (list_cnt + Sc - 1) / Sc;
             int lo = split * per;
             int hi = lo + per;
             if (hi > list_cnt) hi = list_cnt;
@@ -22379,8 +22385,8 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
         TQ_GQA_DENSE_WALK
     }
 #undef TQ_GQA_DENSE_WALK
-    // ---- output: S == 1 -> normalized + gated rows; S > 1 -> split partials for the merge ----
-    if (S > 1) {
+    // ---- output: Sc == 1 -> normalized + gated rows; Sc > 1 -> split partials for the merge ----
+    if (Sc > 1) {
         // partial layout of k_tq_paged_attn_q4_split: [(head * N + col) * S + split][hd], (m, l)
         #pragma unroll
         for (int f = 0; f < 4; f++) {
@@ -22546,12 +22552,15 @@ static void paged_kv_write(int ncol, uint8_t *k4_pool, float *kq4s_pool, uint8_t
 }
 
 static void paged_attn_merge(float *out, const float *q_proj, const int *positions, int N, int S,
-                             cudaStream_t st) {
+                             cudaStream_t st, const int *col_S = NULL) {
     int nh = g_qwen.nh, hd = g_qwen.hd, q_m = nh * hd * 2, attn_m = nh * hd;
     tq_launch(g_pdl_small, g_pg_v4 ? k_tq_paged_attn_q4_merge<1> : k_tq_paged_attn_q4_merge<0>,
               dim3(nh, N), dim3(hd), 0, st,
-              out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+              out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml, col_S);
 }
+// Verify waves: per-column key-split counts (device array, NULL for the decode step) and their max.
+static const int *g_attn_col_S = NULL;
+static int g_attn_col_S_max = 0;
 
 static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t *q_norm_w,
                                 const float *k_proj, const float *v_proj, const uint16_t *k_norm_w,
@@ -22586,12 +22595,14 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
         } else {
             S = paged_gqa_split_S(N, max_pos);
         }
-        if (S > 1 && ensure_attn_partials((size_t)nh * N * S) != 0) S = 1;
+        const int *col_S = NULL;
+        if (g_attn_col_S && !use_topk) { col_S = g_attn_col_S; S = g_attn_col_S_max; }   // per-column S (verify)
+        if (S > 1 && ensure_attn_partials((size_t)nh * N * S) != 0) { S = 1; col_S = NULL; }
 #define TQ_GQA_LAUNCH(TK, VQ, LIST, CNT, CAP) \
             tq_launch(g_pdl_small, k_tq_paged_attn_q4_gqa_mma<TK, VQ>, dim3(nkv, N, S), dim3(256), 0, st, \
                 out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids, \
                 block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S, \
-                g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml, LIST, CNT, CAP)
+                g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml, LIST, CNT, CAP, col_S)
         if (use_topk) {
             if (g_pg_v4) TQ_GQA_LAUNCH(1, 1, g_topk_list, g_topk_count, g_topk_cap);
             else         TQ_GQA_LAUNCH(1, 0, g_topk_list, g_topk_count, g_topk_cap);
@@ -22600,7 +22611,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
             else         TQ_GQA_LAUNCH(0, 0, (const int *)NULL, (const int *)NULL, 0);
         }
 #undef TQ_GQA_LAUNCH
-        if (S > 1) paged_attn_merge(out, q_proj, positions, N, S, st);
+        if (S > 1) paged_attn_merge(out, q_proj, positions, N, S, st, col_S);
         return cudaGetLastError() == cudaSuccess ? 0 : -1;
     }
     int S = paged_split_S(N, max_pos);
@@ -23720,6 +23731,7 @@ static float *g_vf_logits = NULL;                    // [cap][V] every column's 
 static int   *g_vf_argmax = NULL;                    // [cap]
 static float *g_vf_hidden = NULL;                    // [cap][H] pre-final-norm hidden of every column (MTP seeding)
 static int   *g_vf_iota = NULL;                      // 0..cap-1 (gated-norm column ids)
+static int   *g_vf_colS = NULL;                      // [cap] per-column GQA key-split count (= the decode step's at that pos)
 static int   *g_vf_seg_d = NULL;                     // device: [3][TQ_VF_MAX_SEG] slot/off/len of the verify wave
 static int   *g_vf_cseg_d = NULL;                    // device: [3][TQ_VF_MAX_SEG] slot/off/len of a commit list
 static int    g_vf_K = 0, g_vf_T = 0;                // the pending verify wave (0 = none)
@@ -23738,6 +23750,7 @@ static void vf_free_all(void) {
     if (g_vf_argmax) { cudaFree(g_vf_argmax); g_vf_argmax = NULL; }
     if (g_vf_hidden) { cudaFree(g_vf_hidden); g_vf_hidden = NULL; }
     if (g_vf_iota) { cudaFree(g_vf_iota); g_vf_iota = NULL; }
+    if (g_vf_colS) { cudaFree(g_vf_colS); g_vf_colS = NULL; }
     if (g_vf_seg_d) { cudaFree(g_vf_seg_d); g_vf_seg_d = NULL; }
     if (g_vf_cseg_d) { cudaFree(g_vf_cseg_d); g_vf_cseg_d = NULL; }
     g_vf_cap = 0; g_vf_K = 0; g_vf_T = 0;
@@ -23762,6 +23775,7 @@ static int vf_ensure(int T) {
     if (cudaMalloc(&g_vf_argmax, (size_t)cap * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
     if (cudaMalloc(&g_vf_hidden, (size_t)cap * g_qwen.H * sizeof(float)) != cudaSuccess) { vf_free_all(); return -3; }
     if (cudaMalloc(&g_vf_iota, (size_t)cap * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
+    if (cudaMalloc(&g_vf_colS, (size_t)cap * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
     if (cudaMalloc(&g_vf_seg_d, (size_t)3 * TQ_VF_MAX_SEG * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
     if (cudaMalloc(&g_vf_cseg_d, (size_t)3 * TQ_VF_MAX_SEG * sizeof(int)) != cudaSuccess) { vf_free_all(); return -3; }
     int hi[TQ_VF_MAX_T];
@@ -23934,6 +23948,14 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
     cudaMemcpyAsync(g_vf_seg_d + TQ_VF_MAX_SEG, h_vf_seg_off, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_vf_seg_d + 2 * TQ_VF_MAX_SEG, h_vf_seg_len, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     const int *d_sslot = g_vf_seg_d, *d_soff = g_vf_seg_d + TQ_VF_MAX_SEG, *d_slen = g_vf_seg_d + 2 * TQ_VF_MAX_SEG;
+    // each column's GQA key-split count = the one a decode step would pick at ITS position (a wave can span a
+    // tile boundary where the context clamp changes S), so the attention bits match the step's column by column
+    {
+        int h_colS[TQ_VF_MAX_T], smax = 1;
+        for (int j = 0; j < T; j++) { h_colS[j] = paged_gqa_split_S(K, col_pos[j]); if (h_colS[j] > smax) smax = h_colS[j]; }
+        cudaMemcpyAsync(g_vf_colS, h_colS, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        g_attn_col_S = g_vf_colS; g_attn_col_S_max = smax;
+    }
     for (int j = 0; j < T; j++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
             g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
@@ -24030,6 +24052,7 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     g_split_n_override = vf_split_by_slots() ? K : 0;
     g_vf_K = 0;
     int ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    g_attn_col_S = NULL; g_attn_col_S_max = 0;
     g_split_n_override = 0;
     g_exl3_ng_max = 16;
     g_pdl_on = g_pdl_small = 0;
