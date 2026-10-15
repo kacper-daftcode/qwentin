@@ -3177,11 +3177,17 @@ __global__ void k_tq_wide_attn_mma(
         // paged (MODE 4): a 128-aligned super-tile lies in ONE physical block (page>=128),
         // so one block-table lookup gives a contiguous physical-row base for the 128 keys.
         size_t pr0 = 0;
-        constexpr bool t4blk = T4 != 0;                       // T4: every key of a prefill wave is a trellis row
+        constexpr bool t4blk = T4 != 0;
+        // T4: page-local rows < t4nenc are trellis rows of the pool block, rows >= t4nenc the wave's own in-flight
+        // columns, read exact from the slot's fp16 staging (TQ_KV_T4_ASYNC: their trellis encode runs on a side
+        // stream behind the layer loop; in the synchronous mode encl was raised to the wave's end before the launch)
+        int t4nenc = 256;
         if (MODE == 4) {
             int phys = block_table[(size_t)slot * max_blocks + (t0 >> page_log)];
             pr0 = (size_t)phys * page + (size_t)(t0 & (page - 1));
+            if constexpr (T4) t4nenc = t4p.encl[slot] - t0;
         }
+        const uint16_t *t4f16 = T4 ? t4p.f16s + ((size_t)slot * page * nkv + kv_head) * 512 : NULL;   // + (pos & (page-1)) * nkv * 512
         const uint8_t *kcb4_it = kcb4;
         const float *ksz4_it = ksz4;
         const uint8_t *vcb8_it = vcb8;
@@ -3192,7 +3198,7 @@ __global__ void k_tq_wide_attn_mma(
         for (int j = 0; j < 4; j++) { s0[j] = 0.0f; s1[j] = 0.0f; s2[j] = 0.0f; s3[j] = 0.0f; }
         const int tp = t0 + warp * 16;
         int p0 = tp + gr, p1 = tp + 8 + gr;
-        if (T4 && t4blk) {                                     // trellis-K dequant (table) into the Q·Kᵀ tile
+        if (T4 && t4blk && t4nenc >= 128) {                    // all 128 keys trellis: the straight-line table path
             const size_t r0 = TQ_PROW(p0), r1 = TQ_PROW(p1);
             const uint8_t *kr0 = kcb4 + r0 * cstride4;
             const uint8_t *kr1 = kcb4 + r1 * cstride4;
@@ -3207,6 +3213,58 @@ __global__ void k_tq_wide_attn_mma(
                 tq_t4_kfrags(kp0, prev0, t4, sc0, t4tab, bk0, bk8);
                 tq_t4_kfrags(kp1, prev1, t4, sc1, t4tab, ek0, ek8);
                 prev0 = kp0.w >> 24; prev1 = kp1.w >> 24;
+                #pragma unroll
+                for (int cc = 0; cc < 2; cc++) {
+                    const int c = 2 * g + cc;
+                    const uint32_t *a = &sm[OFF_QA + (c * 32 + lane) * 4];
+                    tq_mma_bf16_m16n8k16(s0, a, bk0[cc], bk8[cc]);
+                    tq_mma_bf16_m16n8k16(s1, a, ek0[cc], ek8[cc]);
+                    if constexpr (QT == 2) {
+                        const uint32_t *a2 = &sm[OFF_QA2 + (c * 32 + lane) * 4];
+                        tq_mma_bf16_m16n8k16(s2, a2, bk0[cc], bk8[cc]);
+                        tq_mma_bf16_m16n8k16(s3, a2, ek0[cc], ek8[cc]);
+                    }
+                }
+            }
+        } else if (T4 && t4blk) {                              // the wave's own super-tile: trellis / exact fp16 per row
+            const int o0 = min(p0, maxpos) - t0, o1 = min(p1, maxpos) - t0;
+            const bool tr0 = o0 < t4nenc, tr1 = o1 < t4nenc;
+            const size_t r0 = TQ_PROW(p0), r1 = TQ_PROW(p1);
+            const uint8_t *kr0 = tr0 ? kcb4 + r0 * cstride4 : NULL;
+            const uint8_t *kr1 = tr1 ? kcb4 + r1 * cstride4 : NULL;
+            const uint16_t *kf0 = tr0 ? NULL : t4f16 + (size_t)((min(p0, maxpos)) & (page - 1)) * nkv * 512;
+            const uint16_t *kf1 = tr1 ? NULL : t4f16 + (size_t)((min(p1, maxpos)) & (page - 1)) * nkv * 512;
+            const uint32_t sw0 = tr0 ? tq_t4_side(t4p.kside, r0, nkv, kv_head) : 0u;
+            const uint32_t sw1 = tr1 ? tq_t4_side(t4p.kside, r1, nkv, kv_head) : 0u;
+            const float sc0 = tq_t4_scale(sw0), sc1 = tq_t4_scale(sw1);
+            uint32_t prev0 = sw0 & 0xFFu, prev1 = sw1 & 0xFFu;
+            #pragma unroll
+            for (int g = 0; g < 8; g++) {
+                uint32_t bk0[2], bk8[2], ek0[2], ek8[2];
+                if (tr0) {
+                    const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
+                    tq_t4_kfrags(kp0, prev0, t4, sc0, t4tab, bk0, bk8);
+                    prev0 = kp0.w >> 24;
+                } else {
+                    #pragma unroll
+                    for (int cc = 0; cc < 2; cc++) {
+                        const int ch = 32 * g + 16 * cc + 2 * t4;
+                        bk0[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch));
+                        bk8[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch + 8));
+                    }
+                }
+                if (tr1) {
+                    const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
+                    tq_t4_kfrags(kp1, prev1, t4, sc1, t4tab, ek0, ek8);
+                    prev1 = kp1.w >> 24;
+                } else {
+                    #pragma unroll
+                    for (int cc = 0; cc < 2; cc++) {
+                        const int ch = 32 * g + 16 * cc + 2 * t4;
+                        ek0[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch));
+                        ek8[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch + 8));
+                    }
+                }
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
                     const int c = 2 * g + cc;
@@ -3395,7 +3453,7 @@ __global__ void k_tq_wide_attn_mma(
                 const uint32_t *pa2 = &sm[OFF_PST2 + (tt * 32 + lane) * 4];
                 a2[0] = pa2[0]; a2[1] = pa2[1]; a2[2] = pa2[2]; a2[3] = pa2[3];
             }
-            if (T4 && t4blk) {
+            if (T4 && t4blk && t4nenc >= 128) {
                 // trellis V: states (bits >> 4f) & 0xFFF of the 3 stream bytes at ch/2 of a key row
                 const int r0 = t0 + tt * 16 + 2 * t4;
                 const size_t q0 = TQ_PROW(r0), q1 = TQ_PROW(r0 + 1), q8 = TQ_PROW(r0 + 8), q9 = TQ_PROW(r0 + 9);
@@ -3409,6 +3467,38 @@ __global__ void k_tq_wide_attn_mma(
                 for (int f = 0; f < 4; f++) {
                     uint32_t b0 = tq_pack_bf16(tq_t4_val(c0, f, t4tab, v0), tq_t4_val(c1, f, t4tab, v1));
                     uint32_t b1 = tq_pack_bf16(tq_t4_val(c8, f, t4tab, v8), tq_t4_val(c9, f, t4tab, v9));
+                    tq_mma_bf16_m16n8k16(oacc[f], a, b0, b1);
+                    if constexpr (QT == 2) tq_mma_bf16_m16n8k16(oacc2[f], a2, b0, b1);
+                }
+                continue;
+            }
+            if (T4 && t4blk) {
+                // the wave's own super-tile: trellis rows below t4nenc, the in-flight rows exact fp16 from the staging
+                const int r0 = t0 + tt * 16 + 2 * t4;
+                const int cb = 16 * warp + 2 * gr;
+                float v[4][4];
+                #pragma unroll
+                for (int rr = 0; rr < 4; rr++) {
+                    const int rp = min(r0 + (rr >> 1) * 8 + (rr & 1), maxpos);
+                    if (rp - t0 < t4nenc) {
+                        const size_t q = TQ_PROW(rp);
+                        const uint32_t z = tq_t4_side(t4p.vside, q, nkv, kv_head);
+                        const uint32_t c = tq_t4_vbits(vcb8 + q * cstride4, z, cb);
+                        const float vs = tq_t4_scale(z);
+                        #pragma unroll
+                        for (int f = 0; f < 4; f++) v[rr][f] = tq_t4_val(c, f, t4tab, vs);
+                    } else {
+                        const uint2 w = *(const uint2 *)(t4f16 + (size_t)(rp & (page - 1)) * nkv * 512 + 256 + 2 * cb);
+                        v[rr][0] = __half2float(__ushort_as_half((unsigned short)(w.x & 0xFFFFu)));
+                        v[rr][1] = __half2float(__ushort_as_half((unsigned short)(w.x >> 16)));
+                        v[rr][2] = __half2float(__ushort_as_half((unsigned short)(w.y & 0xFFFFu)));
+                        v[rr][3] = __half2float(__ushort_as_half((unsigned short)(w.y >> 16)));
+                    }
+                }
+                #pragma unroll
+                for (int f = 0; f < 4; f++) {
+                    uint32_t b0 = tq_pack_bf16(v[0][f], v[1][f]);
+                    uint32_t b1 = tq_pack_bf16(v[2][f], v[3][f]);
                     tq_mma_bf16_m16n8k16(oacc[f], a, b0, b1);
                     if constexpr (QT == 2) tq_mma_bf16_m16n8k16(oacc2[f], a2, b0, b1);
                 }
@@ -24458,6 +24548,14 @@ static int32_t *g_t4_best = NULL;  static uint16_t *g_t4_scale = NULL;
 static int     *h_slot_encl = NULL, *h_t4_encl_tmp = NULL;   // per slot: encoded length (host), wave view
 static int     *g_t4_encl_d = NULL;                          // device copy read by the T4 attention kernels
 static int g_t4_stg_rows = 0;
+// TQ_KV_T4_ASYNC (default 1): a prefill wave attends its own columns exact from the fp16 staging (like a decode
+// step) and their trellis encode runs per layer on a side stream behind the layer loop; g_t4_done is recorded after
+// the wave's last encode and every later use of the pool waits on it. 0 = encode synchronously before each layer's
+// attention (every key trellis, the exllamav3 simulation's semantics).
+static int g_t4_async = 1;
+static cudaStream_t g_t4_stream = NULL;
+static cudaEvent_t g_t4_ev = NULL, g_t4_done = NULL;
+static void paged_t4_sync(cudaStream_t st) { if (g_pg_t4 && g_t4_async && g_t4_done) cudaStreamWaitEvent(st, g_t4_done, 0); }
 static tq_t4_pool t4_pool_of(int L) {
     tq_t4_pool p;
     p.kside = g_t4_kside[L]; p.vside = g_t4_vside[L];
@@ -24465,7 +24563,7 @@ static tq_t4_pool t4_pool_of(int L) {
     return p;
 }
 static int paged_t4_encode_wave_layer(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos,
-                                      int K, int L);
+                                      int K, int L, cudaStream_t st);
 
 // t4 != NULL: trellis pool (TQ_KV_T4) -- the write goes to the slot's FP4 staging page + fp16 staging
 static void paged_kv_write(int ncol, uint8_t *k4_pool, float *kq4s_pool, uint8_t *v8_pool, float *vscale_pool,
@@ -24520,8 +24618,8 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
     const tq_t4_pool t4p = t4 ? t4_pool_of(t4_layer) : tq_t4_pool();
     paged_kv_write(N, k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions,
                    slot_ids, block_table, max_blocks, page, page_log, st, t4_layer);
-    if (t4 && wave_seg_slot &&                                   // prefill wave on the scalar path: every key trellis
-        paged_t4_encode_wave_layer(wave_seg_slot, wave_seg_off, wave_seg_len, pos_host, wave_K, t4_layer) != 0) return -5;
+    if (t4 && wave_seg_slot &&          // prefill (scalar path) / verify wave: the wave's columns -> trellis for this layer
+        paged_t4_encode_wave_layer(wave_seg_slot, wave_seg_off, wave_seg_len, pos_host, wave_K, t4_layer, st) != 0) return -5;
     int kpages = paged_topk_pages();
     if (kpages > 0 && pos_host && slot_host) {
         if (paged_kmm_refresh(layer, pos_host, slot_host, N, st) != 0) return -3;
@@ -24664,7 +24762,13 @@ static int launch_paged_attn_q4_mma_prefill(
     const tq_t4_pool t4p = t4 ? t4_pool_of(t4_layer) : tq_t4_pool();
     paged_kv_write(T, k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions,
                    slot_ids, block_table, max_blocks, page, page_log, st, t4_layer);
-    if (t4 && paged_t4_encode_wave_layer(seg_slot, seg_off, seg_len, col_pos_host, K, t4_layer) != 0) return -5;
+    if (t4) {
+        if (g_t4_async) {                      // the attention reads the wave's columns from the fp16 staging; encode behind it
+            cudaEventRecord(g_t4_ev, st);
+            cudaStreamWaitEvent(g_t4_stream, g_t4_ev, 0);
+            if (paged_t4_encode_wave_layer(seg_slot, seg_off, seg_len, col_pos_host, K, t4_layer, g_t4_stream) != 0) return -5;
+        } else if (paged_t4_encode_wave_layer(seg_slot, seg_off, seg_len, col_pos_host, K, t4_layer, st) != 0) return -5;
+    }
     // Prefill attention stays dense. Summaries of the pages this wave wrote are refreshed
     // so a later pure decode step can rank them. Decode columns inside a mixed wave are
     // covered here too (they share this KV write).
@@ -24791,6 +24895,7 @@ static int paged_ensure_blocks(int slot, int pos) {
 
 // Upload the block table (always the raw pool blocks) and the per-slot encoded lengths for the next kernels.
 static void paged_upload_tables(cudaStream_t st) {
+    paged_t4_sync(st);                                        // pending side-stream encodes of the last prefill wave
     size_t n = (size_t)g_pg_maxslots * g_pg_maxblk;
     cudaMemcpyAsync(g_block_table, h_block_table, n * sizeof(int), cudaMemcpyHostToDevice, st);
     if (g_pg_t4)
@@ -24800,7 +24905,8 @@ static void paged_upload_tables(cudaStream_t st) {
 // A batch of position ranges (staging rows -> pool rows), one launch set for every full-attention layer
 // (only_layer < 0) or one layer, K and V. Asynchronous on g_qwen.stream.
 struct tq_t4_ranges { unsigned src[TQ_T4_MAXR], dst[TQ_T4_MAXR]; int n[TQ_T4_MAXR]; int nr; };
-static int paged_t4_encode_ranges(const tq_t4_ranges &rg, int only_layer) {
+static int paged_t4_encode_ranges(const tq_t4_ranges &rg, int only_layer, cudaStream_t st = NULL) {
+    if (!st) st = g_qwen.stream;
     if (!g_pg_t4 || !g_t4_cb) return -1;
     if (rg.nr <= 0) return 0;
     tq_t4_job jb;
@@ -24823,19 +24929,19 @@ static int paged_t4_encode_ranges(const tq_t4_ranges &rg, int only_layer) {
     for (int t0 = 0; t0 < ntiles; t0 += TQ_T4_CHUNK) {
         int n = ntiles - t0 < TQ_T4_CHUNK ? ntiles - t0 : TQ_T4_CHUNK;
         jb.tile0 = t0;
-        k_t4_forward<<<n, TQ_T4_NT, 0, g_qwen.stream>>>(jb, g_t4_cb, g_t4_tb, g_t4_best, g_t4_scale);
-        k_t4_walk<<<(n + 127) / 128, 128, 0, g_qwen.stream>>>(jb, g_t4_tb, g_t4_best, g_t4_scale, n);
+        k_t4_forward<<<n, TQ_T4_NT, 0, st>>>(jb, g_t4_cb, g_t4_tb, g_t4_best, g_t4_scale);
+        k_t4_walk<<<(n + 127) / 128, 128, 0, st>>>(jb, g_t4_tb, g_t4_best, g_t4_scale, n);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -4;
 }
 // Append positions [p0, p1) of `slot` to the batch (split at page boundaries); flushes when full.
-static int paged_t4_add_cols(tq_t4_ranges &rg, int slot, int p0, int p1, int only_layer) {
+static int paged_t4_add_cols(tq_t4_ranges &rg, int slot, int p0, int p1, int only_layer, cudaStream_t st = NULL) {
     while (p0 < p1) {
         int lb = p0 >> g_pg_plog, pend = (lb + 1) << g_pg_plog;
         int n = (p1 < pend ? p1 : pend) - p0;
         int phys = h_block_table[(size_t)slot * g_pg_maxblk + lb];
         if (phys < 0) return -2;
-        if (rg.nr == TQ_T4_MAXR) { int rc = paged_t4_encode_ranges(rg, only_layer); if (rc != 0) return rc; rg.nr = 0; }
+        if (rg.nr == TQ_T4_MAXR) { int rc = paged_t4_encode_ranges(rg, only_layer, st); if (rc != 0) return rc; rg.nr = 0; }
         rg.src[rg.nr] = (unsigned)((size_t)slot * g_pg_page + (p0 & (g_pg_page - 1)));
         rg.dst[rg.nr] = (unsigned)((size_t)phys * g_pg_page + (p0 & (g_pg_page - 1)));
         rg.n[rg.nr] = n;
@@ -24852,15 +24958,15 @@ static int paged_t4_encode_cols(int slot, int p0, int p1, int only_layer) {
 // Prefill waves: before layer L's attention, move the wave's columns (positions encl.. last) of every segment
 // into the pool for that layer, so every key the attention reads is trellis (the simulation's semantics).
 static int paged_t4_encode_wave_layer(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos,
-                                      int K, int L) {
+                                      int K, int L, cudaStream_t st) {
     tq_t4_ranges rg; rg.nr = 0;
     for (int k = 0; k < K; k++) {
         int slot = seg_slot[k], first = col_pos[seg_off[k]], last = col_pos[seg_off[k] + seg_len[k] - 1];
         int from = first < h_slot_encl[slot] ? h_slot_encl[slot] : first;
-        int rc = paged_t4_add_cols(rg, slot, from, last + 1, L);
+        int rc = paged_t4_add_cols(rg, slot, from, last + 1, L, st);
         if (rc != 0) return rc;
     }
-    return paged_t4_encode_ranges(rg, L);
+    return paged_t4_encode_ranges(rg, L, st);
 }
 // The wave's columns are committed as written: advance encl (their trellis codes were produced per layer).
 static void paged_t4_wave_done(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos, int K) {
@@ -24937,6 +25043,9 @@ static void paged_t4_free(void) {
     if (g_t4_best) { cudaFree(g_t4_best); g_t4_best = NULL; }
     if (g_t4_scale) { cudaFree(g_t4_scale); g_t4_scale = NULL; }
     if (g_t4_encl_d) { cudaFree(g_t4_encl_d); g_t4_encl_d = NULL; }
+    if (g_t4_stream) { cudaStreamSynchronize(g_t4_stream); cudaStreamDestroy(g_t4_stream); g_t4_stream = NULL; }
+    if (g_t4_ev) { cudaEventDestroy(g_t4_ev); g_t4_ev = NULL; }
+    if (g_t4_done) { cudaEventDestroy(g_t4_done); g_t4_done = NULL; }
     if (h_slot_encl) { free(h_slot_encl); h_slot_encl = NULL; }
     if (h_t4_encl_tmp) { free(h_t4_encl_tmp); h_t4_encl_tmp = NULL; }
     g_t4_stg_rows = 0; g_pg_t4 = 0;
@@ -24963,7 +25072,8 @@ static int paged_t4_load_codebook(void) {
     cudaMemcpyAsync(g_t4_tab, tab, 4096 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaStreamSynchronize(g_qwen.stream);
     free(cb); free(tab);
-    fprintf(stderr, "[paged] TQ_KV_T4: trellis-coded K+V (L=12, 4 bit, codebook %s); in-flight columns FP4 in staging\n", path);
+    fprintf(stderr, "[paged] TQ_KV_T4: trellis-coded K+V (L=12, 4 bit, codebook %s); in-flight columns exact (fp16 staging), prefill encodes %s\n",
+            path, g_t4_async ? "on a side stream" : "synchronous per layer");
     return 0;
 }
 
@@ -24991,6 +25101,13 @@ static int paged_t4_alloc(int max_slots, int num_blocks, int page) {
         cudaMalloc(&g_t4_scale, (size_t)TQ_T4_CHUNK * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&g_t4_encl_d, (size_t)max_slots * sizeof(int)) != cudaSuccess) return -2;
     cudaMemsetAsync(g_t4_encl_d, 0, (size_t)max_slots * sizeof(int), g_qwen.stream);
+    { const char *e = getenv("TQ_KV_T4_ASYNC"); g_t4_async = (e && *e) ? (atoi(e) != 0) : 1; }
+    int prio_lo = 0, prio_hi = 0;                           // the side stream gets the highest priority: its CTAs
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);   // are scheduled ahead of the attention's and are done
+    if (cudaStreamCreateWithPriority(&g_t4_stream, cudaStreamNonBlocking, prio_hi) != cudaSuccess ||   // before the GEMMs
+        cudaEventCreateWithFlags(&g_t4_ev, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&g_t4_done, cudaEventDisableTiming) != cudaSuccess) return -4;
+    cudaEventRecord(g_t4_done, g_qwen.stream);
     h_slot_encl = (int *)calloc((size_t)max_slots, sizeof(int));
     h_t4_encl_tmp = (int *)calloc((size_t)max_slots, sizeof(int));
     if (!h_slot_encl || !h_t4_encl_tmp) return -3;
@@ -25429,7 +25546,7 @@ extern "C" int qwn_paged_reset_slot(int slot) {
         row[lb] = -1;
     }
     h_slot_nb[slot] = 0;
-    if (g_pg_t4) h_slot_encl[slot] = 0;
+    if (g_pg_t4) { h_slot_encl[slot] = 0; paged_t4_sync(g_qwen.stream); }
     size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
     for (int L = 0; L < g_qwen.L; L++) {
         if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
@@ -25728,6 +25845,7 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
         if (rc != -8 && rc != -9) return rc;                     // -8/-9: ring unavailable -> the per-span path
     }
     cudaMemcpyKind kind = dir ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
+    paged_t4_sync(g_qwen.stream);
     char *p = host;
     #define TQ_XFER(dev, bytes) do { \
         void *d_ = (void *)(dev); size_t b_ = (bytes); \
@@ -26030,7 +26148,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         if (last_pos > pf_maxpos) pf_maxpos = last_pos;
     }
     paged_upload_tables(g_qwen.stream);
-    if (g_pg_t4) paged_t4_upload_wave_encl(seg_slot, seg_off, seg_len, col_pos, K, g_qwen.stream);
+    if (g_pg_t4 && !g_t4_async) paged_t4_upload_wave_encl(seg_slot, seg_off, seg_len, col_pos, K, g_qwen.stream);
     cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     for (int j = 0; j < T; j++)
@@ -26130,7 +26248,10 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         for (int f = 0; f < Kf; f++) out_seed[fk[f]] = htmp[f];
     }
     if (g_mtp_on && mtp_hook_prefill(tokens, col_pos, seg_slot, seg_off, seg_len, K, T) != 0) return -108;
-    if (g_pg_t4) paged_t4_wave_done(seg_slot, seg_off, seg_len, col_pos, K);   // the wave's columns are committed
+    if (g_pg_t4) {                                           // the wave's columns are committed (encoded, or being encoded)
+        paged_t4_wave_done(seg_slot, seg_off, seg_len, col_pos, K);
+        if (g_t4_async) cudaEventRecord(g_t4_done, g_t4_stream);
+    }
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -104;
 }
 
