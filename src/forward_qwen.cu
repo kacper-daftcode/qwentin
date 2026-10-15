@@ -1068,8 +1068,9 @@ struct tq_t4_pool {
     const uint8_t *k4s, *v4s;          // staging FP4 codes [stg rows][nkv * 128]
     const float *kq4ss, *vq4ss;        // staging FP4 (scale, zp) [stg rows][nkv * 16] (q4s element type)
     const uint16_t *table;             // [4096] fp16 dequant table (engine nibble order)
+    const uint16_t *f16s;              // staging fp16 rotated K | V [stg rows][nkv][512]: the in-flight columns
     const int *encl;                   // [max_slots] encoded length: positions < encl[slot] are trellis (pool
-                                       // block rows), positions >= encl[slot] FP4 in staging page 2*slot + (lb & 1)
+                                       // block rows), positions >= encl[slot] the in-flight columns (fp16 staging)
     int nblk;                          // pool blocks (block ids >= nblk would be staging pages; unused since the
                                        // raw table is always uploaded -- kept for the kernels' safety checks)
 };
@@ -1119,6 +1120,10 @@ static __device__ __forceinline__ uint32_t tq_t4_vbits(const uint8_t *codes_row,
     const uint32_t b0 = (cb == 0) ? (sw & 0xFFu) : (uint32_t)codes_row[cb - 1];
     const uint32_t b12 = *(const uint16_t *)(codes_row + cb);
     return b0 | (b12 << 8);
+}
+static __device__ __forceinline__ uint32_t tq_t4_f16x2_bf16(uint32_t h2) {
+    return tq_pack_bf16(__half2float(__ushort_as_half((unsigned short)(h2 & 0xFFFFu))),
+                        __half2float(__ushort_as_half((unsigned short)(h2 >> 16))));
 }
 static __device__ __forceinline__ float tq_t4_val(uint32_t bits, int f, const uint16_t *tab, float sc) {
     return __half2float(__ushort_as_half(tab[(bits >> (4 * f)) & 0xFFFu])) * sc;
@@ -22099,9 +22104,9 @@ __global__ void k_tq_paged_attn_q4(
         for (int j = tid; j < clen; j += 256) {        // physical rows for this chunk
             int t = c0 + j;
             int phys = block_table[bt_base + (t >> page_log)];
-            if constexpr (T4) {        // trellis row (pool) for t < encl, else the step's FP4 row in staging
-                pr_chunk[j] = (t < t4p.encl[slot]) ? phys * page + (t & (page - 1))
-                                                   : -1 - ((2 * slot + ((t >> page_log) & 1)) * page + (t & (page - 1)));
+            if constexpr (T4) {        // trellis row (pool) for t < pos, the column's own key (t == pos) from the fp16 staging
+                pr_chunk[j] = (t < pos) ? phys * page + (t & (page - 1))
+                                        : -1 - ((2 * slot + ((t >> page_log) & 1)) * page + (t & (page - 1)));
             } else {
                 pr_chunk[j] = phys * page + (t & (page - 1));
             }
@@ -22118,12 +22123,18 @@ __global__ void k_tq_paged_attn_q4(
                     int d = lane + 32 * e;
                     dot += qn[d] * tq_t4_dq(krow, sw, d, t4tab);
                 }
+            } else if (T4) {                               // in-flight row: fp16 rotated K
+                size_t pr = (size_t)(-1 - pr_chunk[j]);
+                const uint16_t *kf = t4p.f16s + ((pr * nkv + kv_head) << 9);
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    int d = lane + 32 * e;
+                    dot += qn[d] * __half2float(__ushort_as_half(kf[d]));
+                }
             } else {
-                size_t pr = (size_t)(T4 ? (-1 - pr_chunk[j]) : pr_chunk[j]);
-                const uint8_t *kb = T4 ? t4p.k4s : k4_pool;
-                const float *ks = T4 ? t4p.kq4ss : kq4s_pool;
-                const uint8_t *krow = kb + pr * k4_pp + (size_t)kv_head * (hd >> 1);
-                const float *ksz = q4s_adv(ks, pr * kq4s_pp + (size_t)kv_head * 16);
+                size_t pr = (size_t)pr_chunk[j];
+                const uint8_t *krow = k4_pool + pr * k4_pp + (size_t)kv_head * (hd >> 1);
+                const float *ksz = q4s_adv(kq4s_pool, pr * kq4s_pp + (size_t)kv_head * 16);
                 #pragma unroll
                 for (int e = 0; e < 8; e++) {
                     int d = lane + 32 * e;
@@ -22169,12 +22180,15 @@ __global__ void k_tq_paged_attn_q4(
                 acc += s_chunk[j] * tq_t4_dq(vrow, sw, tid, t4tab);
                 continue;
             }
-            size_t pr = (size_t)(T4 ? (-1 - pr_chunk[j]) : pr_chunk[j]);
+            if (T4) {                                      // in-flight row: fp16 rotated V
+                size_t pr = (size_t)(-1 - pr_chunk[j]);
+                acc += s_chunk[j] * __half2float(__ushort_as_half(t4p.f16s[((pr * nkv + kv_head) << 9) + 256 + tid]));
+                continue;
+            }
+            size_t pr = (size_t)pr_chunk[j];
             if constexpr (VQ4) {
-                const uint8_t *vb = T4 ? t4p.v4s : v8_pool;
-                const float *vs = T4 ? t4p.vq4ss : vscale_pool;
-                uint8_t byte = vb[pr * k4_pp + (size_t)kv_head * (hd >> 1) + (tid >> 1)];
-                float2 z = q4s_pair(q4s_adv(vs, pr * kq4s_pp + (size_t)kv_head * 16), 2 * (tid >> 5));
+                uint8_t byte = v8_pool[pr * k4_pp + (size_t)kv_head * (hd >> 1) + (tid >> 1)];
+                float2 z = q4s_pair(q4s_adv(vscale_pool, pr * kq4s_pp + (size_t)kv_head * 16), 2 * (tid >> 5));
                 acc += s_chunk[j] * (((float)((tid & 1) ? (byte >> 4) : (byte & 15)) - z.y) * z.x);
             } else {
                 float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
@@ -22271,9 +22285,9 @@ __global__ void k_tq_paged_attn_q4_split(
         for (int j = tid; j < clen; j += 256) {
             int t = c0 + j;
             int phys = block_table[bt_base + (t >> page_log)];
-            if constexpr (T4) {        // trellis row (pool) for t < encl, else the step's FP4 row in staging
-                pr_chunk[j] = (t < t4p.encl[slot]) ? phys * page + (t & (page - 1))
-                                                   : -1 - ((2 * slot + ((t >> page_log) & 1)) * page + (t & (page - 1)));
+            if constexpr (T4) {        // trellis row (pool) for t < pos, the column's own key (t == pos) from the fp16 staging
+                pr_chunk[j] = (t < pos) ? phys * page + (t & (page - 1))
+                                        : -1 - ((2 * slot + ((t >> page_log) & 1)) * page + (t & (page - 1)));
             } else {
                 pr_chunk[j] = phys * page + (t & (page - 1));
             }
@@ -22290,12 +22304,18 @@ __global__ void k_tq_paged_attn_q4_split(
                     int d = lane + 32 * e;
                     dot += qn[d] * tq_t4_dq(krow, sw, d, t4tab);
                 }
+            } else if (T4) {                               // in-flight row: fp16 rotated K
+                size_t pr = (size_t)(-1 - pr_chunk[j]);
+                const uint16_t *kf = t4p.f16s + ((pr * nkv + kv_head) << 9);
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    int d = lane + 32 * e;
+                    dot += qn[d] * __half2float(__ushort_as_half(kf[d]));
+                }
             } else {
-                size_t pr = (size_t)(T4 ? (-1 - pr_chunk[j]) : pr_chunk[j]);
-                const uint8_t *kb = T4 ? t4p.k4s : k4_pool;
-                const float *ks = T4 ? t4p.kq4ss : kq4s_pool;
-                const uint8_t *krow = kb + pr * k4_pp + (size_t)kv_head * (hd >> 1);
-                const float *ksz = q4s_adv(ks, pr * kq4s_pp + (size_t)kv_head * 16);
+                size_t pr = (size_t)pr_chunk[j];
+                const uint8_t *krow = k4_pool + pr * k4_pp + (size_t)kv_head * (hd >> 1);
+                const float *ksz = q4s_adv(kq4s_pool, pr * kq4s_pp + (size_t)kv_head * 16);
                 #pragma unroll
                 for (int e = 0; e < 8; e++) {
                     int d = lane + 32 * e;
@@ -22332,12 +22352,15 @@ __global__ void k_tq_paged_attn_q4_split(
                 acc += s_chunk[j] * tq_t4_dq(vrow, sw, tid, t4tab);
                 continue;
             }
-            size_t pr = (size_t)(T4 ? (-1 - pr_chunk[j]) : pr_chunk[j]);
+            if (T4) {                                      // in-flight row: fp16 rotated V
+                size_t pr = (size_t)(-1 - pr_chunk[j]);
+                acc += s_chunk[j] * __half2float(__ushort_as_half(t4p.f16s[((pr * nkv + kv_head) << 9) + 256 + tid]));
+                continue;
+            }
+            size_t pr = (size_t)pr_chunk[j];
             if constexpr (VQ4) {
-                const uint8_t *vb = T4 ? t4p.v4s : v8_pool;
-                const float *vs = T4 ? t4p.vq4ss : vscale_pool;
-                uint8_t byte = vb[pr * k4_pp + (size_t)kv_head * (hd >> 1) + (tid >> 1)];
-                float2 z = q4s_pair(q4s_adv(vs, pr * kq4s_pp + (size_t)kv_head * 16), 2 * (tid >> 5));
+                uint8_t byte = v8_pool[pr * k4_pp + (size_t)kv_head * (hd >> 1) + (tid >> 1)];
+                float2 z = q4s_pair(q4s_adv(vscale_pool, pr * kq4s_pp + (size_t)kv_head * 16), 2 * (tid >> 5));
                 acc += s_chunk[j] * (((float)((tid & 1) ? (byte >> 4) : (byte & 15)) - z.y) * z.x);
             } else {
                 float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
@@ -22795,11 +22818,11 @@ static __device__ __forceinline__ void tq_gqa_mma_supertile_mix(
     int tid, int warp, int lane, int gr, int t4,
     int t0, int phys, int stg, int nenc, int pos, int page, int group, int nkv, float rsc,
     const uint8_t *kcb, const uint8_t *kside, const uint8_t *vcb, const uint8_t *vside, int kv_head,
-    const uint16_t *tab,
-    const uint8_t *kcb4s, const float *ksz4s, const uint8_t *vcb8s, const float *vscbs) {
+    const uint16_t *tab, const uint16_t *f16s) {
     const size_t pr0 = (size_t)phys * page + (size_t)(t0 & (page - 1));          // pool rows
     const size_t sr0 = (size_t)stg * page + (size_t)(t0 & (page - 1));           // staging rows
-    const size_t cstride4 = (size_t)nkv * 128, szstride = (size_t)nkv * 16;
+    const size_t cstride4 = (size_t)nkv * 128;
+    const int diag = pos - t0;                          // the column's own key: exact (fp16), never the code
 #define TQ_GOFF(lp) ((size_t)(min((lp), pos) - t0))
     float s0[4], s1[4];
     #pragma unroll
@@ -22808,48 +22831,41 @@ static __device__ __forceinline__ void tq_gqa_mma_supertile_mix(
     const int p0 = tp + gr, p1 = tp + 8 + gr;
     {
         const size_t o0 = TQ_GOFF(p0), o1 = TQ_GOFF(p1);
-        const bool tr0 = (int)o0 < nenc, tr1 = (int)o1 < nenc;
-        const uint8_t *kr0 = tr0 ? kcb + (pr0 + o0) * cstride4 : kcb4s + (sr0 + o0) * cstride4;
-        const uint8_t *kr1 = tr1 ? kcb + (pr0 + o1) * cstride4 : kcb4s + (sr0 + o1) * cstride4;
+        const bool tr0 = (int)o0 < nenc && (int)o0 != diag, tr1 = (int)o1 < nenc && (int)o1 != diag;
+        // trellis rows: 16 code bytes per group; in-flight rows: their fp16 rotated K (exact), 4 halves per group
+        const uint8_t *kr0 = tr0 ? kcb + (pr0 + o0) * cstride4 : NULL;
+        const uint8_t *kr1 = tr1 ? kcb + (pr0 + o1) * cstride4 : NULL;
+        const uint16_t *kf0 = tr0 ? NULL : f16s + (((sr0 + o0) * nkv + kv_head) << 9);
+        const uint16_t *kf1 = tr1 ? NULL : f16s + (((sr0 + o1) * nkv + kv_head) << 9);
         const uint32_t sw0 = tr0 ? tq_t4_side(kside, pr0 + o0, nkv, kv_head) : 0u;
         const uint32_t sw1 = tr1 ? tq_t4_side(kside, pr0 + o1, nkv, kv_head) : 0u;
-        const float *sz0 = tr0 ? NULL : q4s_adv(ksz4s, (sr0 + o0) * szstride);
-        const float *sz1 = tr1 ? NULL : q4s_adv(ksz4s, (sr0 + o1) * szstride);
         const float sc0 = tq_t4_scale(sw0), sc1 = tq_t4_scale(sw1);
         uint32_t prev0 = sw0 & 0xFFu, prev1 = sw1 & 0xFFu;
         #pragma unroll
         for (int g = 0; g < 8; g++) {
-            const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
-            const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
             uint32_t bk0[2], bk8[2], ek0[2], ek8[2];
             if (tr0) {
+                const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
                 tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8);
                 prev0 = kp0.w >> 24;
             } else {
-                const float2 ps = q4s_pair(sz0, 2 * g);
-                const uint32_t w[4] = {kp0.x, kp0.y, kp0.z, kp0.w};
-                const uint8_t *b = (const uint8_t *)w;
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
-                    const int bi = 8 * cc + t4;
-                    const uint8_t a0 = b[bi], a8 = b[bi + 4];
-                    bk0[cc] = tq_pack_bf16(((float)(a0 & 15) - ps.y) * ps.x, ((float)(a0 >> 4) - ps.y) * ps.x);
-                    bk8[cc] = tq_pack_bf16(((float)(a8 & 15) - ps.y) * ps.x, ((float)(a8 >> 4) - ps.y) * ps.x);
+                    const int ch = 32 * g + 16 * cc + 2 * t4;
+                    bk0[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch));
+                    bk8[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch + 8));
                 }
             }
             if (tr1) {
+                const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
                 tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8);
                 prev1 = kp1.w >> 24;
             } else {
-                const float2 ps = q4s_pair(sz1, 2 * g);
-                const uint32_t w[4] = {kp1.x, kp1.y, kp1.z, kp1.w};
-                const uint8_t *b = (const uint8_t *)w;
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
-                    const int bi = 8 * cc + t4;
-                    const uint8_t e0 = b[bi], e8 = b[bi + 4];
-                    ek0[cc] = tq_pack_bf16(((float)(e0 & 15) - ps.y) * ps.x, ((float)(e0 >> 4) - ps.y) * ps.x);
-                    ek8[cc] = tq_pack_bf16(((float)(e8 & 15) - ps.y) * ps.x, ((float)(e8 >> 4) - ps.y) * ps.x);
+                    const int ch = 32 * g + 16 * cc + 2 * t4;
+                    ek0[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch));
+                    ek8[cc] = tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch + 8));
                 }
             }
             #pragma unroll
@@ -22915,17 +22931,18 @@ static __device__ __forceinline__ void tq_gqa_mma_supertile_mix(
         #pragma unroll
         for (int rr = 0; rr < 4; rr++) {
             const size_t o = TQ_GOFF(r0 + (rr >> 1) * 8 + (rr & 1));
-            if ((int)o < nenc) {
+            if ((int)o < nenc && (int)o != diag) {
                 const uint32_t z = tq_t4_side(vside, pr0 + o, nkv, kv_head);
                 const uint32_t c = tq_t4_vbits(vcb + (pr0 + o) * cstride4, z, cb);
                 const float vs = tq_t4_scale(z);
                 #pragma unroll
                 for (int f = 0; f < 4; f++) v[rr][f] = tq_t4_val(c, f, tab, vs);
-            } else {
-                const uint32_t c = *(const uint16_t *)(vcb8s + (sr0 + o) * cstride4 + cb);
-                const float2 z = q4s_pair(q4s_adv(vscbs, (sr0 + o) * szstride), 2 * warp);
-                #pragma unroll
-                for (int f = 0; f < 4; f++) v[rr][f] = ((float)((c >> (4 * f)) & 15u) - z.y) * z.x;
+            } else {                                    // in-flight row: fp16 rotated V, channels 2cb .. 2cb+3
+                const uint2 w = *(const uint2 *)(f16s + (((sr0 + o) * nkv + kv_head) << 9) + 256 + 2 * cb);
+                v[rr][0] = __half2float(__ushort_as_half((unsigned short)(w.x & 0xFFFFu)));
+                v[rr][1] = __half2float(__ushort_as_half((unsigned short)(w.x >> 16)));
+                v[rr][2] = __half2float(__ushort_as_half((unsigned short)(w.y & 0xFFFFu)));
+                v[rr][3] = __half2float(__ushort_as_half((unsigned short)(w.y >> 16)));
             }
         }
         #pragma unroll
@@ -23050,25 +23067,21 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_mma(
         nst = hi < nst_all ? hi : nst_all;
     }
     const size_t bt_base = (size_t)slot * max_blocks;
-    const int t4_encl = T4 ? t4p.encl[slot] : 0;                // positions < encl are trellis (T4)
-    // one 128-key super-tile of block `physd` at keys t0d..: T4 -> trellis rows (< encl), the step's own FP4
-    // rows in the staging page (>= encl), or both (mixed); else the FP4 / E4M3 pool
+    // T4: every key before the column's own position is a trellis row (prefill and verify waves encode their
+    // columns per layer before the attention, decode steps right after the step); the column's own key (row
+    // pos) is read exact from the fp16 staging. A super-tile is all-trellis or the mixed one holding row pos.
 #define TQ_GQA_SUPERTILE(t0d, physd) \
     do { \
         if constexpr (T4) { \
-            const int nenc_ = t4_encl - (t0d); \
+            const int nenc_ = pos - (t0d); \
             const int stg_ = 2 * slot + (((t0d) >> page_log) & 1); \
             if (nenc_ >= 128) \
                 tq_gqa_mma_supertile_t4(oacc, sm, wmax, wsum, mst, lst, alph, tid, warp, lane, gr, t4, \
                     (t0d), (physd), pos, page, group, nkv, rsc, kcb4, t4p.kside, vcb8, t4p.vside, kv_head, t4tab); \
-            else if (nenc_ <= 0) \
-                tq_gqa_mma_supertile<1>(oacc, sm, wmax, wsum, mst, lst, alph, tid, warp, lane, gr, t4, \
-                    (t0d), stg_, pos, page, group, nkv, rsc, \
-                    kcb4s, cstride4, ksz4s, szstride, vcb8s, cstride, vscbs); \
             else \
                 tq_gqa_mma_supertile_mix(oacc, sm, wmax, wsum, mst, lst, alph, tid, warp, lane, gr, t4, \
-                    (t0d), (physd), stg_, nenc_, pos, page, group, nkv, rsc, kcb4, t4p.kside, vcb8, t4p.vside, \
-                    kv_head, t4tab, kcb4s, ksz4s, vcb8s, vscbs); \
+                    (t0d), (physd), stg_, nenc_ < 0 ? 0 : nenc_, pos, page, group, nkv, rsc, kcb4, t4p.kside, \
+                    vcb8, t4p.vside, kv_head, t4tab, t4p.f16s); \
         } else { \
             tq_gqa_mma_supertile<VQ4>(oacc, sm, wmax, wsum, mst, lst, alph, tid, warp, lane, gr, t4, \
                 (t0d), (physd), pos, page, group, nkv, rsc, kcb4, cstride4, ksz4, szstride, vcb8, cstride, vscb); \
@@ -24455,7 +24468,7 @@ static tq_t4_pool t4_pool_of(int L) {
     p.kside = g_t4_kside[L]; p.vside = g_t4_vside[L];
     p.k4s = g_t4_stg_k4[L]; p.v4s = g_t4_stg_v4[L];
     p.kq4ss = g_t4_stg_kq4s[L]; p.vq4ss = g_t4_stg_vq4s[L];
-    p.table = g_t4_tab; p.encl = g_t4_encl_d; p.nblk = g_pg_nblocks;
+    p.table = g_t4_tab; p.f16s = g_t4_stg_f16[L]; p.encl = g_t4_encl_d; p.nblk = g_pg_nblocks;
     return p;
 }
 static int paged_t4_encode_wave_layer(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos,
@@ -24855,14 +24868,6 @@ static int paged_t4_encode_wave_layer(const int *seg_slot, const int *seg_off, c
         if (rc != 0) return rc;
     }
     return paged_t4_encode_ranges(rg, L);
-}
-// The slot's committed length grew to `len`: the committed columns [encl, len) become trellis (all layers).
-static int paged_t4_commit_len(int slot, int len) {
-    if (!g_pg_t4 || len <= h_slot_encl[slot]) return 0;
-    int rc = paged_t4_encode_cols(slot, h_slot_encl[slot], len, -1);
-    if (rc != 0) return rc;
-    h_slot_encl[slot] = len;
-    return 0;
 }
 // The wave's columns are committed as written: advance encl (their trellis codes were produced per layer).
 static void paged_t4_wave_done(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos, int K) {
@@ -26483,6 +26488,7 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
     for (int k = 0; k < K; k++) { h_vf_seg_slot[k] = seg_slot[k]; h_vf_seg_off[k] = seg_off[k]; h_vf_seg_len[k] = seg_len[k]; }
     for (int j = 0; j < T; j++) { h_vf_tok[j] = tokens[j]; h_vf_pos[j] = col_pos[j]; }
     paged_upload_tables(g_qwen.stream);
+    if (g_pg_t4) paged_t4_upload_wave_encl(seg_slot, seg_off, seg_len, col_pos, K, g_qwen.stream);
     cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_vf_seg_d, h_vf_seg_slot, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
@@ -26542,7 +26548,7 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
                                      T, vf_maxpos, L, col_pos, col_slot, 1, g_qwen.stream,
-                                     g_pg_t4 ? L : -1) != 0) return -67;
+                                     g_pg_t4 ? L : -1, g_pg_t4 ? seg_slot : NULL, seg_off, seg_len, K) != 0) return -67;
             if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -68;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -68;
             if (fuse) {
@@ -26721,9 +26727,11 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
     }
     g_pdl_small = 0;
     if (g_mtp_on && mtp_hook_commit(m) != 0) return -10;      // MTP trunk over the accepted columns
-    if (g_pg_t4)                                            // the accepted columns -> trellis
-        for (int c = 0; c < m; c++)
-            if (paged_t4_commit_len(h_vf_cseg[0][c], h_vf_pos[h_vf_cseg[1][c]] + h_vf_cseg[2][c]) != 0) return -11;
+    if (g_pg_t4)                                            // the accepted columns were encoded per layer by the wave
+        for (int c = 0; c < m; c++) {
+            int slot = h_vf_cseg[0][c], len = h_vf_pos[h_vf_cseg[1][c]] + h_vf_cseg[2][c];
+            if (len > h_slot_encl[slot]) h_slot_encl[slot] = len;
+        }
     if (cudaGetLastError() != cudaSuccess) return -8;
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -9;
 }

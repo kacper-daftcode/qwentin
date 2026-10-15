@@ -86,7 +86,7 @@ def kv_summary(L, total_blocks, page):
     """'KV <format> <KiB>/token, <tokens> pooled tokens' for the startup line (needs qwn_paged_token_bytes)."""
     fmt = "int4 K + int4 V" if os.environ.get("TQ_KV_V4", "0") not in ("", "0") else "int4 K + E4M3 V"
     if os.environ.get("TQ_KV_T4", "0") not in ("", "0"):
-        fmt = "trellis-4 K + V (12-bit states, complete pages; newest page " + fmt + ")"
+        fmt = "trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16)"
     if not L.has_token_bytes:
         return fmt
     tb = int(L.qwn_paged_token_bytes())
@@ -1270,11 +1270,13 @@ def main():
                          "12 slots); opt-5.75 needs --no-kv-v4 (E4M3 V) to stay at FP8 quality at long context.")
     ap.add_argument("--no-kv-v4", dest="kv_v4", action="store_false")
     ap.add_argument("--kv-t4", dest="kv_t4", action="store_true", default=False,
-                    help="B2 (session 10): trellis-coded K and V for every COMPLETE 128-token page (TQ_KV_T4=1; "
-                         "12-bit-state bitshift trellis, 4 bits per value, fp16 RMS scale per vector, trained codebook "
-                         "--kv-t4-codebook): 16.5 instead of 20.0 KiB per pooled token; the newest page of a slot stays "
-                         "int4 K+V (needs --kv-v4) in a per-slot staging area and is encoded when it completes "
-                         "(~3 ms per page). Size --num-blocks with analysis/pool_size.py (TQ_KV_T4=1).")
+                    help="B2 (session 10): trellis-coded K and V for every committed token (TQ_KV_T4=1; 12-bit-state "
+                         "bitshift trellis, 4 bits per value, fp16 RMS scale per vector, trained codebook "
+                         "--kv-t4-codebook): 16.5 instead of 20.0 KiB per pooled token. Prefill and verify waves encode "
+                         "their columns per layer, decode steps after the step (~3 ms per 128-column wave, ~0.2 ms per "
+                         "step); the in-flight columns are attended exact from an fp16 staging ring (needs --kv-v4). "
+                         "Size --num-blocks with analysis/pool_size.py (TQ_KV_T4=1): 4500 blocks = 576K tokens at ~30 GB "
+                         "on opt-5.75 with 12 slots.")
     ap.add_argument("--kv-t4-codebook", default="/mnt/nvme/qwen256k/analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32",
                     help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK)")
     ap.add_argument("--pdl", dest="pdl", action="store_true", default=True,
