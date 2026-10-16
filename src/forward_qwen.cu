@@ -20595,6 +20595,65 @@ __global__ void __launch_bounds__(1024) k_tq_exl3_bf16_wide(float *out, const ui
     if (tid < 8 && n0 + tid < N) out[(size_t)(n0 + tid) * M + m] = red[tid][0];
 }
 
+// The same Linears at prefill N, 4 rows per block (session 10, prefill thread): the block-per-row kernel above cost
+// 30 µs per call at N = 128 (512 blocks each re-reading 8 token rows = ~80 MB of L2 traffic per 320 KB weight, and a
+// 10-step 1024-thread tree per block: 2.9 ms of a 69 ms prefill wave for in_proj_b + in_proj_a). Same per-thread partial
+// sums (k = tid + 1024 i, i ascending) and the same tree (stride 512 .. 1, red[tid] += red[tid + stride]) -> bitwise;
+// the five in-warp levels (stride 16 .. 1) run as shfl_down on warp 0 (the same operand pairs), the rows one after the
+// other through one 32 KB smem buffer. grid (M / 4, ceil(N / 8)). K % 1024 == 0, M % 4 == 0.
+__global__ void __launch_bounds__(1024) k_tq_exl3_bf16_wide_r4(float *out, const uint16_t *w, const float *x,
+                                                               int M, int K, int N) {
+    __shared__ float red[8][1024];
+    int m0 = blockIdx.x * 4, n0 = blockIdx.y * 8, tid = threadIdx.x;
+    int nn = N - n0 < 8 ? N - n0 : 8;
+    float acc[4][8];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        #pragma unroll
+        for (int c = 0; c < 8; c++) acc[r][c] = 0.0f;
+    for (int k = tid; k < K; k += 1024) {
+        float xv[8];
+        #pragma unroll
+        for (int c = 0; c < 8; c++) xv[c] = (c < nn) ? __ldg(x + (size_t)(n0 + c) * K + k) : 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            float wv = tq_bf16_to_float(__ldg(w + (size_t)(m0 + r) * K + k));
+            #pragma unroll
+            for (int c = 0; c < 8; c++) acc[r][c] += wv * xv[c];
+        }
+    }
+    int lane = tid & 31;
+    for (int r = 0; r < 4; r++) {
+        if (r > 0) __syncthreads();                   // red is free again (warp 0 finished the previous row)
+        #pragma unroll
+        for (int c = 0; c < 8; c++) red[c][tid] = acc[r][c];
+        __syncthreads();
+        for (int stride = 512; stride >= 32; stride >>= 1) {
+            if (tid < stride) {
+                #pragma unroll
+                for (int c = 0; c < 8; c++) red[c][tid] += red[c][tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid < 32) {
+            float v[8];
+            #pragma unroll
+            for (int c = 0; c < 8; c++) v[c] = red[c][lane];
+            #pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                #pragma unroll
+                for (int c = 0; c < 8; c++) {
+                    float o = __shfl_down_sync(0xffffffffu, v[c], stride);
+                    if (lane < stride) v[c] += o;
+                }
+            }
+            if (lane == 0) {
+                for (int c = 0; c < nn; c++) out[(size_t)(n0 + c) * M + m0 + r] = v[c];
+            }
+        }
+    }
+}
+
 // Decode-size N: the two bf16 Linears that share an input (GDN in_proj_b / in_proj_a, M rows each)
 // in one launch. Block = (row of either weight, group of 8 tokens), 256 threads x 4-wide K chunks,
 // warp shuffles + one smem pass to reduce (the block-per-row kernel above spends ~4 us per call in
@@ -20895,7 +20954,12 @@ static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (!g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
     if (w->exl3_kbits == 0) {
         if (!w->d_exl3_bf16) return -111;
-        k_tq_exl3_bf16_wide<<<dim3(M, (N + 7) / 8), 1024, 0, g_qwen.stream>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
+        static int r4 = -1;
+        if (r4 < 0) { const char *e = getenv("TQ_EXL3_BF16_R4"); r4 = (e && *e) ? (atoi(e) != 0) : 1; }
+        if (r4 && N > 16 && (M & 3) == 0 && (K & 1023) == 0)
+            k_tq_exl3_bf16_wide_r4<<<dim3(M / 4, (N + 7) / 8), 1024, 0, g_qwen.stream>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
+        else
+            k_tq_exl3_bf16_wide<<<dim3(M, (N + 7) / 8), 1024, 0, g_qwen.stream>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
         return 0;
     }
     size_t need_w = 0;
