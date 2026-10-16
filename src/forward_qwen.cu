@@ -26161,6 +26161,13 @@ static size_t park_spans(int slot, int upto_pos, std::vector<tq_span> &sp) {
                 if (cnt > page) cnt = page;
                 if (cnt <= 0) break;
                 size_t bo = (size_t)phys * page;
+                if (g_pg_t4) {                                // TQ_KV_T4: trellis rows + side words (same order as paged_slot_xfer)
+                    add(g_pool_k4[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                    add(g_t4_kside[L] + bo * nkv * 4, (size_t)cnt * nkv * 4);
+                    add(g_pool_v8[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                    add(g_t4_vside[L] + bo * nkv * 4, (size_t)cnt * nkv * 4);
+                    continue;
+                }
                 add(g_pool_k4[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
                 add((char *)g_pool_kq4s[L] + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
                 if (g_pg_v4) {
@@ -26261,12 +26268,12 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
     int *row = h_block_table + (size_t)slot * g_pg_maxblk;
     int n = upto_pos + 1, nb = (upto_pos >> g_pg_plog) + 1;
     if (nb > h_slot_nb[slot]) return -3;                         // slot does not own that many blocks
+    paged_t4_sync(g_qwen.stream);                                // TQ_KV_T4: the side-stream encodes of this slot are in the pool
     if (park_ring_enabled()) {
         int rc = paged_slot_xfer_ring(slot, upto_pos, host, dir);
         if (rc != -8 && rc != -9) return rc;                     // -8/-9: ring unavailable -> the per-span path
     }
     cudaMemcpyKind kind = dir ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
-    paged_t4_sync(g_qwen.stream);
     char *p = host;
     #define TQ_XFER(dev, bytes) do { \
         void *d_ = (void *)(dev); size_t b_ = (bytes); \
