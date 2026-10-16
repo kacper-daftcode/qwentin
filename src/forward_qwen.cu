@@ -20255,13 +20255,29 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const f
 #ifndef TQ_EXL3_L2PF_KB7
 #define TQ_EXL3_L2PF_KB7 0
 #endif
+// 128-token units (NG = 16; session 10, prefill-GEMM thread): ncu of the 64-token units has the tensor pipe 36-39 %
+// active -- one m16n8k16 f16 HMMA takes 16 pipe cycles per sub-partition, and every warp spends ~100 issue slots of
+// codeword extraction + loads per 8 HMMAs, with only 4 warps per scheduler (128 registers, 2 blocks/SM) to interleave
+// them (8.5 cycles per issued instruction: long-scoreboard 2.1, math-pipe throttle 2.1, fixed-latency wait 1.8). A
+// 128-token unit feeds 16 HMMAs (256 pipe cycles) per dequantized tile; it runs at ONE block per SM (255 registers:
+// 96 accumulators, a double-buffered B-fragment set, a 4-tile weight ring, no spills), so the two warps of a scheduler
+// alternate HMMA bursts and dequant phases. Same k-walk, fold schedule and -- for even feature-block counts -- the same
+// k-split count as the 64-token units at 128 columns: bitwise identical outputs.
+#ifndef TQ_EXL3_NG16_BLOCKS
+#define TQ_EXL3_NG16_BLOCKS 1
+#endif
+#ifndef TQ_EXL3_NG16_PF
+#define TQ_EXL3_NG16_PF 4
+#endif
 template <int KB, int NG>
-__global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
-                                                           const uint16_t *trellis, const uint32_t *bfrag,
-                                                           const uint16_t *svh, int M, int Kt16, int nvar,
-                                                           int GP, int g_base, int ntg, int k_splits, int per, int *ctr) {
+__global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : (NG >= 16 ? TQ_EXL3_NG16_BLOCKS : 2))
+k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
+                    const uint16_t *trellis, const uint32_t *bfrag,
+                    const uint16_t *svh, int M, int Kt16, int nvar,
+                    int GP, int g_base, int ntg, int k_splits, int per, int *ctr) {
     constexpr int NW = 8 * KB;
-    constexpr int PF = (NG <= 4) ? 4 : 2;         // tiles in flight per warp (register ring)
+    constexpr int PF = (NG <= 4) ? 4 : (NG >= 16 ? TQ_EXL3_NG16_PF : 2);   // tiles in flight per warp (register ring)
+    constexpr bool BPF = (NG >= 16);                // B fragments double-buffered one tile ahead
     constexpr int RW = 2 * tq_exl3_win<KB>::NGRP;   // words per lane per tile
     __shared__ int s_unit;
     __shared__ __align__(16) float s_red[8][128];
@@ -20322,9 +20338,8 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
         };
         // One tile's NG MMAs against the tokens (A fragment already dequantized). Group pairs
         // are contiguous per lane: two groups per 16-byte load, coalesced across the warp.
-        auto tile_mma = [&](uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, int kt) {
+        auto load_b = [&](int kt, uint32_t (&bw)[NG][2]) {
             const uint32_t *bp = bfrag + (((size_t)kt * GP + gp0) * 32 + lane) * 4;
-            uint32_t bw[NG][2];
             if (NG >= 2) {
                 #pragma unroll
                 for (int g = 0; g < NG; g += 2) {
@@ -20335,6 +20350,8 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
                 uint2 q = __ldg((const uint2 *)(bp + half0 * 2));
                 bw[0][0] = q.x; bw[0][1] = q.y;
             }
+        };
+        auto mma_b = [&](uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, const uint32_t (&bw)[NG][2]) {
             #pragma unroll
             for (int g = 0; g < NG; g++) {
                 if (ACC16) {
@@ -20352,10 +20369,15 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
                 }
             }
         };
+        auto tile_mma = [&](uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, int kt) {
+            uint32_t bw[NG][2];
+            load_b(kt, bw);
+            mma_b(a0, a1, a2, a3, bw);
+        };
         // Register ring: pf[d] holds the lane's words of tile kt+d (direct per-lane loads of
         // the two words of each codeword group; L1 absorbs the overlap between lanes).
         constexpr bool STREAM = !(TQ_EXL3_WIDE_LDG && NG >= 8);
-        constexpr int L2PF = (NG == 8 && (KB != 7 || TQ_EXL3_L2PF_KB7)) ? TQ_EXL3_L2PF : 0;   // NG=16 (lm_head) spills more with it
+        constexpr int L2PF = (NG >= 8 && (KB != 7 || TQ_EXL3_L2PF_KB7)) ? TQ_EXL3_L2PF : 0;
         uint32_t pf[PF][RW];
         #pragma unroll
         for (int d = 0; d < PF; d++)
@@ -20367,6 +20389,49 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
         }
         if (!waited) { tq_pdl_wait(); waited = true; }
         int kt = t0;
+        if (BPF) {
+            // 128-token units: B fragments double-buffered one tile ahead (bwb[(kt - t0 + d) & 1]; PF is even, so the
+            // parity is d & 1 in every iteration), the ring and the L2 prefetch as below. Same MMA order per tile.
+            static_assert(!BPF || (PF % 2) == 0, "B double buffer needs an even ring");
+            static_assert(!BPF || FOLD == 8, "the fold rule below encodes FOLD = 8 with the 2-tile ring's tail");
+            // fp16 fold points of the 2-tile-ring schedule below (bitwise identity with the 64-token units): after
+            // every 8th tile while at least 4 tiles remain, then after the tail's 2-tile chunks -- i.e. after tile
+            // c (1-based) when c % 8 == 0 && c <= nE - 2, or c == nE, or c == n, with nE = n rounded down to even.
+            const int nE = (t1 - t0) & ~1;
+            uint32_t bwb[2][NG][2];
+            if (t0 < t1) load_b(t0, bwb[0]);
+            for (; kt + 2 * PF <= t1; kt += PF) {     // c <= n - PF here: only the 8-tile rule applies
+                #pragma unroll
+                for (int d = 0; d < PF; d++) {
+                    uint32_t r[RW];
+                    #pragma unroll
+                    for (int q = 0; q < RW; q++) r[q] = pf[d][q];
+                    win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                    if (L2PF > 0 && kt + d + PF + L2PF < t1) win.prefetch(tr + (size_t)(kt + d + PF + L2PF) * kstride);
+                    load_b(kt + d + 1, bwb[(d + 1) & 1]);          // kt + d + 1 < t1: 2*PF tiles are left
+                    uint32_t a0, a1, a2, a3;
+                    win.frag(r, a0, a1, a2, a3);
+                    mma_b(a0, a1, a2, a3, bwb[d & 1]);
+                    if (ACC16 && (((kt - t0 + d + 1) & 7) == 0)) fold16();
+                }
+            }
+            for (; kt < t1; kt += PF) {
+                #pragma unroll
+                for (int d = 0; d < PF; d++) {
+                    if (kt + d >= t1) break;
+                    uint32_t r[RW];
+                    #pragma unroll
+                    for (int q = 0; q < RW; q++) r[q] = pf[d][q];
+                    if (kt + d + PF < t1) win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                    if (kt + d + 1 < t1) load_b(kt + d + 1, bwb[(d + 1) & 1]);
+                    uint32_t a0, a1, a2, a3;
+                    win.frag(r, a0, a1, a2, a3);
+                    mma_b(a0, a1, a2, a3, bwb[d & 1]);
+                    const int c = kt - t0 + d + 1;
+                    if (ACC16 && ((((c & 7) == 0) && c <= nE - 2) || c == nE)) fold16();
+                }
+            }
+        } else {
         // main loop: PF tiles in hand and PF more guaranteed ahead -> no per-tile branches
         for (; kt + 2 * PF <= t1; kt += PF) {
             #pragma unroll
@@ -20396,6 +20461,7 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
                 tile_mma(a0, a1, a2, a3, kt + d);
             }
             if (ACC16) fold16();
+        }
         }
         fold16();
         int row0 = nt * 16 + gid, row1 = row0 + 8;
@@ -20615,6 +20681,11 @@ static int exl3_unit_ng(int N, int MB) {
     // lm_head, whose 1940 feature blocks fill the GPU with 128-token units and no split
     // (1.47 vs 1.63 ms); the k/v projections (8 feature blocks) need 32-token units.
     int units16 = MB * ((N + 127) / 128);
+    // TQ_EXL3_WIDE_NG16 (session 10, prefill thread): 128-token units at one block per SM for every Linear with
+    // >= 32 of them (the k/v projections keep their 32-token units) -- see k_tq_exl3_wide_gemm's NG = 16 notes.
+    static int ng16 = -1;
+    if (ng16 < 0) { const char *f = getenv("TQ_EXL3_WIDE_NG16"); ng16 = (f && *f) ? (atoi(f) != 0) : 0; }
+    if (ng16 && N >= 128 && units16 >= 32) return 16;
     if (units16 >= 1024) return 16;
     int units8 = MB * ((N + 63) / 64);
     if (units8 >= 64) return 8;
