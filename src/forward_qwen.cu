@@ -1080,6 +1080,28 @@ static __device__ __forceinline__ void tq_t4_load_table(const uint16_t *g, uint1
     dst[tid] = src[tid];
     dst[tid + 256] = src[tid + 256];
 }
+// Table replication (B2-eng lever 1, 2026-10-16): the lookups' 12-bit indices are random, so 32 lanes hit random banks
+// (3.4 wavefronts per LDS measured). TR interleaved copies, copy r's word j (entries 2j, 2j+1) at word TR*j + r, put
+// copy r on the banks == r (mod TR) only; lane l reads copy (l & (TR-1)), so conflicts stay within the 32/TR lanes of a
+// copy over 32/TR banks (expected wavefronts 3.53 / 3.07 / 2.61 for TR = 1 / 2 / 4). Entry e of copy r is at uint16
+// index ((e << LOG) & ~(2 TR - 1)) | 2 r | (e & 1); the per-lane 2 r is precomputed (cr).
+template <int TR> struct tq_t4_tab {
+    static constexpr int LOG = (TR == 4) ? 2 : (TR == 2) ? 1 : 0;
+    static constexpr int ENTRIES = TR * 4096;
+    static __device__ __forceinline__ uint32_t cr(int lane) { return (uint32_t)((lane & (TR - 1)) << 1); }
+    static __device__ __forceinline__ uint32_t idx(uint32_t e, uint32_t cr) {
+        return TR == 1 ? e : ((((e << LOG) & ~(uint32_t)(2 * TR - 1)) | cr) | (e & 1u));
+    }
+    static __device__ __forceinline__ void load(const uint16_t *g, uint16_t *s, int tid) {
+        const uint32_t *src = (const uint32_t *)g;             // word w = entries (2w, 2w+1)
+        uint32_t *dst = (uint32_t *)s;
+        for (int w = tid; w < 2048; w += 256) {
+            const uint32_t v = src[w];
+            #pragma unroll
+            for (int r = 0; r < TR; r++) dst[w * TR + r] = v;
+        }
+    }
+};
 // one vector's side word: prefix byte | fp16 scale bits << 8
 static __device__ __forceinline__ uint32_t tq_t4_side(const uint8_t *side, size_t row, int nkv, int kv_head) {
     return *(const uint32_t *)(side + (row * nkv + kv_head) * 4);
@@ -1093,38 +1115,42 @@ static __device__ __forceinline__ float tq_t4_scale(uint32_t sw) {
 static __device__ __forceinline__ uint32_t tq_t4_pair(uint32_t x, uint32_t y, int t4) {
     return __funnelshift_r(x, y, 8 * t4) & 0xFFFFu;
 }
-static __device__ __forceinline__ uint32_t tq_t4_bk(uint32_t pair, const uint16_t *tab, float sc) {
-    const float lo = __half2float(__ushort_as_half(tab[pair & 0xFFFu])) * sc;
-    const float hi = __half2float(__ushort_as_half(tab[(pair >> 4) & 0xFFFu])) * sc;
+template <int TR = 1>
+static __device__ __forceinline__ uint32_t tq_t4_bk(uint32_t pair, const uint16_t *tab, float sc, uint32_t cr = 0) {
+    const float lo = __half2float(__ushort_as_half(tab[tq_t4_tab<TR>::idx(pair & 0xFFFu, cr)])) * sc;
+    const float hi = __half2float(__ushort_as_half(tab[tq_t4_tab<TR>::idx((pair >> 4) & 0xFFFu, cr)])) * sc;
     return tq_pack_bf16(lo, hi);
 }
 // Q.K^T B-fragments of one key row for 32-channel group g (two k16 chunks): the thread (gr, t4)
 // supplies channels {16c + 2t4, +1} (bk0[cc]) and {16c + 2t4 + 8, +9} (bk8[cc]) of chunk c = 2g + cc.
 // w = the row's 16 code bytes of group g, prevb = the code byte before them (the prefix byte at g = 0).
+template <int TR = 1>
 static __device__ __forceinline__ void tq_t4_kfrags(const uint4 kp, uint32_t prevb, int t4, float sc,
-                                                    const uint16_t *tab, uint32_t bk0[2], uint32_t bk8[2]) {
+                                                    const uint16_t *tab, uint32_t bk0[2], uint32_t bk8[2], uint32_t cr = 0) {
     const uint32_t w[4] = {kp.x, kp.y, kp.z, kp.w};
     #pragma unroll
     for (int k = 0; k < 4; k++) {
         const uint32_t lowb = (k == 0) ? prevb : (w[k - 1] >> 24);
         const uint32_t x = (w[k] << 8) | lowb, y = w[k] >> 24;
-        const uint32_t frag = tq_t4_bk(tq_t4_pair(x, y, t4), tab, sc);
+        const uint32_t frag = tq_t4_bk<TR>(tq_t4_pair(x, y, t4), tab, sc, cr);
         if (k & 1) bk8[k >> 1] = frag; else bk0[k >> 1] = frag;
     }
 }
 // fp16 path (attention third pass, B2-eng): the table values themselves as the fp16 MMA operands -- no scale, no
 // conversion; the vector's scale is applied to the Q.K^T score column (K) or folded into the P row (V) afterwards.
-static __device__ __forceinline__ uint32_t tq_t4_bk_raw(uint32_t pair, const uint16_t *tab) {
-    return (uint32_t)tab[pair & 0xFFFu] | ((uint32_t)tab[(pair >> 4) & 0xFFFu] << 16);
+template <int TR = 1>
+static __device__ __forceinline__ uint32_t tq_t4_bk_raw(uint32_t pair, const uint16_t *tab, uint32_t cr = 0) {
+    return (uint32_t)tab[tq_t4_tab<TR>::idx(pair & 0xFFFu, cr)] | ((uint32_t)tab[tq_t4_tab<TR>::idx((pair >> 4) & 0xFFFu, cr)] << 16);
 }
+template <int TR = 1>
 static __device__ __forceinline__ void tq_t4_kfrags_raw(const uint4 kp, uint32_t prevb, int t4,
-                                                        const uint16_t *tab, uint32_t bk0[2], uint32_t bk8[2]) {
+                                                        const uint16_t *tab, uint32_t bk0[2], uint32_t bk8[2], uint32_t cr = 0) {
     const uint32_t w[4] = {kp.x, kp.y, kp.z, kp.w};
     #pragma unroll
     for (int k = 0; k < 4; k++) {
         const uint32_t lowb = (k == 0) ? prevb : (w[k - 1] >> 24);
         const uint32_t x = (w[k] << 8) | lowb, y = w[k] >> 24;
-        const uint32_t frag = tq_t4_bk_raw(tq_t4_pair(x, y, t4), tab);
+        const uint32_t frag = tq_t4_bk_raw<TR>(tq_t4_pair(x, y, t4), tab, cr);
         if (k & 1) bk8[k >> 1] = frag; else bk0[k >> 1] = frag;
     }
 }
@@ -1141,11 +1167,13 @@ static __device__ __forceinline__ uint32_t tq_t4_f16x2_bf16(uint32_t h2) {
     return tq_pack_bf16(__half2float(__ushort_as_half((unsigned short)(h2 & 0xFFFFu))),
                         __half2float(__ushort_as_half((unsigned short)(h2 >> 16))));
 }
-static __device__ __forceinline__ float tq_t4_val(uint32_t bits, int f, const uint16_t *tab, float sc) {
-    return __half2float(__ushort_as_half(tab[(bits >> (4 * f)) & 0xFFFu])) * sc;
+template <int TR = 1>
+static __device__ __forceinline__ float tq_t4_val(uint32_t bits, int f, const uint16_t *tab, float sc, uint32_t cr = 0) {
+    return __half2float(__ushort_as_half(tab[tq_t4_tab<TR>::idx((bits >> (4 * f)) & 0xFFFu, cr)])) * sc;
 }
-static __device__ __forceinline__ uint32_t tq_t4_val_raw(uint32_t bits, int f, const uint16_t *tab) {
-    return (uint32_t)tab[(bits >> (4 * f)) & 0xFFFu];
+template <int TR = 1>
+static __device__ __forceinline__ uint32_t tq_t4_val_raw(uint32_t bits, int f, const uint16_t *tab, uint32_t cr = 0) {
+    return (uint32_t)tab[tq_t4_tab<TR>::idx((bits >> (4 * f)) & 0xFFFu, cr)];
 }
 // scalar paths: value of channel d of a row (codes_row = the 128 code bytes, sw = its side word)
 static __device__ __forceinline__ float tq_t4_dq(const uint8_t *codes_row, uint32_t sw, int d, const uint16_t *tab) {
@@ -2038,6 +2066,12 @@ static __device__ __forceinline__ void tq_bar_sync(int bar, int nthreads) {
 
 static __device__ __forceinline__ void tq_cp_async16(uint32_t dst_smem, const void *src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_smem), "l"(src));
+}
+static __device__ __forceinline__ void tq_cp_async8(uint32_t dst_smem, const void *src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(dst_smem), "l"(src));
+}
+static __device__ __forceinline__ void tq_cp_async4(uint32_t dst_smem, const void *src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst_smem), "l"(src));
 }
 
 template <int STAGE>
@@ -24453,21 +24487,73 @@ __global__ void __launch_bounds__(256, 2) k_tq_paged_attn_q4_gqa_f16(
 // scale multiplies its score column after Q.K^T (one FMUL per score, folded into the rsc step) and a value row's
 // scale is folded into P (4 HMUL2 per 16 keys, as the int4 fp16 kernel does); exact own keys (fp16 staging) are the
 // operands as stored with scale 1. F16 = 0 is the bf16 path above (bitwise the per-column kernel's).
+// Shared-memory layout of the T4 segment kernel, sized by QT (the bf16 segment kernel's layout above is QT = 2's);
+// the dequant table follows it (tq_t4_tab, TR copies). MEASURED 2026-10-16 (notes 12): TR = 4 (32 KB) cut the
+// lookups' LDS wavefronts by only 5 % (3.39 -> 3.22 per instruction) and cost +32 % instructions for the index math
+// -> +8 % kernel time; TR = 1 is the default. V staging (VST/VSS, QT = 1 only): the super-tile's 128 V code rows at a
+// 152-byte stride (38 words: rows r0, r0+1, r0+8, r0+9 of a lane quad land on disjoint banks) + the 128 side words,
+// cp.async'd during Q.K^T (one 16 KB copy per super-tile instead of 96 per-key 1/2/4-byte loads per thread).
+// QT = 1: 14.9 + 19.5 + 8 KB = 42.4 KB; QT = 2: 28.7 + 8 KB -- both static, both at 2 blocks/SM.
+#ifndef TQ_T4_TABREP
+#define TQ_T4_TABREP 1
+#endif
+#ifndef TQ_T4_VSTAGE
+#define TQ_T4_VSTAGE 1
+#endif
+template <int QT> struct tq_t4_seg_sm {
+    static constexpr int ROWS = QT * 16;
+    static constexpr int TR   = (QT == 1) ? TQ_T4_TABREP : ((TQ_T4_TABREP >= 2) ? 2 : 1);
+    static constexpr bool VSTAGE = (QT == 1) && (TQ_T4_VSTAGE != 0);
+    static constexpr int VROW = 38;                        // words per staged V code row (128 B + 24 B pad)
+    static constexpr int QA   = 0;                        // [QT*16 chunks][32 lanes][4] Q A-frags
+    static constexpr int PST  = QA + QT * 2048;           // [QT*8 tiles][32][4] P A-frag staging
+    static constexpr int WMAX = PST + QT * 1024;          // [8 warps][ROWS]
+    static constexpr int WSUM = WMAX + 8 * ROWS;
+    static constexpr int MST  = WSUM + 8 * ROWS;          // [ROWS] running row max
+    static constexpr int LST  = MST + ROWS;               // [ROWS] running row denominator
+    static constexpr int ALPH = LST + ROWS;               // [ROWS] per-row rescale
+    static constexpr int RPOS = ALPH + ROWS;              // [ROWS] per row: position
+    static constexpr int RLO  = RPOS + ROWS;              // first tile of the row's split range
+    static constexpr int RHI  = RLO + ROWS;               // one past the last
+    static constexpr int RSC  = RHI + ROWS;               // the row's split count S_t
+    static constexpr int RCOL = RSC + ROWS;               // the row's wave column
+    static constexpr int QTMP = RCOL + ROWS;              // [256]
+    static constexpr int RED  = QTMP + 256;               // [16]
+    static constexpr int VST  = RED + 16;                 // [128 rows][VROW] staged V codes (QT = 1)
+    static constexpr int VSS  = VST + (VSTAGE ? 128 * VROW : 0);   // [128] staged V side words
+    static constexpr int WORDS = VSS + (VSTAGE ? 128 : 0);
+};
 template <int QT, int F16>
 static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
     float oacc[QT][4][4], uint32_t *sm, int tid, int warp, int lane, int gr, int t4,
     int it, int t0, int phys, int pos_max, int page, int nrows, int nkv, float rsc,
     const uint8_t *kcb, const uint8_t *kside, const uint8_t *vcb, const uint8_t *vside, int kv_head,
     const uint16_t *tab, const uint16_t *f16s, int slot, int seg_pos0, int seg_pos1) {
-    float *wmax = (float *)(sm + TQ_SEG_WMAX), *wsum = (float *)(sm + TQ_SEG_WSUM);
-    float *mst = (float *)(sm + TQ_SEG_MST), *lst = (float *)(sm + TQ_SEG_LST), *alph = (float *)(sm + TQ_SEG_ALPH);
-    const int *rpos = (const int *)(sm + TQ_SEG_RPOS), *rlo = (const int *)(sm + TQ_SEG_RLO), *rhi = (const int *)(sm + TQ_SEG_RHI);
+    typedef tq_t4_seg_sm<QT> L;
+    constexpr int TR = L::TR, ROWS = L::ROWS;
+    const uint32_t cr = tq_t4_tab<TR>::cr(lane);
+    float *wmax = (float *)(sm + L::WMAX), *wsum = (float *)(sm + L::WSUM);
+    float *mst = (float *)(sm + L::MST), *lst = (float *)(sm + L::LST), *alph = (float *)(sm + L::ALPH);
+    const int *rpos = (const int *)(sm + L::RPOS), *rlo = (const int *)(sm + L::RLO), *rhi = (const int *)(sm + L::RHI);
     const size_t pr0 = (size_t)phys * page + (size_t)(t0 & (page - 1));
     const size_t cstride4 = (size_t)nkv * 128;
     const size_t stg0 = (size_t)slot * page;                      // staging row of position p: stg0 + (p & (page-1))
 #define TQ_GROW(lp) (pr0 + (size_t)(min((lp), pos_max) - t0))
 #define TQ_STGK(p) (f16s + ((stg0 + (size_t)((p) & (page - 1))) * nkv + kv_head) * 512)
     const bool diag = seg_pos1 >= t0 && seg_pos0 < t0 + 128;      // block-uniform
+    if constexpr (L::VSTAGE) {
+        // stage this super-tile's V codes (128 rows x 128 B, 8-byte copies into the 152-byte-stride rows) and side
+        // words (rows clamped to pos_max like the direct reads); lands during Q.K^T, waited for before P.V
+        uint32_t *vst = sm + L::VST, *vss = sm + L::VSS;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int id = tid + 256 * k, row = id >> 4, sub = id & 15;
+            tq_cp_async8((uint32_t)__cvta_generic_to_shared(vst + row * L::VROW + sub * 2),
+                         vcb + TQ_GROW(t0 + row) * cstride4 + 8 * sub);
+        }
+        if (tid < 128) tq_cp_async4((uint32_t)__cvta_generic_to_shared(vss + tid), vside + (TQ_GROW(t0 + tid) * nkv + kv_head) * 4);
+        asm volatile("cp.async.commit_group;\n");
+    }
     float s0[QT][4], s1[QT][4];
     #pragma unroll
     for (int q = 0; q < QT; q++)
@@ -24496,15 +24582,15 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                 const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
                 const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
                 uint32_t bk0[2], bk8[2], ek0[2], ek8[2];
-                if constexpr (F16) { tq_t4_kfrags_raw(kp0, prev0, t4, tab, bk0, bk8); tq_t4_kfrags_raw(kp1, prev1, t4, tab, ek0, ek8); }
-                else { tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8); tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8); }
+                if constexpr (F16) { tq_t4_kfrags_raw<TR>(kp0, prev0, t4, tab, bk0, bk8, cr); tq_t4_kfrags_raw<TR>(kp1, prev1, t4, tab, ek0, ek8, cr); }
+                else { tq_t4_kfrags<TR>(kp0, prev0, t4, sc0, tab, bk0, bk8, cr); tq_t4_kfrags<TR>(kp1, prev1, t4, sc1, tab, ek0, ek8, cr); }
                 prev0 = kp0.w >> 24; prev1 = kp1.w >> 24;
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
                     const int c = 2 * g + cc;
                     #pragma unroll
                     for (int q = 0; q < QT; q++) {
-                        const uint32_t *a = &sm[TQ_SEG_QA + ((q * 16 + c) * 32 + lane) * 4];
+                        const uint32_t *a = &sm[L::QA + ((q * 16 + c) * 32 + lane) * 4];
                         if constexpr (F16) { tq_mma_f16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]); tq_mma_f16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]); }
                         else { tq_mma_bf16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]); tq_mma_bf16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]); }
                     }
@@ -24531,8 +24617,8 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                 const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
                 const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
                 uint32_t bk0[2], bk8[2], ek0[2], ek8[2];
-                if constexpr (F16) { tq_t4_kfrags_raw(kp0, prev0, t4, tab, bk0, bk8); tq_t4_kfrags_raw(kp1, prev1, t4, tab, ek0, ek8); }
-                else { tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8); tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8); }
+                if constexpr (F16) { tq_t4_kfrags_raw<TR>(kp0, prev0, t4, tab, bk0, bk8, cr); tq_t4_kfrags_raw<TR>(kp1, prev1, t4, tab, ek0, ek8, cr); }
+                else { tq_t4_kfrags<TR>(kp0, prev0, t4, sc0, tab, bk0, bk8, cr); tq_t4_kfrags<TR>(kp1, prev1, t4, sc1, tab, ek0, ek8, cr); }
                 prev0 = kp0.w >> 24; prev1 = kp1.w >> 24;
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
@@ -24551,7 +24637,7 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                     }
                     #pragma unroll
                     for (int q = 0; q < QT; q++) {
-                        const uint32_t *a = &sm[TQ_SEG_QA + ((q * 16 + c) * 32 + lane) * 4];
+                        const uint32_t *a = &sm[L::QA + ((q * 16 + c) * 32 + lane) * 4];
                         if constexpr (F16) {
                             tq_mma_f16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]);
                             tq_mma_f16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]);
@@ -24610,14 +24696,14 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
             lm_lo = fmaxf(lm_lo, __shfl_xor_sync(0xffffffffu, lm_lo, o));
             lm_hi = fmaxf(lm_hi, __shfl_xor_sync(0xffffffffu, lm_hi, o));
         }
-        if (t4 == 0) { wmax[warp * 32 + rl] = lm_lo; wmax[warp * 32 + rh] = lm_hi; }
+        if (t4 == 0) { wmax[warp * ROWS + rl] = lm_lo; wmax[warp * ROWS + rh] = lm_hi; }
     }
     __syncthreads();
     if (tid < QT * 16) {
         const int row = tid;
         const bool act = row < nrows && it >= rlo[row] && it < rhi[row];
         float m_old = mst[row], m_new = m_old;
-        for (int w = 0; w < 8; w++) m_new = fmaxf(m_new, wmax[w * 32 + row]);
+        for (int w = 0; w < 8; w++) m_new = fmaxf(m_new, wmax[w * ROWS + row]);
         alph[row] = act ? expf(m_old - m_new) : 1.0f;
         mst[row] = act ? m_new : m_old;
     }
@@ -24636,8 +24722,8 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
             ls_lo += __shfl_xor_sync(0xffffffffu, ls_lo, o);
             ls_hi += __shfl_xor_sync(0xffffffffu, ls_hi, o);
         }
-        if (t4 == 0) { wsum[warp * 32 + rl] = ls_lo; wsum[warp * 32 + rh] = ls_hi; }
-        uint32_t *pst = &sm[TQ_SEG_PST + ((q * 8 + warp) * 32 + lane) * 4];
+        if (t4 == 0) { wsum[warp * ROWS + rl] = ls_lo; wsum[warp * ROWS + rh] = ls_hi; }
+        uint32_t *pst = &sm[L::PST + ((q * 8 + warp) * 32 + lane) * 4];
         if constexpr (F16) {
             pst[0] = tq_pack_f16(p00, p01); pst[1] = tq_pack_f16(p02, p03);
             pst[2] = tq_pack_f16(p10, p11); pst[3] = tq_pack_f16(p12, p13);
@@ -24649,7 +24735,7 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
     __syncthreads();
     if (tid < QT * 16) {
         float l = lst[tid] * alph[tid];
-        for (int w = 0; w < 8; w++) l += wsum[w * 32 + tid];
+        for (int w = 0; w < 8; w++) l += wsum[w * ROWS + tid];
         lst[tid] = l;
     }
     #pragma unroll
@@ -24659,6 +24745,11 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
         for (int f = 0; f < 4; f++) { oacc[q][f][0] *= a_lo; oacc[q][f][1] *= a_lo; oacc[q][f][2] *= a_hi; oacc[q][f][3] *= a_hi; }
     }
     const int cb = 16 * warp + 2 * gr;                            // stream byte of the thread's first channel
+    if constexpr (L::VSTAGE) {
+        asm volatile("cp.async.wait_group 0;\n");                // this super-tile's V has landed (per thread) ...
+        __syncthreads();                                          // ... and is visible to every warp
+    }
+    const uint32_t *vstw = sm + L::VST, *vssw = sm + L::VSS;
     for (int tt = 0; tt < 8; tt++) {
         const int r0 = t0 + tt * 16 + 2 * t4;
         float v[4][4];                                            // [key q0,q1,q8,q9][f]: trellis V (bf16 path, dequantized)
@@ -24666,17 +24757,33 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
         uint32_t zs[4];
         #pragma unroll
         for (int rr = 0; rr < 4; rr++) {
-            const size_t qq = TQ_GROW(r0 + (rr >> 1) * 8 + (rr & 1));
-            const uint32_t z = tq_t4_side(vside, qq, nkv, kv_head);
-            const uint32_t c = tq_t4_vbits(vcb + qq * cstride4, z, cb);
+            uint32_t z, c;
+            if constexpr (L::VSTAGE) {
+                // staged: row-local index (the clamp to pos_max happened at the copy), 3 code bytes cb-1 .. cb+1 from the
+                // two words around them (cb = 0: the prefix byte of the side word)
+                const int lr = tt * 16 + 2 * t4 + (rr >> 1) * 8 + (rr & 1);
+                z = vssw[lr];
+                const uint32_t *rw = vstw + lr * L::VROW;
+                if (cb == 0) {
+                    c = (z & 0xFFu) | ((rw[0] & 0xFFFFu) << 8);
+                } else {
+                    const int o = cb - 1;
+                    const uint32_t w0 = rw[o >> 2], w1 = rw[(o >> 2) + 1];
+                    c = __funnelshift_r(w0, w1, 8 * (o & 3)) & 0xFFFFFFu;
+                }
+            } else {
+                const size_t qq = TQ_GROW(r0 + (rr >> 1) * 8 + (rr & 1));
+                z = tq_t4_side(vside, qq, nkv, kv_head);
+                c = tq_t4_vbits(vcb + qq * cstride4, z, cb);
+            }
             zs[rr] = z;
             if constexpr (F16) {
                 #pragma unroll
-                for (int f = 0; f < 4; f++) vr[rr][f] = tq_t4_val_raw(c, f, tab);
+                for (int f = 0; f < 4; f++) vr[rr][f] = tq_t4_val_raw<TR>(c, f, tab, cr);
             } else {
                 const float vs = tq_t4_scale(z);
                 #pragma unroll
-                for (int f = 0; f < 4; f++) v[rr][f] = tq_t4_val(c, f, tab, vs);
+                for (int f = 0; f < 4; f++) v[rr][f] = tq_t4_val<TR>(c, f, tab, vs, cr);
             }
         }
         // F16: the V scales of the thread's key pairs (r0, r0+1) / (r0+8, r0+9) as fp16x2, folded into the P pairs
@@ -24689,7 +24796,7 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                 const uint32_t b1 = F16 ? (vr[2][f] | (vr[3][f] << 16)) : tq_pack_bf16(v[2][f], v[3][f]);
                 #pragma unroll
                 for (int q = 0; q < QT; q++) {
-                    const uint32_t *pa = &sm[TQ_SEG_PST + ((q * 8 + tt) * 32 + lane) * 4];
+                    const uint32_t *pa = &sm[L::PST + ((q * 8 + tt) * 32 + lane) * 4];
                     if constexpr (F16) {
                         uint32_t a[4] = {tq_hmul2(pa[0], scv_lo), tq_hmul2(pa[1], scv_lo), tq_hmul2(pa[2], scv_hi), tq_hmul2(pa[3], scv_hi)};
                         tq_mma_f16_m16n8k16(oacc[q][f], a, b0, b1);
@@ -24705,7 +24812,7 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
         // variant MMA per own key kk (exact V at kk, P scale 1 there) for the rows owning kk
         #pragma unroll
         for (int q = 0; q < QT; q++) {
-            const uint32_t *pa = &sm[TQ_SEG_PST + ((q * 8 + tt) * 32 + lane) * 4];
+            const uint32_t *pa = &sm[L::PST + ((q * 8 + tt) * 32 + lane) * 4];
             uint32_t a[4];
             if constexpr (F16) { a[0] = tq_hmul2(pa[0], scv_lo); a[1] = tq_hmul2(pa[1], scv_lo); a[2] = tq_hmul2(pa[2], scv_hi); a[3] = tq_hmul2(pa[3], scv_hi); }
             else { a[0] = pa[0]; a[1] = pa[1]; a[2] = pa[2]; a[3] = pa[3]; }
@@ -24760,8 +24867,10 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
     int nh, int nkv, int hd, int q_m, int attn_m, int S, int ncols,
     float eps, float rope_theta, float *part_acc, float *part_ml, const tq_t4_pool t4p) {
     tq_pdl_enter();
-    __shared__ uint32_t sm[TQ_SEG_WORDS];
-    __shared__ __align__(16) uint16_t t4tab[4096];
+    typedef tq_t4_seg_sm<QT> L;
+    constexpr int ROWS = L::ROWS, TR = L::TR;
+    __shared__ __align__(16) uint32_t sm[L::WORDS];
+    __shared__ __align__(16) uint16_t t4tab[tq_t4_tab<TR>::ENTRIES];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int gr = lane >> 2, t4 = lane & 3;
     const int kv_head = blockIdx.x, seg = blockIdx.y, split = blockIdx.z;
@@ -24771,13 +24880,13 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
     const int slot = slot_ids[col0];
     const uint8_t *kcb4 = k4_pool + (size_t)kv_head * (hd >> 1);
     const uint8_t *vcb8 = v8_pool + (size_t)kv_head * (hd >> 1);
-    float *qtmp = (float *)(sm + TQ_SEG_QTMP), *red = (float *)(sm + TQ_SEG_RED);
-    float *mst = (float *)(sm + TQ_SEG_MST), *lst = (float *)(sm + TQ_SEG_LST);
-    int *rpos = (int *)(sm + TQ_SEG_RPOS), *rlo = (int *)(sm + TQ_SEG_RLO), *rhi = (int *)(sm + TQ_SEG_RHI);
-    int *rSc = (int *)(sm + TQ_SEG_RSC), *rcol = (int *)(sm + TQ_SEG_RCOL);
-    for (int i = tid; i < TQ_SEG_PST + QT * 1024; i += 256) sm[i] = 0;
-    tq_t4_load_table(t4p.table, t4tab, tid);
-    if (tid < 32) {
+    float *qtmp = (float *)(sm + L::QTMP), *red = (float *)(sm + L::RED);
+    float *mst = (float *)(sm + L::MST), *lst = (float *)(sm + L::LST);
+    int *rpos = (int *)(sm + L::RPOS), *rlo = (int *)(sm + L::RLO), *rhi = (int *)(sm + L::RHI);
+    int *rSc = (int *)(sm + L::RSC), *rcol = (int *)(sm + L::RCOL);
+    for (int i = tid; i < L::WMAX; i += 256) sm[i] = 0;
+    tq_t4_tab<TR>::load(t4p.table, t4tab, tid);
+    if (tid < ROWS) {
         mst[tid] = TQ_AMM_NINF; lst[tid] = 0.0f;
         int row = tid, lo = 0, hi = 0, pos = -1, Sc = 0, col = -1;
         if (row < nrows) {
@@ -24828,7 +24937,7 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
             int c16 = tid >> 3, tt = (tid >> 1) & 3, rsel = tid & 1;
             int d0 = 16 * c16 + 2 * tt + 8 * rsel;
             int l = 4 * (row & 7) + tt, rr = ((row >> 3) & 1) + 2 * rsel;
-            sm[TQ_SEG_QA + (((row >> 4) * 16 + c16) * 32 + l) * 4 + rr] =
+            sm[L::QA + (((row >> 4) * 16 + c16) * 32 + l) * 4 + rr] =
                 F16 ? tq_pack_f16(qtmp[d0], qtmp[d0 + 1]) : tq_pack_bf16(qtmp[d0], qtmp[d0 + 1]);
         }
         __syncthreads();
@@ -24979,15 +25088,16 @@ static int paged_gqa_split_S_f16(int N, int pos_max, int qt, int kf16) {
 // The key-split count of the kernel the launcher will pick for this mode (decode: qt = 1; verify: its QT).
 static int g_pg_v4 = 0;                         // TQ_KV_V4, read by qwn_paged_init (the pool's V is int4 like K)
 static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below)
-// TQ_T4_ATTN_F16 (default 0): the trellis pool's decode step and verify wave run k_tq_paged_attn_q4_gqa_seg_t4<QT, 1>
-// (fp16 operands, one kernel for both); 0 = the bf16 per-column decode kernel + the bf16 segment kernel. MEASURED
-// 2026-10-16 (notes/session10-b2.md 11.1): gates pass (spec_paged_check verify == decode, 4K dec8 e2e dKL -0.00001
-// +-0.00004 vs the bf16 kernels) but speed-neutral (32K N=8: 335 vs 333 us per layer) -- the T4 kernels are LSU-bound
-// (table-lookup bank conflicts 3.4 wavefronts/LDS, 3x the FP4 kernel's global load requests), not ALU-bound; this
-// kernel is the vehicle for the table replication / V staging that would change that. Off until then.
+// TQ_T4_ATTN_F16 (default 1 since 2026-10-16): the trellis pool's decode step and verify wave run
+// k_tq_paged_attn_q4_gqa_seg_t4<QT, 1> (fp16 operands, one kernel for both, cp.async-staged V codes for the decode
+// step); 0 = the bf16 per-column decode kernel + the bf16 segment kernel (the 10-15 path). MEASURED (notes/session10-b2.md
+// 11.1, 12): gates pass (spec_paged_check verify == decode, 4K dec8 e2e dKL -0.00001 +-0.00004 vs the bf16 kernels,
+// needle 6/6 at 32K / 128K); the fp16 operands alone were speed-neutral (the kernel is LSU-bound: table-lookup bank
+// conflicts 3.4 wavefronts/LDS, 3x the FP4 kernel's global load requests), the V staging (TQ_T4_VSTAGE) made it
+// 335 -> 277 us per layer at 32K N=8 (-1.0 ms per step vs the bf16 kernels; FP4 + ST3 = 249 us).
 static int paged_attn_t4_f16_enabled(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 0; }
+    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 1; }
     return c;
 }
 // resident-block capacity of the T4 fp16 kernel (QT = 1's: decode and verify share one picker, so a column's split
