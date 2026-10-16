@@ -20541,6 +20541,32 @@ __global__ void __launch_bounds__(256) k_tq_exl3_bf16_pair(float *out0, const ui
 // needle, not bit-exact). Scratch grows lazily. ---------------------------------------
 static uint8_t *g_wproj_b = NULL; static float *g_wproj_bscale = NULL, *g_wproj_part = NULL;
 static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
+// TQ_GEMM_FORK=1 (session 10, decode-graph; default off): the 2nd / 3rd Linear of a group that shares one input
+// (k/v after q, z after qkv, up after gate) run on side streams concurrently with the first -- they are independent
+// (the fragment buffer is read-only, the outputs distinct), so the small k/v_proj GEMMs (80 of 680 blocks) and every
+// member's tail fill the GPU instead of serializing. Same kernels, same grids, same k-splits -> bitwise; each side
+// member gets its own k-split partial buffer (the shared one would race) and, as every launch, its own counter slot.
+static int tq_gemm_fork_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TQ_GEMM_FORK"); v = (e && *e) ? (atoi(e) != 0) : 0; }
+    return v;
+}
+static float *g_wproj_part_side[2] = {NULL, NULL}; static size_t g_wproj_part_side_bytes[2] = {0, 0};
+static int g_exl3_part_sel = 0;                     // 0 = the main partial buffer, 1..2 = side member i's
+static cudaStream_t g_fork_st[2] = {NULL, NULL};
+static cudaEvent_t g_fork_ev0 = NULL, g_fork_ev[2] = {NULL, NULL};
+static int fork_streams_ok(void) {
+    static int state = 0;                           // 0 = not tried, 1 = ok, -1 = failed
+    if (state == 0) {
+        state = 1;
+        for (int i = 0; i < 2 && state == 1; i++)
+            if (cudaStreamCreateWithFlags(&g_fork_st[i], cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&g_fork_ev[i], cudaEventDisableTiming) != cudaSuccess) state = -1;
+        if (state == 1 && cudaEventCreateWithFlags(&g_fork_ev0, cudaEventDisableTiming) != cudaSuccess) state = -1;
+        if (state < 0) fprintf(stderr, "[gemm-fork] side streams unavailable -- serial GEMM groups\n");
+    }
+    return state == 1;
+}
 // EXL3: wide_quant_input only records the fp32 input (the transform depends on each Linear's suh);
 // exl3_wide_proj builds the fp16 fragments per projection.
 static const float *g_exl3_x = NULL; static int g_exl3_K = 0, g_exl3_N = 0;   // (g_exl3_x2 declared above)
@@ -20655,13 +20681,15 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
     float *pout = NULL;
     if (ks > 1) {
         size_t need = (size_t)ks * split_stride * sizeof(float);
-        if (need > g_wproj_part_bytes) {
+        float **pp = g_exl3_part_sel ? &g_wproj_part_side[g_exl3_part_sel - 1] : &g_wproj_part;
+        size_t *pb = g_exl3_part_sel ? &g_wproj_part_side_bytes[g_exl3_part_sel - 1] : &g_wproj_part_bytes;
+        if (need > *pb) {
             graph_invalidate();
-            if (g_wproj_part) cudaFree(g_wproj_part);
-            if (cudaMalloc(&g_wproj_part, need) != cudaSuccess) { g_wproj_part = NULL; g_wproj_part_bytes = 0; return -91; }
-            g_wproj_part_bytes = need;
+            if (*pp) cudaFree(*pp);
+            if (cudaMalloc(pp, need) != cudaSuccess) { *pp = NULL; *pb = 0; return -91; }
+            *pb = need;
         }
-        pout = g_wproj_part;
+        pout = *pp;
     }
     int total = units * ks;
     int grid = total < cap ? total : cap;
@@ -20737,8 +20765,8 @@ static int exl3_build_frags(const tq_qmma_weight_t *const *ws, int n, int N, siz
     return 0;
 }
 
-static int exl3_gemm_frags(const tq_qmma_weight_t *w, const uint32_t *bp, float *out, int N) {
-    cudaStream_t st = g_qwen.stream;
+static int exl3_gemm_frags(const tq_qmma_weight_t *w, const uint32_t *bp, float *out, int N, cudaStream_t st = NULL) {
+    if (!st) st = g_qwen.stream;
     int M = w->M, K = w->K;
     int Kt16 = K / 16;
     int Gt = wide_ng(N);
@@ -20781,6 +20809,24 @@ static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs
     }
     size_t need_w = 0;
     int r = exl3_build_frags(ws, n, N, &need_w);
+    if (r == 0 && tq_gemm_fork_enabled() && fork_streams_ok()) {
+        // members 1.. on the side streams, concurrently with member 0 (fork after the fragments, join before the
+        // next op of the main stream: the consumer and the next PDL launch wait for every member)
+        cudaStream_t ms = g_qwen.stream;
+        cudaEventRecord(g_fork_ev0, ms);
+        for (int i = 1; i < n; i++) cudaStreamWaitEvent(g_fork_st[i - 1], g_fork_ev0, 0);
+        r = exl3_gemm_frags(ws[0], g_exl3_b, outs[0], N, ms);
+        for (int i = 1; i < n; i++) {
+            if (r == 0) {
+                g_exl3_part_sel = i;
+                r = exl3_gemm_frags(ws[i], g_exl3_b + i * need_w, outs[i], N, g_fork_st[i - 1]);
+                g_exl3_part_sel = 0;
+            }
+            cudaEventRecord(g_fork_ev[i - 1], g_fork_st[i - 1]);
+            cudaStreamWaitEvent(ms, g_fork_ev[i - 1], 0);
+        }
+        return r;
+    }
     for (int i = 0; i < n && r == 0; i++) r = exl3_gemm_frags(ws[i], g_exl3_b + i * need_w, outs[i], N);
     return r;
 }
