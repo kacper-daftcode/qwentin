@@ -23596,16 +23596,20 @@ __global__ void __launch_bounds__(256, TQ_AST_MINB) k_tq_paged_attn_q4_gqa_mma_s
     }
 }
 
-// TQ_PAGED_ATTN_ST=1 (default): the staged-V GQA decode kernel for dense int4-V attention (bitwise identical to
-// the base kernel); 0 = the base kernel. The page-list (Quest) path and E4M3 V always use the base kernel.
-// TQ_PAGED_ATTN_ST: 0 = base kernel, 1 = staged-V kernel (bitwise = base; default), 2 = fp16 int4 path for P.V
-// (k_tq_paged_attn_q4_gqa_f16<QT,0>: P in fp16 with the V scale folded in, raw nibbles as operands, exact V), 3 = also
-// the fp16 K dequant and fp16 Q (k_tq_paged_attn_q4_gqa_f16<QT,1>). 2/3 serve the verify waves with the same kernel.
+// TQ_PAGED_ATTN_ST: 0 = base GQA decode kernel, 1 = staged-V kernel (bitwise = base; the default until 10-16),
+// 2 = fp16 int4 path for P.V (k_tq_paged_attn_q4_gqa_f16<QT,0>: P in fp16 with the V scale folded in, raw nibbles as
+// operands, exact V), 3 = also the fp16 K dequant and fp16 Q (k_tq_paged_attn_q4_gqa_f16<QT,1>). 2/3 serve the verify
+// waves with the same kernel. **Default 3 since 10-16 (owner, HANDOFF Decisions 16e)**: e2e-neutral within +-0.0001 KL,
+// verify == decode, -1.5 ms per step at 32K N = 8; TQ_PAGED_ATTN_ST=1 reverts to the kernel that is bitwise e1ecb3a's.
+// The page-list (Quest) path and E4M3 V always use the base kernel; with TQ_KV_T4 the trellis pool runs its own GQA
+// kernels and this knob is a no-op (see launch_paged_attn_q4).
 static int paged_attn_st_enabled(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_PAGED_ATTN_ST"); c = (e && *e) ? atoi(e) : 1; if (c < 0 || c > 3) c = 1; }
+    if (c < 0) { const char *e = getenv("TQ_PAGED_ATTN_ST"); c = (e && *e) ? atoi(e) : 3; if (c < 0 || c > 3) c = 3; }
     return c;
 }
+// The effective TQ_PAGED_ATTN_ST (for the server's startup line).
+extern "C" int qwn_paged_attn_st(void) { return paged_attn_st_enabled(); }
 
 // ===== Segment-aware GQA attention for the verify wave (task 10, stage 5 performance item (a)) =====
 // One block = (kv head, segment of up to QT*16/group consecutive columns of ONE slot, key split): the slot's
@@ -25953,6 +25957,11 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     free(hi);
     g_pg_ready = 1;
     if (g_pg_v4) fprintf(stderr, "[paged] TQ_KV_V4: V stored as int4 like K\n");
+    fprintf(stderr, "[paged] TQ_PAGED_ATTN_ST=%d%s\n", paged_attn_st_enabled(),
+            g_pg_t4 ? " (no-op with TQ_KV_T4: the trellis pool uses its own GQA kernels)"
+            : (paged_attn_st_enabled() >= 2 && g_pg_v4) ? " (fp16 int4 GQA decode / verify kernel)"
+            : (paged_attn_st_enabled() >= 2) ? " (E4M3 V: the fp16 int4 path needs TQ_KV_V4=1; base kernel, bitwise = e1ecb3a's)"
+            : " (bitwise = e1ecb3a's kernel)");
     return 0;
 }
 

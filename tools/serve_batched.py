@@ -25,6 +25,11 @@ Modes:
 Run (GPU7, prod Q4):
   CUDA_VISIBLE_DEVICES=7 TQ_CTX=8192 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --selftest
   CUDA_VISIBLE_DEVICES=7 TQ_CTX=131072 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --port 8100
+
+Defaults since 10-16 (owner, HANDOFF Decisions 16): --kv-v4 --kv-t4 (trellis-4 K+V, 16.5 KiB/token), --spec (the paged
+MTP drafter; needs the --mtp-exl3 tqf, e.g. qwen3_8-27b-exl3-opt5.75-mtp4.tqf, else it warns and runs plain decode) and
+the engine's TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4). The served line: 12 slots, --num-blocks 4100 (525K pooled
+tokens; 4600 = 589K with --no-spec). --no-kv-t4 / --no-spec / TQ_PAGED_ATTN_ST=1 revert to the 10-13 stack.
 """
 from __future__ import annotations
 import argparse, ctypes, json, os, sys, threading, time, queue, uuid
@@ -80,6 +85,51 @@ def load_lib(path):
     except AttributeError:
         L.has_spec = False
     return L
+
+
+TQ_FLAG_MTP_EXL3 = 1 << 12      # tqf header flag: the MTP projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3)
+
+
+def tqf_has_exl3_mtp(path):
+    """True/False from the tqf header's flags word (offset 8); None if the header cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(12)
+        if len(h) < 12 or h[:4] != b"TQF1":
+            return None
+        return bool(int.from_bytes(h[8:12], "little") & TQ_FLAG_MTP_EXL3)
+    except OSError:
+        return None
+
+
+def default_t4_codebook():
+    """analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this checkout (<repo>/tools/..): the
+    project dir that holds the qwentin checkout (../../analysis) or the repo itself (../analysis); else the project path."""
+    rel = os.path.join("analysis", "kv_trellis_cuda", "codebooks", "lloyd_kv12a.f32")
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.path.join(here, ".."), os.path.join(here, "..", "..")):
+        p = os.path.normpath(os.path.join(base, rel))
+        if os.path.exists(p):
+            return p
+    return os.path.join("/mnt/nvme/qwen256k", rel)
+
+
+def attn_st_summary(L):
+    """'decode attention TQ_PAGED_ATTN_ST=<n> (...)' for the startup line: the engine's effective value when the library
+    exports qwn_paged_attn_st (>= the 10-16 defaults commit), else the environment with the engine's default rule."""
+    try:
+        L.qwn_paged_attn_st.restype = ctypes.c_int
+        st = int(L.qwn_paged_attn_st())
+    except AttributeError:
+        e = os.environ.get("TQ_PAGED_ATTN_ST", "")
+        st = int(e) if e.strip().lstrip("-").isdigit() else 1
+    t4 = os.environ.get("TQ_KV_T4", "0") not in ("", "0")
+    v4 = os.environ.get("TQ_KV_V4", "0") not in ("", "0")
+    what = ("a no-op under --kv-t4 today: the trellis pool runs its own GQA kernels" if t4
+            else "fp16 int4 GQA decode/verify kernel" if (st >= 2 and v4)
+            else "E4M3 V: base kernel (the fp16 path needs --kv-v4)" if st >= 2
+            else "staged-V kernel, bitwise = e1ecb3a" if st == 1 else "base kernel, bitwise = e1ecb3a")
+    return f"decode attention TQ_PAGED_ATTN_ST={st} ({what})"
 
 
 def kv_summary(L, total_blocks, page):
@@ -181,11 +231,19 @@ class BatchedEngine:
         self.spec = bool(spec)
         self.spec_on = self.spec
         self.spec_k = spec_k
+        self.spec_off_reason = ""
         if self.spec:
             if not getattr(lib, "has_spec", False):
                 raise RuntimeError("--spec needs an engine library with qwn_paged_verify/commit/mtp_* (build >= eae20ab)")
             rc = self.L.qwn_paged_mtp_init(1)
-            if rc != 0:
+            if rc == -3:
+                # --spec is the default since 10-16: a tqf without the EXL3 MTP section (an older ...-mtp.tqf) runs
+                # plain decode instead of refusing to start (convert_qwen_tqf.py --mtp-exl3 makes the -mtp4.tqf).
+                self.spec_off_reason = (f"the tqf has no EXL3 MTP section (qwn_paged_mtp_init -> -3); use the --mtp-exl3 "
+                                        f"tqf (...-mtp4.tqf) for speculative decoding")
+                print(f"[spec] WARNING: speculative decoding OFF: {self.spec_off_reason}", flush=True)
+                self.spec = self.spec_on = False
+            elif rc != 0:
                 raise RuntimeError(f"qwn_paged_mtp_init failed: {rc} (needs --mtp and a --mtp-exl3 tqf, e.g. ...-mtp4.tqf)")
         self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
         self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
@@ -1140,9 +1198,10 @@ def serve(args):
                         decode_steps_per_wave=args.decode_steps_per_wave,
                         spec=args.spec, spec_k=args.spec_k, park_ram_ttl=args.park_ram_ttl)
     fb, tb, pg, mb = eng._stats()
+    spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k})" if eng.spec
+                 else "speculative decoding OFF (" + (eng.spec_off_reason or getattr(args, "spec_off_reason", "") or "--no-spec") + ")")
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
-          f"{kv_summary(eng.L, tb, pg)}"
-          + (f"; speculative decoding ON (MTP drafter, K={args.spec_k})" if args.spec else ""), flush=True)
+          f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
     print(f"listening on {args.host}:{args.port}  (model={args.model_name})", flush=True)
     try:
@@ -1266,34 +1325,52 @@ def main():
     ap.add_argument("--kv-v4", dest="kv_v4", action="store_true", default=True,
                     help="store V like K in the paged pool (TQ_KV_V4=1, default): FWHT-256 rotated int4, asymmetric "
                          "per 32 channels, 20.0 instead of 26.2 KiB per token (+31%% pooled tokens in the same pool "
-                         "memory). The served stack is EXL3 opt-6.25 + int4 V (FP8 quality end to end, 3300 blocks with "
-                         "12 slots); opt-5.75 needs --no-kv-v4 (E4M3 V) to stay at FP8 quality at long context.")
+                         "memory); required by --kv-t4 (the default since 10-16). The 10-13 served stack was EXL3 "
+                         "opt-6.25 + int4 V (--no-kv-t4: 3300 blocks with 12 slots); opt-5.75 + FP4 V needs --no-kv-v4 "
+                         "(E4M3 V) to stay at FP8 quality at long context -- with --kv-t4 opt-5.75 is FP8 quality.")
     ap.add_argument("--no-kv-v4", dest="kv_v4", action="store_false")
-    ap.add_argument("--kv-t4", dest="kv_t4", action="store_true", default=False,
+    ap.add_argument("--kv-t4", dest="kv_t4", action="store_true", default=True,
                     help="B2 (session 10): trellis-coded K and V for every committed token (TQ_KV_T4=1; 12-bit-state "
                          "bitshift trellis, 4 bits per value, fp16 RMS scale per vector, trained codebook "
                          "--kv-t4-codebook): 16.5 instead of 20.0 KiB per pooled token. Prefill and verify waves encode "
                          "their columns per layer, decode steps after the step (~3 ms per 128-column wave, ~0.2 ms per "
                          "step); the in-flight columns are attended exact from an fp16 staging ring (needs --kv-v4). "
-                         "Size --num-blocks with analysis/pool_size.py (TQ_KV_T4=1): 4500 blocks = 576K tokens at ~30 GB "
-                         "on opt-5.75 with 12 slots.")
-    ap.add_argument("--kv-t4-codebook", default="/mnt/nvme/qwen256k/analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32",
-                    help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK)")
+                         "DEFAULT since 10-16 (owner, Decisions 16a: the served stack is EXL3 opt-5.75 + trellis-4, "
+                         "FP8 quality end to end; 12 slots: --num-blocks 4600 = 589K tokens, 4100 = 525K with --spec); "
+                         "--no-kv-t4 reverts to FP4 K+V (size with analysis/pool_size.py).")
+    ap.add_argument("--no-kv-t4", dest="kv_t4", action="store_false")
+    ap.add_argument("--kv-t4-codebook", default=default_t4_codebook(),
+                    help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK); default: "
+                         "analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this checkout")
     ap.add_argument("--pdl", dest="pdl", action="store_true", default=True,
                     help="programmatic dependent launch in the decode step (TQ_PDL=1, default): each EXL3 GEMM and "
                          "its bfrag launch while the predecessor drains and wait on the device; bit-identical outputs, "
                          "-0.55..-0.61 ms per step at N = 1-8 @32K (5090 at 550 W, opt-6.25 + int4 V).")
     ap.add_argument("--no-pdl", dest="pdl", action="store_false")
-    ap.add_argument("--spec", dest="spec", action="store_true", default=False,
+    ap.add_argument("--spec", dest="spec", action="store_true", default=True,
                     help="speculative decoding with the paged MTP drafter (task 10): in decode-only phases each "
                          "engine iteration drafts K tokens per slot, verifies them in one wave and commits the "
-                         "longest matching prefix + 1 (greedy-equivalent outside near-ties). Implies --mtp; needs "
-                         "a tqf with EXL3 MTP projections (convert_qwen_tqf.py --mtp-exl3, e.g. ...-opt6.25-mtp4.tqf) "
-                         "and ~6%% of the pool for the drafter's KV rows (12 slots: --num-blocks 3000 instead of 3300). "
-                         "Measured 10-15 (5090, 550 W, code): 2.9-3.5x per stream at N=1 @32K, 2.1x at N=4, 1.6x at N=8.")
+                         "longest matching prefix + 1 (bitwise = plain decode at the same client count). Implies --mtp; "
+                         "needs a tqf with EXL3 MTP projections (convert_qwen_tqf.py --mtp-exl3, e.g. ...-opt5.75-mtp4.tqf) "
+                         "and ~11%% of the trellis pool for the drafter's FP4 KV rows (12 slots: --num-blocks 4100 instead "
+                         "of 4600). DEFAULT since 10-16 (owner, Decisions 16b); a tqf without the EXL3 MTP section runs "
+                         "with spec OFF after a warning; --no-spec turns it off. Measured through the server (5090, 550 W, "
+                         "trellis-4 @32K): 2.7x per stream at N=1, 1.9x at N=4, 1.7x at N=8.")
+    ap.add_argument("--no-spec", dest="spec", action="store_false")
     ap.add_argument("--spec-k", default="auto",
                     help="draft depth: auto = 4 at <= 2 active slots, 3 at <= 8, 2 above; or a fixed number (1..16).")
     args = ap.parse_args()
+    args.spec_off_reason = ""
+    if args.spec and (args.bench or args.selftest):
+        args.spec = False                  # neither mode runs speculative rounds (and --mtp would only load the head)
+    if args.spec:
+        has_mtp4 = tqf_has_exl3_mtp(args.tqf)
+        if has_mtp4 is False:
+            # Decided before qwn_init so the bf16 MTP head of an older -mtp.tqf is not loaded for nothing (TQ_NO_MTP=1).
+            args.spec_off_reason = (f"{os.path.basename(args.tqf)} has no EXL3 MTP section (header flag 0x1000); "
+                                    f"speculative decoding needs the --mtp-exl3 tqf (...-mtp4.tqf)")
+            print(f"[spec] WARNING: speculative decoding OFF: {args.spec_off_reason} (--no-spec silences this)", flush=True)
+            args.spec = False
     if args.spec:
         args.mtp = True
         if args.spec_k != "auto":
@@ -1310,6 +1387,9 @@ def main():
         os.environ.setdefault("TQ_KV_T4_CODEBOOK", args.kv_t4_codebook)
         if os.environ.get("TQ_KV_V4", "0") in ("", "0"):
             sys.exit("--kv-t4 needs --kv-v4 (the open page is staged as int4 K + V)")
+        if not os.path.exists(os.environ["TQ_KV_T4_CODEBOOK"]):
+            sys.exit(f"--kv-t4: codebook {os.environ['TQ_KV_T4_CODEBOOK']} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
+                     f"analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 of the qwen256k project)")
     os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
     if args.bench:
         bench(args)
