@@ -20099,6 +20099,18 @@ static __device__ __forceinline__ __half tq_exl3_mul1(uint32_t x) {
 static __device__ __forceinline__ uint32_t tq_exl3_pack(__half lo, __half hi) {
     return (uint32_t)__half_as_ushort(lo) | ((uint32_t)__half_as_ushort(hi) << 16);
 }
+// Two codewords -> one packed fp16 pair (an A-fragment word): the per-element arithmetic of tq_exl3_mul1 (same
+// IMAD / DP4A, one HFMA2 = two fp16 fmas with the same rounding), paired in fragment order -- ptxas pairs the scalar
+// version's hfmas arbitrarily and spends 8 PRMTs per tile re-pairing the results (session 10, prefill thread).
+static __device__ __forceinline__ uint32_t tq_exl3_mul1x2(uint32_t x0, uint32_t x1) {
+    x0 *= 0x83DCD12Du; x1 *= 0x83DCD12Du;
+    uint32_t s0 = __dp4a(x0, 0x01010101u, 0x6400u), s1 = __dp4a(x1, 0x01010101u, 0x6400u);
+    uint32_t p = __byte_perm(s0, s1, 0x5410);                 // lo16(s0) | lo16(s1) << 16
+    __half2 h = __hfma2(*reinterpret_cast<const __half2 *>(&p),
+                        __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee)),
+                        __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931)));
+    return *reinterpret_cast<uint32_t *>(&h);
+}
 
 // Codeword extraction (the exllamav3 dq4 / dq2x2 / dq8 scheme). The lane's 8 weights are the
 // A operand of mma.m16n8k16 (rows = output features n, cols = k): a0 (n=l/4, k=2(l%4)+{0,1}),
@@ -20145,7 +20157,24 @@ struct tq_exl3_win {
     __device__ __forceinline__ void prefetch(const uint32_t *tile) const {
         asm volatile("prefetch.global.L2 [%0];" :: "l"(tile + ia[0]));
     }
+    // PAIR: decode the codewords two at a time straight into the fragment words (tq_exl3_mul1x2; the wide units).
+    template <bool PAIR = false>
     __device__ __forceinline__ void frag(const uint32_t *r, uint32_t &a0, uint32_t &a1, uint32_t &a2, uint32_t &a3) const {
+        if (PAIR) {
+            uint32_t cw[8];
+            #pragma unroll
+            for (int g = 0; g < NGRP; g++) {
+                uint64_t m = ((uint64_t)r[2 * g] << 32) | (uint64_t)r[2 * g + 1];
+                #pragma unroll
+                for (int j = 0; j < NCW; j++)
+                    cw[g * NCW + j] = (uint32_t)(m >> (s2[g] + (NCW - 1 - j) * KB)) & 0xffffu;
+            }
+            a0 = tq_exl3_mul1x2(cw[0], cw[1]);
+            a2 = tq_exl3_mul1x2(cw[2], cw[3]);
+            a1 = tq_exl3_mul1x2(cw[4], cw[5]);
+            a3 = tq_exl3_mul1x2(cw[6], cw[7]);
+            return;
+        }
         __half w[8];
         #pragma unroll
         for (int g = 0; g < NGRP; g++) {
@@ -20269,6 +20298,9 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const f
 #ifndef TQ_EXL3_NG16_PF
 #define TQ_EXL3_NG16_PF 4
 #endif
+#ifndef TQ_EXL3_PAIR
+#define TQ_EXL3_PAIR 1
+#endif
 template <int KB, int NG>
 __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : (NG >= 16 ? TQ_EXL3_NG16_BLOCKS : 2))
 k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
@@ -20278,6 +20310,7 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
     constexpr int NW = 8 * KB;
     constexpr int PF = (NG <= 4) ? 4 : (NG >= 16 ? TQ_EXL3_NG16_PF : 2);   // tiles in flight per warp (register ring)
     constexpr bool BPF = (NG >= 16);                // B fragments double-buffered one tile ahead
+    constexpr bool PAIR = (TQ_EXL3_PAIR != 0) && (NG >= 8);   // paired codeword decode (tq_exl3_mul1x2); decode N unchanged
     constexpr int RW = 2 * tq_exl3_win<KB>::NGRP;   // words per lane per tile
     __shared__ int s_unit;
     __shared__ __align__(16) float s_red[8][128];
@@ -20410,7 +20443,7 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                     if (L2PF > 0 && kt + d + PF + L2PF < t1) win.prefetch(tr + (size_t)(kt + d + PF + L2PF) * kstride);
                     load_b(kt + d + 1, bwb[(d + 1) & 1]);          // kt + d + 1 < t1: 2*PF tiles are left
                     uint32_t a0, a1, a2, a3;
-                    win.frag(r, a0, a1, a2, a3);
+                    win.template frag<PAIR>(r, a0, a1, a2, a3);
                     mma_b(a0, a1, a2, a3, bwb[d & 1]);
                     if (ACC16 && (((kt - t0 + d + 1) & 7) == 0)) fold16();
                 }
@@ -20425,7 +20458,7 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                     if (kt + d + PF < t1) win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
                     if (kt + d + 1 < t1) load_b(kt + d + 1, bwb[(d + 1) & 1]);
                     uint32_t a0, a1, a2, a3;
-                    win.frag(r, a0, a1, a2, a3);
+                    win.template frag<PAIR>(r, a0, a1, a2, a3);
                     mma_b(a0, a1, a2, a3, bwb[d & 1]);
                     const int c = kt - t0 + d + 1;
                     if (ACC16 && ((((c & 7) == 0) && c <= nE - 2) || c == nE)) fold16();
@@ -20442,7 +20475,7 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                 win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
                 if (L2PF > 0 && kt + d + PF + L2PF < t1) win.prefetch(tr + (size_t)(kt + d + PF + L2PF) * kstride);
                 uint32_t a0, a1, a2, a3;
-                win.frag(r, a0, a1, a2, a3);
+                win.template frag<PAIR>(r, a0, a1, a2, a3);
                 tile_mma(a0, a1, a2, a3, kt + d);
             }
             if (ACC16 && (((kt - t0) / PF + 1) % (FOLD / PF)) == 0) fold16();
@@ -20457,7 +20490,7 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                 for (int q = 0; q < RW; q++) r[q] = pf[d][q];
                 if (kt + d + PF < t1) win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
                 uint32_t a0, a1, a2, a3;
-                win.frag(r, a0, a1, a2, a3);
+                win.template frag<PAIR>(r, a0, a1, a2, a3);
                 tile_mma(a0, a1, a2, a3, kt + d);
             }
             if (ACC16) fold16();
