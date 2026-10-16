@@ -25088,16 +25088,17 @@ static int paged_gqa_split_S_f16(int N, int pos_max, int qt, int kf16) {
 // The key-split count of the kernel the launcher will pick for this mode (decode: qt = 1; verify: its QT).
 static int g_pg_v4 = 0;                         // TQ_KV_V4, read by qwn_paged_init (the pool's V is int4 like K)
 static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below)
-// TQ_T4_ATTN_F16 (default 1 since 2026-10-16): the trellis pool's decode step and verify wave run
-// k_tq_paged_attn_q4_gqa_seg_t4<QT, 1> (fp16 operands, one kernel for both, cp.async-staged V codes for the decode
-// step); 0 = the bf16 per-column decode kernel + the bf16 segment kernel (the 10-15 path). MEASURED (notes/session10-b2.md
+// TQ_T4_ATTN_F16 (default 0 on main until the owner's decision (b) in the handoff; the B2 branch recommends 1): 1 = the
+// trellis pool's decode step and verify wave run k_tq_paged_attn_q4_gqa_seg_t4<QT, 1> (fp16 operands, one kernel for
+// both, cp.async-staged V codes for the decode step); 0 = the bf16 per-column decode kernel + the bf16 segment kernel
+// (the 10-15 path, bit for bit). MEASURED (notes/session10-b2.md
 // 11.1, 12): gates pass (spec_paged_check verify == decode, 4K dec8 e2e dKL -0.00001 +-0.00004 vs the bf16 kernels,
 // needle 6/6 at 32K / 128K); the fp16 operands alone were speed-neutral (the kernel is LSU-bound: table-lookup bank
 // conflicts 3.4 wavefronts/LDS, 3x the FP4 kernel's global load requests), the V staging (TQ_T4_VSTAGE) made it
 // 335 -> 277 us per layer at 32K N=8 (-1.0 ms per step vs the bf16 kernels; FP4 + ST3 = 249 us).
 static int paged_attn_t4_f16_enabled(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 1; }
+    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 0; }
     return c;
 }
 // resident-block capacity of the T4 fp16 kernel (QT = 1's: decode and verify share one picker, so a column's split
