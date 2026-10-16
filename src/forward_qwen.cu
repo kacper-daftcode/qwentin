@@ -20301,6 +20301,10 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const f
 #ifndef TQ_EXL3_PAIR
 #define TQ_EXL3_PAIR 1
 #endif
+// Dropped (session 10, prefill thread, measured 10-16): a cp.async shared-memory stage of 8 tiles of B fragments for the
+// 64-token units (one copy per block, double-buffered, one barrier per stage, LDS.128 reads) -- bitwise, but +9 % per
+// prefill wave (76.1 vs 69.7 ms at 32K): the two 38 KB blocks per SM shrink L1 under the weight ring and the LDS
+// wavefronts equal the L1-hit LDG.128s they replace. The register double buffer of the 128-token units is the keeper.
 template <int KB, int NG>
 __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : (NG >= 16 ? TQ_EXL3_NG16_BLOCKS : 2))
 k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
@@ -20773,10 +20777,13 @@ static int exl3_unit_ng(int N, int MB) {
     // lm_head, whose 1940 feature blocks fill the GPU with 128-token units and no split
     // (1.47 vs 1.63 ms); the k/v projections (8 feature blocks) need 32-token units.
     int units16 = MB * ((N + 127) / 128);
-    // TQ_EXL3_WIDE_NG16 (session 10, prefill thread): 128-token units at one block per SM for every Linear with
-    // >= 32 of them (the k/v projections keep their 32-token units) -- see k_tq_exl3_wide_gemm's NG = 16 notes.
+    // TQ_EXL3_WIDE_NG16 (default 1; session 10, prefill thread): 128-token units at one block per SM for every Linear
+    // with >= 32 of them (the k/v projections keep their 32-token units) -- see k_tq_exl3_wide_gemm's NG = 16 notes.
+    // Measured 10-16 (GPU 2, 550 W, trellis stack): KB=5 GEMMs 99 -> 87 us, KB=6 74.5 -> 67.6, KB=7 unchanged;
+    // 128-column wave at 32K 69.7 -> 66.1 ms (-5.1 %), at 128K 120.0 -> 116.9 (-2.6 %); bitwise (per-Linear vs the
+    // 64-token units at N = 128 / 130 / 256, prefill-mode e2e). =0 restores the 64-token units.
     static int ng16 = -1;
-    if (ng16 < 0) { const char *f = getenv("TQ_EXL3_WIDE_NG16"); ng16 = (f && *f) ? (atoi(f) != 0) : 0; }
+    if (ng16 < 0) { const char *f = getenv("TQ_EXL3_WIDE_NG16"); ng16 = (f && *f) ? (atoi(f) != 0) : 1; }
     if (ng16 && N >= 128 && units16 >= 32) return 16;
     if (units16 >= 1024) return 16;
     int units8 = MB * ((N + 63) / 64);
