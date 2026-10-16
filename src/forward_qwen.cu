@@ -25339,7 +25339,11 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     int pdl = tq_pdl_enabled();
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
-    g_exl3_ng_max = 4;
+    // TQ_VF_NG8=1: waves of more than 32 columns take 64-token GEMM units (fp16 accumulators, the prefill waves'
+    // regime) instead of two 32-token passes; the verify is then no longer bitwise the decode step's (default off).
+    static int ng8 = -1;
+    if (ng8 < 0) { const char *e = getenv("TQ_VF_NG8"); ng8 = (e && *e) ? (atoi(e) != 0) : 0; }
+    g_exl3_ng_max = (ng8 && T > 32) ? 8 : 4;
     g_split_n_override = vf_split_by_slots() ? K : 0;
     g_vf_K = 0;
     int ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
