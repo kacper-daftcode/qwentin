@@ -517,6 +517,31 @@ static __device__ __forceinline__ float tq_bf16_to_float(uint16_t bits) {
     return v.f;
 }
 
+// --- TQ_DSTATE_BF16 (session 10, dstate): storage format of the paged DeltaNet RECURRENT state (g_pg_recur) ---
+// DS = 0: fp32 (main's layout and arithmetic, bitwise), 1: bf16 (round-to-nearest-even), 2: fp16 (RNE, clamped to
+// +-65504 so one outlier cannot poison a head with inf). The compute stays fp32 in every kernel: load -> convert ->
+// update -> round -> store; only the bits that reach HBM change. The conv window (g_pg_conv, 5 % of the state) stays fp32.
+template <int DS> struct tq_ds_elem { typedef float T; };          // the element type of each format
+template <> struct tq_ds_elem<1> { typedef uint16_t T; };
+template <> struct tq_ds_elem<2> { typedef uint16_t T; };
+template <int DS> static __device__ __forceinline__ float tq_ds_ld(const void *base, size_t i) {
+    if constexpr (DS == 1) return tq_bf16_to_float(((const uint16_t *)base)[i]);
+    else if constexpr (DS == 2) return __half2float(__ushort_as_half(((const uint16_t *)base)[i]));
+    else return ((const float *)base)[i];
+}
+template <int DS> static __device__ __forceinline__ void tq_ds_st(void *base, size_t i, float v) {
+    if constexpr (DS == 1) ((uint16_t *)base)[i] = tq_float_to_bf16(v);
+    else if constexpr (DS == 2) ((uint16_t *)base)[i] = __half_as_ushort(__float2half_rn(fminf(fmaxf(v, -65504.0f), 65504.0f)));
+    else ((float *)base)[i] = v;
+}
+// The value a store + load round trip would give (the sequential verify / commit kernel applies it to the state it
+// carries in registers between columns, so its columns equal per-token decode steps bit for bit in every format).
+template <int DS> static __device__ __forceinline__ float tq_ds_round(float v) {
+    if constexpr (DS == 1) return tq_bf16_to_float(tq_float_to_bf16(v));
+    else if constexpr (DS == 2) return __half2float(__float2half_rn(fminf(fmaxf(v, -65504.0f), 65504.0f)));
+    else return v;
+}
+
 static __device__ __forceinline__ float tq_e4m3_to_float(uint8_t v) {
     int sign = (v >> 7) & 1;
     int exp = (v >> 3) & 0x0f;
@@ -17818,8 +17843,10 @@ static int launch_deltanet_chunk(int ck, float *core_out, float *recurrent_state
 // this writes the RAW core and k_tq_deltanet_norm finalises it. Numerically
 // identical to k_tq_deltanet_chunk (same per-column math, same FP order per lane
 // group up to the G-split reduction order).
-template<int CK, int D, int NSTRIPE, int G>
-__global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
+// DS (dstate): storage format of recurrent_state (0 fp32 = the original kernel; 1 bf16 / 2 fp16 for the paged pool
+// under TQ_DSTATE_BF16: the state is read once and written once per CK-token sub-chunk, converted at the access).
+template<int CK, int D, int NSTRIPE, int G, int DS = 0>
+__global__ void k_tq_deltanet_chunk_hs(float *core_raw, void *recurrent_state,
                                        const float *qkv_conv,
                                        const float *b_proj, const float *a_proj,
                                        const float *A_log, const uint16_t *dt_bias,
@@ -17850,7 +17877,8 @@ __global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
 
     float Alog = A_log[head];
     float dtb  = tq_bf16_to_float(dt_bias[head]);
-    float *state = recurrent_state + (size_t)head * D * D;
+    typedef typename tq_ds_elem<DS>::T ST;
+    ST *state = (ST *)recurrent_state + (size_t)head * D * D;   // the head's state slice in the DS format
     const unsigned FULL = 0xffffffffu;
 
     for (int s = 0; s < N; s += CK) {
@@ -17908,7 +17936,7 @@ __global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
         #pragma unroll
         for (int j = 0; j < CK; j++) { kS0[j] = 0.0f; qS0[j] = 0.0f; }
         for (int k = klane; k < D; k += G) {
-            float sval = state[(size_t)k * D + v];
+            float sval = tq_ds_ld<DS>(state, (size_t)k * D + v);
             for (int j = 0; j < L; j++) {
                 kS0[j] += kn_sh[j][k] * sval;
                 qS0[j] += qn_sh[j][k] * sval;
@@ -17947,9 +17975,9 @@ __global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
         float dec[CK];
         for (int i = 0; i < L; i++) dec[i] = expf(la_last - la_sh[i]) * Dl[i];
         for (int k = klane; k < D; k += G) {
-            float acc = gamma_last * state[(size_t)k * D + v];
+            float acc = gamma_last * tq_ds_ld<DS>(state, (size_t)k * D + v);
             for (int i = 0; i < L; i++) acc += dec[i] * kn_sh[i][k];
-            state[(size_t)k * D + v] = acc;
+            tq_ds_st<DS>(state, (size_t)k * D + v, acc);
         }
         __syncthreads();
     }
@@ -18029,6 +18057,31 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
     } else ok = -101;
     #undef TQ_LAUNCH_DNC_HS
     if (ok != 0) return ok;
+    k_tq_deltanet_norm<<<value_heads * N, dim, 0, st>>>(
+        core_out, core_out, z, norm_weight, value_heads, dim, eps);
+    return 0;
+}
+
+// The paged prefill waves' call (ck = 8, nstripe = 2, g = 8) with the recurrent state in the dstate format ds
+// (0 = the launcher above, unchanged; 1 bf16 / 2 fp16: the same kernel instantiated on the half storage).
+static int launch_deltanet_chunk_hs_ds(int ds, float *core_out, void *recurrent_state,
+                                       const float *qkv_conv, const float *z,
+                                       const float *b_proj, const float *a_proj,
+                                       const float *A_log, const uint16_t *dt_bias,
+                                       const float *norm_weight, int N, int value_heads,
+                                       int key_heads, int dim, float eps, cudaStream_t st) {
+    if (ds == 0)
+        return launch_deltanet_chunk_hs(8, 2, 8, core_out, (float *)recurrent_state, qkv_conv, z, b_proj, a_proj,
+                                        A_log, dt_bias, norm_weight, N, value_heads, key_heads, dim, eps, st);
+    if (dim != 128) return -100;
+    dim3 grid(value_heads * 2), blk((dim / 2) * 8);
+    if (ds == 1)
+        k_tq_deltanet_chunk_hs<8, 128, 2, 8, 1><<<grid, blk, 0, st>>>(core_out, recurrent_state, qkv_conv, b_proj, a_proj,
+                                                                     A_log, dt_bias, N, value_heads, key_heads, dim);
+    else if (ds == 2)
+        k_tq_deltanet_chunk_hs<8, 128, 2, 8, 2><<<grid, blk, 0, st>>>(core_out, recurrent_state, qkv_conv, b_proj, a_proj,
+                                                                     A_log, dt_bias, N, value_heads, key_heads, dim);
+    else return -102;
     k_tq_deltanet_norm<<<value_heads * N, dim, 0, st>>>(
         core_out, core_out, z, norm_weight, value_heads, dim, eps);
     return 0;
@@ -22840,6 +22893,10 @@ __global__ void k_tq_paged_attn_q4_merge(
 }
 
 // --- paged DeltaNet: IO indexed by column (blockIdx.y), STATE by slot_ids[column] ---
+// TQ_DSTATE_BF16 (read by qwn_paged_init): the storage format of the per-slot recurrent state g_pg_recur --
+// 0 = fp32 (default, main's layout), 1 = bf16, 2 = fp16 (see tq_ds_ld / tq_ds_st). g_pg_ds_es = bytes per element.
+static int g_pg_dstate = 0;
+static size_t g_pg_ds_es = sizeof(float);
 __global__ void k_tq_linear_conv_update_paged(float *out, float *state, const float *x,
                                               const uint16_t *conv_weight, int channels, int kernel_size,
                                               const int *slot_ids, int state_stride) {
@@ -22861,8 +22918,9 @@ __global__ void k_tq_linear_conv_update_paged(float *out, float *state, const fl
     outn[i] = sum / (1.0f + expf(-sum));
 }
 
-template <int G, int HS>
-__global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurrent_state,
+// DS: storage format of recurrent_state (tq_ds_ld / tq_ds_st; 0 = fp32, main's kernel bit for bit).
+template <int G, int HS, int DS>
+__global__ void k_tq_linear_decode_core_hs_paged(float *core_out, void *recurrent_state,
                                              const float *qkv_conv,
                                              const float *b_proj, const float *a_proj,
                                              const float *A_log, const uint16_t *dt_bias,
@@ -22875,7 +22933,8 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
     int col = blockIdx.y;
     int slot = slot_ids[col];
     float *core_o = core_out + (size_t)col * core_stride;
-    float *rstate = recurrent_state + (size_t)slot * recur_stride;
+    typedef typename tq_ds_elem<DS>::T ST;
+    ST *rstate = (ST *)recurrent_state + (size_t)slot * recur_stride;   // the slot's state in the DS format
     qkv_conv += (size_t)col * conv_dim;
     b_proj += (size_t)col * value_heads;
     a_proj += (size_t)col * value_heads;
@@ -22906,7 +22965,7 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
     float softplus = log1pf(expf(-fabsf(softplus_arg))) + fmaxf(softplus_arg, 0.0f);
     float gg = -expf(A_log[head]) * softplus;
     float decay = expf(gg);
-    float *state = rstate + (size_t)head * dim * dim;
+    ST *state = rstate + (size_t)head * dim * dim;
     // dim == 128 (checked by the launcher): constant-trip loops keep the state slice in registers (the runtime-bound
     // form put st[] in local memory: STACK 64); same kk order -> same bits.
     constexpr int NKK = 128 / G;
@@ -22915,7 +22974,7 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
     #pragma unroll
     for (int j = 0; j < NKK; j++) {
         int kk = klane + j * G;
-        float sval = state[(size_t)kk * dim + tid];
+        float sval = tq_ds_ld<DS>(state, (size_t)kk * dim + tid);
         st[j] = sval;
         psum += sval * kn[kk];
     }
@@ -22928,7 +22987,7 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
     for (int j = 0; j < NKK; j++) {
         int kk = klane + j * G;
         float newv = st[j] * decay + kn[kk] * delta;
-        state[(size_t)kk * dim + tid] = newv;
+        tq_ds_st<DS>(state, (size_t)kk * dim + tid, newv);
         pcore += newv * qn[kk];
     }
     #pragma unroll
@@ -22938,7 +22997,7 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
 }
 
 // paged DeltaNet core + gated-norm over N columns (state by slot, IO + norm by column).
-static int paged_linear_core(tq_layer_t *l, float *core_base, float *recur_base,
+static int paged_linear_core(tq_layer_t *l, float *core_base, void *recur_base,
                              const float *qkv_base, const float *z_base,
                              const float *bp_base, const float *ap_base,
                              const int *slot_ids, const int *iota, int N,
@@ -22954,17 +23013,22 @@ static int paged_linear_core(tq_layer_t *l, float *core_base, float *recur_base,
     size_t shA = (size_t)3 * dim * sizeof(float), shB = (size_t)dim * sizeof(float);
     int blkA = (dim / lc_hs) * lc_g;
     dim3 gridA(heads * lc_hs, N);
-    #define PAGED_CORE_HS(GG, HH)                                                      \
-        tq_launch(g_pdl_small, k_tq_linear_decode_core_hs_paged<GG, HH>, gridA, dim3(blkA), shA, \
+    #define PAGED_CORE_HS1(GG, HH, DS)                                                 \
+        tq_launch(g_pdl_small, k_tq_linear_decode_core_hs_paged<GG, HH, DS>, gridA, dim3(blkA), shA, \
             g_qwen.stream, core_base, recur_base, qkv_base, bp_base, ap_base,          \
             l->d_linear_A_log, l->d_linear_dt_bias, heads, key_heads, dim,             \
             slot_ids, recur_f, conv_dim, value_dim)
+    #define PAGED_CORE_HS(GG, HH) do {                                                 \
+        if (g_pg_dstate == 1) PAGED_CORE_HS1(GG, HH, 1);                               \
+        else if (g_pg_dstate == 2) PAGED_CORE_HS1(GG, HH, 2);                          \
+        else PAGED_CORE_HS1(GG, HH, 0); } while (0)
     if (lc_g == 8 && lc_hs == 8) PAGED_CORE_HS(8, 8);
     else if (lc_g == 8 && lc_hs == 4) PAGED_CORE_HS(8, 4);
     else if (lc_g == 8 && lc_hs == 2) PAGED_CORE_HS(8, 2);
     else if (lc_g == 4 && lc_hs == 4) PAGED_CORE_HS(4, 4);
     else PAGED_CORE_HS(4, 2);
     #undef PAGED_CORE_HS
+    #undef PAGED_CORE_HS1
     // gated norm: IO is column-major -> identity ids (the merged _b kernel reads node=ids[col]).
     dim3 gridN(heads, N);
     tq_launch(g_pdl_small, k_tq_linear_decode_gated_norm_b, gridN, dim3(dim), shB, g_qwen.stream,
@@ -25437,8 +25501,13 @@ static uint8_t *g_pool_k4[TQ_MAX_LAYERS] = {0};
 static float   *g_pool_kq4s[TQ_MAX_LAYERS] = {0};
 static uint8_t *g_pool_v8[TQ_MAX_LAYERS] = {0};
 static float   *g_pool_vscale[TQ_MAX_LAYERS] = {0};
-static float   *g_pg_recur[TQ_MAX_LAYERS] = {0};
-static float   *g_pg_conv[TQ_MAX_LAYERS] = {0};
+static void    *g_pg_recur[TQ_MAX_LAYERS] = {0};   // [max_slots][recur_f] in the g_pg_dstate format (fp32 / bf16 / fp16)
+static float   *g_pg_conv[TQ_MAX_LAYERS] = {0};    // [max_slots][conv_f] fp32
+// A slot's recurrent state (device pointer) and its byte size in the current storage format.
+static inline void *pg_recur_slot(int L, int slot) {
+    return (char *)g_pg_recur[L] + (size_t)slot * (size_t)batched_recur_floats() * g_pg_ds_es;
+}
+static inline size_t pg_recur_slot_bytes(void) { return (size_t)batched_recur_floats() * g_pg_ds_es; }
 static int     *g_block_table = NULL, *h_block_table = NULL;
 static int     *g_slot_ids = NULL, *g_iota = NULL, *g_ones = NULL;   // g_iota/g_ones: pool-wide 0..max_slots-1 / all-ones
 static int     *g_tok_d = NULL;                                      // device token ids of the step's columns (TQ_GRAPH)
@@ -25829,6 +25898,7 @@ static void paged_free_all(void) {
     g_pg_nfree = 0; g_pg_page = 0; g_pg_plog = 0; g_pg_nblocks = 0;
     g_pg_maxslots = 0; g_pg_maxblk = 0; g_pg_ready = 0;
     g_pg_sink = NULL; g_pg_sink_cap = 0; g_pg_sink_head = 0;
+    g_pg_dstate = 0; g_pg_ds_es = sizeof(float);
 }
 
 static int paged_alloc_block(void) { return g_pg_nfree > 0 ? h_free[--g_pg_nfree] : -1; }
@@ -26490,6 +26560,11 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     paged_free_all();
     { const char *e = getenv("TQ_KV_V4"); g_pg_v4 = (e && atoi(e) != 0) ? 1 : 0; }
     { const char *e = getenv("TQ_KV_T4"); g_pg_t4 = (e && atoi(e) != 0) ? 1 : 0; }
+    {   // TQ_DSTATE_BF16: 0 = fp32 recurrent state (default), 1 = bf16, 2 = fp16 (half the per-slot state memory)
+        const char *e = getenv("TQ_DSTATE_BF16"); int m = (e && *e) ? atoi(e) : 0;
+        if (m < 0 || m > 2) return -13;
+        g_pg_dstate = m; g_pg_ds_es = m ? sizeof(uint16_t) : sizeof(float);
+    }
     if (g_pg_t4 && !g_pg_v4) return -10;                   // trellis pages stage their open page as FP4 K+V
     if (g_pg_t4 && (page & 127)) return -10;                // whole 128-token pages are encoded
     if (g_pg_t4 && paged_topk_pages() > 0) return -11;      // page summaries read FP4 K; not ported
@@ -26514,10 +26589,10 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
             cudaMemsetAsync(g_pool_v8[L], 0, v8b, g_qwen.stream);
             if (vscb) cudaMemsetAsync(g_pool_vscale[L], 0, vscb, g_qwen.stream);
         } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
-            size_t rb = (size_t)max_slots * recur_f * sizeof(float), cb = (size_t)max_slots * conv_f * sizeof(float);
+            size_t rb = (size_t)max_slots * recur_f * g_pg_ds_es, cb = (size_t)max_slots * conv_f * sizeof(float);
             if (cudaMalloc(&g_pg_recur[L], rb) != cudaSuccess) { paged_free_all(); return -5; }
             if (cudaMalloc(&g_pg_conv[L], cb) != cudaSuccess) { paged_free_all(); return -5; }
-            cudaMemsetAsync(g_pg_recur[L], 0, rb, g_qwen.stream);
+            cudaMemsetAsync(g_pg_recur[L], 0, rb, g_qwen.stream);   // 0x0000 is +0 in every format
             cudaMemsetAsync(g_pg_conv[L], 0, cb, g_qwen.stream);
         }
     }
@@ -26556,6 +26631,14 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     free(hi);
     g_pg_ready = 1;
     if (g_pg_v4) fprintf(stderr, "[paged] TQ_KV_V4: V stored as int4 like K\n");
+    if (g_pg_dstate) {
+        int nlin = 0;
+        for (int L = 0; L < g_qwen.L; L++) nlin += g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION;
+        fprintf(stderr, "[paged] TQ_DSTATE_BF16=%d: DeltaNet recurrent state stored as %s (%.1f MiB per slot instead of %.1f; "
+                "conv window fp32 %.1f MiB; compute fp32)\n", g_pg_dstate, g_pg_dstate == 1 ? "bf16" : "fp16",
+                (double)nlin * recur_f * g_pg_ds_es / 1048576.0, (double)nlin * recur_f * sizeof(float) / 1048576.0,
+                (double)nlin * conv_f * sizeof(float) / 1048576.0);
+    }
     fprintf(stderr, "[paged] TQ_PAGED_ATTN_ST=%d%s\n", paged_attn_st_enabled(),
             g_pg_t4 ? " (no-op with TQ_KV_T4: the trellis pool uses its own GQA kernels)"
             : (paged_attn_st_enabled() >= 2 && g_pg_v4) ? " (fp16 int4 GQA decode / verify kernel)"
@@ -26576,13 +26659,20 @@ extern "C" int qwn_paged_reset_slot(int slot) {
     }
     h_slot_nb[slot] = 0;
     if (g_pg_t4) { h_slot_encl[slot] = 0; paged_t4_sync(g_qwen.stream); }
-    size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+    size_t conv_f = (size_t)batched_conv_floats();
     for (int L = 0; L < g_qwen.L; L++) {
         if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
-        cudaMemsetAsync(g_pg_recur[L] + (size_t)slot * recur_f, 0, recur_f * sizeof(float), g_qwen.stream);
+        cudaMemsetAsync(pg_recur_slot(L, slot), 0, pg_recur_slot_bytes(), g_qwen.stream);
         cudaMemsetAsync(g_pg_conv[L] + (size_t)slot * conv_f, 0, conv_f * sizeof(float), g_qwen.stream);
     }
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -2;
+}
+
+// fp32 -> the dstate format (qwn_paged_load_client: the single-stream state into a half-precision slot).
+template <int DS>
+__global__ void k_tq_ds_from_f32(void *dst, const float *src, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) tq_ds_st<DS>(dst, i, src[i]);
 }
 
 // Snapshot the engine's current single-stream Q4 state into paged slot (parity / bring-up):
@@ -26619,8 +26709,15 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
             }
         } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
             if (!l->d_linear_recurrent_state || !l->d_linear_conv_state) return -6;
-            cudaMemcpyAsync(g_pg_recur[L] + (size_t)slot * recur_f, l->d_linear_recurrent_state,
-                            recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+            if (g_pg_dstate == 0)
+                cudaMemcpyAsync(pg_recur_slot(L, slot), l->d_linear_recurrent_state,
+                                recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+            else if (g_pg_dstate == 1)
+                k_tq_ds_from_f32<1><<<(unsigned)((recur_f + 255) / 256), 256, 0, g_qwen.stream>>>(
+                    pg_recur_slot(L, slot), l->d_linear_recurrent_state, recur_f);
+            else
+                k_tq_ds_from_f32<2><<<(unsigned)((recur_f + 255) / 256), 256, 0, g_qwen.stream>>>(
+                    pg_recur_slot(L, slot), l->d_linear_recurrent_state, recur_f);
             cudaMemcpyAsync(g_pg_conv[L] + (size_t)slot * conv_f, l->d_linear_conv_state,
                             conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
         }
@@ -26651,17 +26748,32 @@ static size_t paged_fp4_layer_token_bytes(void) {         // the FP4 K + V row f
     return 2 * k_tok;
 }
 
+// TQ_DSTATE_BF16: a parking blob written with a half-precision recurrent state starts with this 16-byte header (the
+// fp32 mode keeps main's header-less layout byte for byte); qwn_paged_slot_restore rejects a blob whose header is
+// missing or names another state format (-11) instead of scattering fp32 bytes into a bf16 state (or vice versa; an
+// fp32 blob offered to a half-precision pool also fails the size check only in the other direction).
+struct tq_park_hdr { char magic[4]; uint8_t version, dstate, es, pad; uint32_t recur_f; uint32_t conv_f; };
+static size_t paged_park_hdr_bytes(void) { return g_pg_dstate ? sizeof(tq_park_hdr) : 0; }
+static void paged_park_hdr_fill(tq_park_hdr *h) {
+    memcpy(h->magic, "QDS1", 4); h->version = 1; h->dstate = (uint8_t)g_pg_dstate; h->es = (uint8_t)g_pg_ds_es; h->pad = 0;
+    h->recur_f = (uint32_t)batched_recur_floats(); h->conv_f = (uint32_t)batched_conv_floats();
+}
+static int paged_park_hdr_ok(const tq_park_hdr *h) {
+    tq_park_hdr w; paged_park_hdr_fill(&w);
+    return memcmp(h, &w, sizeof(tq_park_hdr)) == 0;
+}
+
 static size_t paged_slot_bytes(int upto_pos) {
     int n = upto_pos + 1;
     size_t per_tok = paged_layer_token_bytes();
-    size_t bytes = 0;
+    size_t bytes = paged_park_hdr_bytes();
     int nfull = 0, nlin = 0;
     for (int L = 0; L < g_qwen.L; L++) {
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) nfull++;
         else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) nlin++;
     }
     bytes += (size_t)nfull * (size_t)n * per_tok;             // T4: every committed position is a trellis row
-    bytes += (size_t)nlin * ((size_t)batched_recur_floats() + (size_t)batched_conv_floats()) * sizeof(float);
+    bytes += (size_t)nlin * (pg_recur_slot_bytes() + (size_t)batched_conv_floats() * sizeof(float));
     if (g_mtp_on) bytes += (size_t)n * (g_pg_t4 ? paged_fp4_layer_token_bytes() : per_tok) + (size_t)g_qwen.H * sizeof(float);
     return bytes;
 }
@@ -26677,6 +26789,16 @@ extern "C" size_t qwn_paged_token_bytes(void) {
     int nfull = 0;
     for (int L = 0; L < g_qwen.L; L++) nfull += g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION;
     return (size_t)nfull * paged_layer_token_bytes();
+}
+
+// The pool's recurrent-state storage format (TQ_DSTATE_BF16 as read by qwn_paged_init): 0 fp32, 1 bf16, 2 fp16;
+// -1 before qwn_paged_init. qwn_paged_state_bytes: the per-slot DeltaNet state (recurrent + conv window) in bytes.
+extern "C" int qwn_paged_dstate(void) { return g_pg_ready ? g_pg_dstate : -1; }
+extern "C" size_t qwn_paged_state_bytes(void) {
+    if (!g_pg_ready) return 0;
+    int nlin = 0;
+    for (int L = 0; L < g_qwen.L; L++) nlin += g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION;
+    return (size_t)nlin * (pg_recur_slot_bytes() + (size_t)batched_conv_floats() * sizeof(float));
 }
 
 // dir 0 = save (device -> host), 1 = restore (host -> device; the slot must already own the blocks)
@@ -26787,10 +26909,11 @@ static size_t park_spans(int slot, int upto_pos, std::vector<tq_span> &sp) {
                 }
             }
         } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
-            add(g_pg_recur[L] + (size_t)slot * recur_f, recur_f * sizeof(float));
+            add(pg_recur_slot(L, slot), pg_recur_slot_bytes());
             add(g_pg_conv[L] + (size_t)slot * conv_f, conv_f * sizeof(float));
         }
     }
+    (void)recur_f;
     if (g_mtp_on) {
         for (int lb = 0; lb < nb; lb++) {
             int phys = row[lb], t0 = lb * page, cnt = n - t0;
@@ -26915,10 +27038,11 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
                 }
             }
         } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
-            TQ_XFER(g_pg_recur[L] + (size_t)slot * recur_f, recur_f * sizeof(float));
+            TQ_XFER(pg_recur_slot(L, slot), pg_recur_slot_bytes());
             TQ_XFER(g_pg_conv[L] + (size_t)slot * conv_f, conv_f * sizeof(float));
         }
     }
+    (void)recur_f;
     if (g_mtp_on) {                                  // the MTP layer's KV rows + the slot's last hidden
         for (int lb = 0; lb < nb; lb++) {
             int phys = row[lb], t0 = lb * page, cnt = n - t0;
@@ -26945,15 +27069,19 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
 extern "C" int qwn_paged_slot_save(int slot, int upto_pos, void *host, size_t host_bytes) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots || upto_pos < 0 || !host) return -1;
     if (host_bytes < paged_slot_bytes(upto_pos)) return -2;
-    return paged_slot_xfer(slot, upto_pos, (char *)host, 0);
+    size_t hb = paged_park_hdr_bytes();
+    if (hb) { tq_park_hdr h; paged_park_hdr_fill(&h); memcpy(host, &h, sizeof(h)); }
+    return paged_slot_xfer(slot, upto_pos, (char *)host + hb, 0);
 }
 
 // Restore a saved session into a (reset, empty) slot: allocates its blocks, copies KV + state back.
 extern "C" int qwn_paged_slot_restore(int slot, int upto_pos, const void *host, size_t host_bytes) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots || upto_pos < 0 || !host) return -1;
     if (host_bytes < paged_slot_bytes(upto_pos)) return -2;
+    size_t hb = paged_park_hdr_bytes();
+    if (hb && !paged_park_hdr_ok((const tq_park_hdr *)host)) return -11;   // blob of another recurrent-state format
     if (paged_ensure_blocks(slot, upto_pos) != 0) return -6;     // pool exhausted
-    int rc = paged_slot_xfer(slot, upto_pos, (char *)host, 1);
+    int rc = paged_slot_xfer(slot, upto_pos, (char *)host + hb, 1);
     if (rc != 0) return rc;
     if (g_pg_t4) h_slot_encl[slot] = upto_pos + 1;
     // Summaries are a function of K and are not in the parking blob. The restored
@@ -27365,7 +27493,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
     int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
     int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
     int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
-    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
+    int conv_f = batched_conv_floats();
     int ret;
     if (ensure_wide_prefill_buffers(T) != 0) return -90;
     if (ensure_pf_colslot(T) != 0) return -90;
@@ -27422,8 +27550,8 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                 k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
                     g_wide_qkv + (size_t)off * conv_dim, g_pg_conv[L] + (size_t)slot * conv_f,
                     g_wide_qkv + (size_t)off * conv_dim, l->d_linear_conv1d, conv_dim, g_qwen.linear_conv_kernel_dim, n);
-                if (launch_deltanet_chunk_hs(8, 2, 8, g_wide_lcore + (size_t)off * value_dim,
-                        g_pg_recur[L] + (size_t)slot * recur_f, g_wide_qkv + (size_t)off * conv_dim,
+                if (launch_deltanet_chunk_hs_ds(g_pg_dstate, g_wide_lcore + (size_t)off * value_dim,
+                        pg_recur_slot(L, slot), g_wide_qkv + (size_t)off * conv_dim,
                         g_wide_z + (size_t)off * value_dim, g_wide_b + (size_t)off * lvh, g_wide_a + (size_t)off * lvh,
                         l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_norm, n, lvh, lkh, ld,
                         g_qwen.eps, g_qwen.stream) != 0) return -99;
@@ -27532,7 +27660,7 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
 // bit-identical to the decode step's (analysis/spec_paged_check.py); unpinned, a column's k-splits
 // follow T instead of N (the same "not batch-invariant" band as decode at different N).
 // Per linear layer: the kept verify inputs and the slot states (device table for the fused commit replay).
-struct tq_vf_lp { float *x; const float *b; const float *a; float *recur; float *conv;
+struct tq_vf_lp { float *x; const float *b; const float *a; void *recur; float *conv;     // recur: g_pg_dstate format
                   const uint16_t *conv_w; const float *A_log; const uint16_t *dt_bias; };
 #define TQ_VF_MAX_T 64
 #define TQ_VF_MAX_SEG 256
@@ -27682,23 +27810,24 @@ __global__ void k_tq_linear_conv_seq_paged_all(const tq_vf_lp *lp, int channels,
 // columns of a segment (grid.y) with the state slice in registers: same thread layout, same per-column
 // math and reduction order, so the column outputs and the final state equal n sequential launches of
 // the per-token kernel. core_out = NULL skips the core (commit replay); write_state stores the state.
-template <int G, int HS>
+template <int G, int HS, int DS>
 static __device__ __forceinline__ void tq_linear_core_seq_body(
-        float *core_out, float *recurrent_state, const float *qkv_conv, const float *b_proj, const float *a_proj,
+        float *core_out, void *recurrent_state, const float *qkv_conv, const float *b_proj, const float *a_proj,
         const float *A_log, const uint16_t *dt_bias, int value_heads, int key_heads, int dim,
         const int *seg_slot, const int *seg_off, const int *seg_len,
         int recur_stride, int conv_dim, int core_stride, int write_state, int seg) {
     extern __shared__ float smem[];
     float *qn = smem, *kn = smem + dim, *red = smem + 2 * dim;
     int slot = seg_slot[seg], off = seg_off[seg], n = seg_len[seg];
-    float *rstate = recurrent_state + (size_t)slot * recur_stride;
+    typedef typename tq_ds_elem<DS>::T ST;
+    ST *rstate = (ST *)recurrent_state + (size_t)slot * recur_stride;   // the slot's state in the DS format
     int blk = blockIdx.x, head = blk / HS, part = blk % HS;
     if (head >= value_heads) return;
     int t = threadIdx.x, bs = blockDim.x;
     int tids_per = dim / HS, tid_local = t / G, klane = t % G;
     int tid = part * tids_per + tid_local;
     int group = value_heads / key_heads, key_head = head / group, key_dim = key_heads * dim;
-    float *state = rstate + (size_t)head * dim * dim;
+    ST *state = rstate + (size_t)head * dim * dim;
     constexpr int NKK = 128 / G;                      // dim == 128: constant-trip loops keep st[] in registers
     float st[NKK];
     int nkk = 0;
@@ -27713,7 +27842,7 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
         b_c = b_proj[(size_t)off * value_heads + head]; a_c = a_proj[(size_t)off * value_heads + head];
     }
     #pragma unroll
-    for (int j = 0; j < NKK; j++) st[j] = state[(size_t)(klane + j * G) * dim + tid];
+    for (int j = 0; j < NKK; j++) st[j] = tq_ds_ld<DS>(state, (size_t)(klane + j * G) * dim + tid);
     (void)nkk;
     for (int s = 0; s < n; s++) {
         int col = off + s;
@@ -27755,7 +27884,7 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
         for (int j = 0; j < NKK; j++) {
             int kk = klane + j * G;
             float newv = st[j] * decay + kn[kk] * delta;
-            st[j] = newv;
+            st[j] = tq_ds_round<DS>(newv);                // what the next decode step would load back (fp32: newv)
             pcore += newv * qn[kk];
         }
         #pragma unroll
@@ -27766,33 +27895,33 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
     }
     if (write_state) {
         #pragma unroll
-        for (int j = 0; j < NKK; j++) state[(size_t)(klane + j * G) * dim + tid] = st[j];
+        for (int j = 0; j < NKK; j++) tq_ds_st<DS>(state, (size_t)(klane + j * G) * dim + tid, st[j]);
     }
 }
-template <int G, int HS>
-__global__ void k_tq_linear_core_seq_paged(float *core_out, float *recurrent_state,
+template <int G, int HS, int DS>
+__global__ void k_tq_linear_core_seq_paged(float *core_out, void *recurrent_state,
                                            const float *qkv_conv, const float *b_proj, const float *a_proj,
                                            const float *A_log, const uint16_t *dt_bias,
                                            int value_heads, int key_heads, int dim,
                                            const int *seg_slot, const int *seg_off, const int *seg_len,
                                            int recur_stride, int conv_dim, int core_stride, int write_state) {
     tq_pdl_enter();
-    tq_linear_core_seq_body<G, HS>(core_out, recurrent_state, qkv_conv, b_proj, a_proj, A_log, dt_bias, value_heads,
-                                   key_heads, dim, seg_slot, seg_off, seg_len, recur_stride, conv_dim, core_stride,
-                                   write_state, blockIdx.y);
+    tq_linear_core_seq_body<G, HS, DS>(core_out, recurrent_state, qkv_conv, b_proj, a_proj, A_log, dt_bias, value_heads,
+                                       key_heads, dim, seg_slot, seg_off, seg_len, recur_stride, conv_dim, core_stride,
+                                       write_state, blockIdx.y);
 }
-template <int G, int HS>
+template <int G, int HS, int DS>
 __global__ void k_tq_linear_core_seq_paged_all(const tq_vf_lp *lp, int value_heads, int key_heads, int dim,
                                                const int *seg_slot, const int *seg_off, const int *seg_len,
                                                int recur_stride, int conv_dim) {
     tq_pdl_enter();
     const tq_vf_lp p = lp[blockIdx.z];
-    tq_linear_core_seq_body<G, HS>(NULL, p.recur, p.x, p.b, p.a, p.A_log, p.dt_bias, value_heads, key_heads, dim,
-                                   seg_slot, seg_off, seg_len, recur_stride, conv_dim, 0, 1, blockIdx.y);
+    tq_linear_core_seq_body<G, HS, DS>(NULL, p.recur, p.x, p.b, p.a, p.A_log, p.dt_bias, value_heads, key_heads, dim,
+                                       seg_slot, seg_off, seg_len, recur_stride, conv_dim, 0, 1, blockIdx.y);
 }
 
 // Launch the sequential core over nseg segments (device seg arrays). core_out NULL = state replay only.
-static int vf_linear_core_seq(tq_layer_t *l, float *core_out, float *recur_base, const float *qkv_conv,
+static int vf_linear_core_seq(tq_layer_t *l, float *core_out, void *recur_base, const float *qkv_conv,
                               const float *bp, const float *ap, const int *seg_slot, const int *seg_off,
                               const int *seg_len, int nseg, int recur_f, int conv_dim, int value_dim, int write_state) {
     int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
@@ -27806,16 +27935,21 @@ static int vf_linear_core_seq(tq_layer_t *l, float *core_out, float *recur_base,
     size_t shA = (size_t)3 * dim * sizeof(float);
     int blkA = (dim / lc_hs) * lc_g;
     dim3 gridA(heads * lc_hs, nseg);
-    #define VF_CORE_HS(GG, HH)                                                                    \
-        tq_launch(g_pdl_small, k_tq_linear_core_seq_paged<GG, HH>, gridA, dim3(blkA), shA, g_qwen.stream, \
+    #define VF_CORE_HS1(GG, HH, DS)                                                               \
+        tq_launch(g_pdl_small, k_tq_linear_core_seq_paged<GG, HH, DS>, gridA, dim3(blkA), shA, g_qwen.stream, \
                   core_out, recur_base, qkv_conv, bp, ap, l->d_linear_A_log, l->d_linear_dt_bias,   \
                   heads, key_heads, dim, seg_slot, seg_off, seg_len, recur_f, conv_dim, value_dim, write_state)
+    #define VF_CORE_HS(GG, HH) do {                                                               \
+        if (g_pg_dstate == 1) VF_CORE_HS1(GG, HH, 1);                                             \
+        else if (g_pg_dstate == 2) VF_CORE_HS1(GG, HH, 2);                                        \
+        else VF_CORE_HS1(GG, HH, 0); } while (0)
     if (lc_g == 8 && lc_hs == 8) VF_CORE_HS(8, 8);
     else if (lc_g == 8 && lc_hs == 4) VF_CORE_HS(8, 4);
     else if (lc_g == 8 && lc_hs == 2) VF_CORE_HS(8, 2);
     else if (lc_g == 4 && lc_hs == 4) VF_CORE_HS(4, 4);
     else VF_CORE_HS(4, 2);
     #undef VF_CORE_HS
+    #undef VF_CORE_HS1
     return 0;
 }
 
@@ -28140,15 +28274,20 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
                   g_qwen.stream, (const tq_vf_lp *)g_vf_lp, conv_dim, g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f);
         size_t shA = (size_t)3 * dim * sizeof(float);
         dim3 gridA(heads * lc_hs, m, g_vf_nlin), blkA((dim / lc_hs) * lc_g);
-        #define VF_CORE_ALL(GG, HH) \
-            tq_launch(g_pdl_small, k_tq_linear_core_seq_paged_all<GG, HH>, gridA, blkA, shA, g_qwen.stream, \
+        #define VF_CORE_ALL1(GG, HH, DS) \
+            tq_launch(g_pdl_small, k_tq_linear_core_seq_paged_all<GG, HH, DS>, gridA, blkA, shA, g_qwen.stream, \
                       (const tq_vf_lp *)g_vf_lp, heads, lkh, dim, d_cslot, d_coff, d_clen, recur_f, conv_dim)
+        #define VF_CORE_ALL(GG, HH) do {                                                          \
+            if (g_pg_dstate == 1) VF_CORE_ALL1(GG, HH, 1);                                        \
+            else if (g_pg_dstate == 2) VF_CORE_ALL1(GG, HH, 2);                                   \
+            else VF_CORE_ALL1(GG, HH, 0); } while (0)
         if (lc_g == 8 && lc_hs == 8) VF_CORE_ALL(8, 8);
         else if (lc_g == 8 && lc_hs == 4) VF_CORE_ALL(8, 4);
         else if (lc_g == 8 && lc_hs == 2) VF_CORE_ALL(8, 2);
         else if (lc_g == 4 && lc_hs == 4) VF_CORE_ALL(4, 4);
         else VF_CORE_ALL(4, 2);
         #undef VF_CORE_ALL
+        #undef VF_CORE_ALL1
     } else {
         for (int L = 0; L < g_qwen.L; L++) {
             if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;

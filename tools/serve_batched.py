@@ -140,7 +140,15 @@ def kv_summary(L, total_blocks, page):
     if not L.has_token_bytes:
         return fmt
     tb = int(L.qwn_paged_token_bytes())
-    return f"{fmt} {tb / 1024:.2f} KiB/token, {total_blocks * page} pooled tokens"
+    s = f"{fmt} {tb / 1024:.2f} KiB/token, {total_blocks * page} pooled tokens"
+    try:   # TQ_DSTATE_BF16 (dstate): the engine's effective recurrent-state format + the per-slot DeltaNet state bytes
+        L.qwn_paged_dstate.restype = ctypes.c_int
+        L.qwn_paged_state_bytes.restype = ctypes.c_size_t
+        ds = int(L.qwn_paged_dstate())
+        s += f"; DeltaNet state {('fp32', 'bf16', 'fp16')[ds]} {int(L.qwn_paged_state_bytes()) / 2**20:.0f} MiB/slot"
+    except (AttributeError, IndexError):
+        pass
+    return s
 
 
 def fast_prefill(L, ids, chunk=16):
@@ -1359,6 +1367,13 @@ def main():
     ap.add_argument("--no-spec", dest="spec", action="store_false")
     ap.add_argument("--spec-k", default="auto",
                     help="draft depth: auto = 4 at <= 2 active slots, 3 at <= 8, 2 above; or a fixed number (1..16).")
+    ap.add_argument("--dstate-bf16", dest="dstate", action="store_const", const=1, default=0,
+                    help="store the per-slot GatedDeltaNet recurrent state as bf16 instead of fp32 (TQ_DSTATE_BF16=1; "
+                         "compute stays fp32): 75.5 instead of 151 MiB per slot, ~0.9 GB freed at 12 slots (~+440 "
+                         "trellis blocks); parking blobs shrink the same way (versioned header). Default off (fp32, "
+                         "bitwise the 10-16 served line). Quality gate: notes/session10-dstate.md.")
+    ap.add_argument("--dstate-fp16", dest="dstate", action="store_const", const=2,
+                    help="the same with fp16 storage (TQ_DSTATE_BF16=2; 11-bit significand, clamped to +-65504).")
     args = ap.parse_args()
     args.spec_off_reason = ""
     if args.spec and (args.bench or args.selftest):
@@ -1391,6 +1406,7 @@ def main():
             sys.exit(f"--kv-t4: codebook {os.environ['TQ_KV_T4_CODEBOOK']} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
                      f"analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 of the qwen256k project)")
     os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
+    os.environ.setdefault("TQ_DSTATE_BF16", str(args.dstate))
     if args.bench:
         bench(args)
     elif args.selftest:
