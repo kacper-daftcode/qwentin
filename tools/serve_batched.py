@@ -145,7 +145,7 @@ def kv_summary(L, total_blocks, page):
         L.qwn_paged_dstate.restype = ctypes.c_int
         L.qwn_paged_state_bytes.restype = ctypes.c_size_t
         ds = int(L.qwn_paged_dstate())
-        s += f"; DeltaNet state {('fp32', 'bf16', 'fp16')[ds]} {int(L.qwn_paged_state_bytes()) / 2**20:.0f} MiB/slot"
+        s += f"; DeltaNet state {('fp32', 'bf16', 'fp16', 'bf16+8', 'fp16sr')[ds]} {int(L.qwn_paged_state_bytes()) / 2**20:.0f} MiB/slot"
     except (AttributeError, IndexError):
         pass
     return s
