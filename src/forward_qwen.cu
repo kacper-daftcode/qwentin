@@ -22061,12 +22061,14 @@ k_t4_encode(const tq_t4_job jb, const float *__restrict__ cb) {
         tq_t4_min16(cost, m, a);
         const int par = st & 1;
         ms[par][mslot] = m;
+        __syncthreads();
+        // the step's traceback nibbles are packed after the barrier so the shuffle chain overlaps the next
+        // step's m loads / cost update instead of sitting on the barrier's critical path
         uint32_t w = (uint32_t)a;
         w |= __shfl_down_sync(0xffffffffu, w, 1) << 4;
         w |= __shfl_down_sync(0xffffffffu, w, 2) << 8;
         w |= __shfl_down_sync(0xffffffffu, w, 4) << 16;
         if ((lane & 7) == 0) tbs[st * (NT / 8) + (i >> 3)] = w;
-        __syncthreads();
         const float xt = xs[st];
         const float4 *mr = par ? mrow1 : mrow0;
         const float4 m0 = mr[0], m1 = mr[1], m2 = mr[2], m3 = mr[3];
