@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <thread>
 #include <vector>
 
@@ -4232,6 +4233,26 @@ static void tq_launch(bool pdl, void (*kern)(KArgs...), dim3 grid, dim3 block, s
     cfg.attrs = attr; cfg.numAttrs = 1;
     cudaLaunchKernelEx(&cfg, kern, static_cast<KArgs>(args)...);
 }
+
+// CUDA graphs for the paged decode step (TQ_GRAPH=1, session 10 "decode-graph"): the step's kernel sequence is
+// captured once per shape class (clients N, GQA key-split count S, MTP columns, mode flags) and replayed; the
+// per-step inputs (tokens, slot ids, positions, block tables, encoded lengths, MTP control rows) reach the kernels
+// through device buffers uploaded before the replay, so the replayed kernels run with exactly the eager step's
+// parameters (bitwise identical). Every device buffer a captured step may reference is owned by the engine and
+// (re)allocated only in a handful of places; each of them bumps g_graph_gen, which drops every cached graph.
+static int tq_graph_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TQ_GRAPH"); v = (e && *e) ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+static int tq_graph_debug(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TQ_GRAPH_DEBUG"); v = (e && *e) ? atoi(e) : 0; }
+    return v;
+}
+static unsigned g_graph_gen = 1;
+static void graph_cache_clear(void);
+static void graph_invalidate(void) { g_graph_gen++; graph_cache_clear(); }
 
 // Batched rmsnorm over `nodes` contiguous vectors (vector v at v*N). Grid = (stripes,
 // nodes), node = blockIdx.y. Bit-identical to k_tq_qwen_rmsnorm per node (same .x stripe
@@ -19948,6 +19969,7 @@ static int    g_wide_capture_mode = 0;   // when set: skip the pos-setup host sy
 
 static int ensure_wide_prefill_buffers(int N) {
     if (g_wide_cap >= N) return 0;
+    graph_invalidate();
     float **bufs[] = {&g_wide_h, &g_wide_q, &g_wide_k, &g_wide_v, &g_wide_core, &g_wide_norm,
                       &g_wide_resid, &g_wide_o, &g_wide_pn, &g_wide_gate, &g_wide_up,
                       &g_wide_mh, &g_wide_down, &g_wide_qkv, &g_wide_z, &g_wide_b,
@@ -20634,6 +20656,7 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
     if (ks > 1) {
         size_t need = (size_t)ks * split_stride * sizeof(float);
         if (need > g_wproj_part_bytes) {
+            graph_invalidate();
             if (g_wproj_part) cudaFree(g_wproj_part);
             if (cudaMalloc(&g_wproj_part, need) != cudaSuccess) { g_wproj_part = NULL; g_wproj_part_bytes = 0; return -91; }
             g_wproj_part_bytes = need;
@@ -20689,6 +20712,7 @@ static int exl3_build_frags(const tq_qmma_weight_t *const *ws, int n, int N, siz
     if (n < 1 || n > 3 || !g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
     if (!g_exl3_ctr) {
         size_t nb = (size_t)TQ_EXL3_CTR_SLOTS * TQ_EXL3_CTR_STRIDE * sizeof(int);
+        graph_invalidate();
         if (cudaMalloc(&g_exl3_ctr, nb) != cudaSuccess) { g_exl3_ctr = NULL; return -116; }
         cudaMemset(g_exl3_ctr, 0, nb);
     }
@@ -20696,6 +20720,7 @@ static int exl3_build_frags(const tq_qmma_weight_t *const *ws, int n, int N, siz
     int Gt = wide_ng(N), GP = (Gt + 1) / 2;
     size_t need_w = (size_t)GP * Kt16 * 128;      // [kt][pair][32 lanes][4 words]
     if (3 * need_w > g_exl3_b_words) {
+        graph_invalidate();
         if (g_exl3_b) cudaFree(g_exl3_b);
         if (cudaMalloc(&g_exl3_b, 3 * need_w * sizeof(uint32_t)) != cudaSuccess) { g_exl3_b = NULL; g_exl3_b_words = 0; return -112; }
         g_exl3_b_words = 3 * need_w;
@@ -20772,11 +20797,13 @@ static int wide_quant_input(const float *d_x, int K, int N) {
     int Kt = (K + 31) / 32, G = wide_ng(N), nblocks = (K + 127) / 128;  // NG groups (pow2); extras zeroed
     size_t need_b = (size_t)G * Kt * 256;
     if (need_b > g_wproj_b_bytes) {
+        graph_invalidate();
         if (g_wproj_b) cudaFree(g_wproj_b);
         if (cudaMalloc(&g_wproj_b, need_b) != cudaSuccess) return -1;
         g_wproj_b_bytes = need_b;
     }
     if ((size_t)nblocks > g_wproj_bscale_n) {
+        graph_invalidate();
         if (g_wproj_bscale) cudaFree(g_wproj_bscale);
         if (cudaMalloc(&g_wproj_bscale, (size_t)nblocks * sizeof(float)) != cudaSuccess) return -2;
         g_wproj_bscale_n = nblocks;
@@ -20801,6 +20828,7 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (k_splits > 1) {
         size_t need = (size_t)k_splits * N * w->M * sizeof(float);
         if (need > g_wproj_part_bytes) {
+            graph_invalidate();
             if (g_wproj_part) cudaFree(g_wproj_part);
             if (cudaMalloc(&g_wproj_part, need) != cudaSuccess) return -91;
             g_wproj_part_bytes = need;
@@ -25146,6 +25174,7 @@ static int paged_split_S(int N, int max_pos) {
 }
 
 static int ensure_attn_partials(size_t units) {        // units = nh*N*S
+    if (units > g_attn_pacc_n || units > g_attn_pml_n) graph_invalidate();
     if (units > g_attn_pacc_n) {
         if (g_attn_pacc) cudaFree(g_attn_pacc);
         if (cudaMalloc(&g_attn_pacc, units * g_qwen.hd * sizeof(float)) != cudaSuccess) { g_attn_pacc = NULL; g_attn_pacc_n = 0; return -1; }
@@ -25183,6 +25212,8 @@ static float   *g_pg_recur[TQ_MAX_LAYERS] = {0};
 static float   *g_pg_conv[TQ_MAX_LAYERS] = {0};
 static int     *g_block_table = NULL, *h_block_table = NULL;
 static int     *g_slot_ids = NULL, *g_iota = NULL, *g_ones = NULL;   // g_iota/g_ones: pool-wide 0..max_slots-1 / all-ones
+static int     *g_tok_d = NULL;                                      // device token ids of the step's columns (TQ_GRAPH)
+static int     *h_pin_ctl = NULL;                                    // pinned [3][max_slots]: tokens, slot ids, positions
 static int     *g_pf_colslot = NULL; static int g_pf_colslot_cap = 0;  // prefill wave column->slot
 static float   *g_pg_logits = NULL;
 static int     *g_pg_argmax = NULL;
@@ -25520,6 +25551,8 @@ static uint8_t *g_mtp_k4 = NULL;  static float *g_mtp_kq4s = NULL;
 static uint8_t *g_mtp_v8 = NULL;  static float *g_mtp_vscale = NULL;
 static float   *g_mtp_last_h = NULL;                 // [max_slots][H]
 static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *positions, int N);
+static int mtp_hook_decode_prep(const int *tokens, const int *slot_ids_h, const int *positions, int N);
+static int mtp_hook_decode_kernels(int m, int N);
 static int mtp_hook_prefill(const int *tokens, const int *col_pos, const int *seg_slot, const int *seg_off,
                             const int *seg_len, int K, int T);
 static int mtp_hook_commit(int m);
@@ -25529,6 +25562,7 @@ static void mtp_paged_free(void);                                    // paged MT
 static void park_ring_free(void);
 static void paged_t4_free(void);
 static void paged_free_all(void) {
+    graph_invalidate();
     vf_free_all();
     mtp_paged_free();
     park_ring_free();
@@ -25544,6 +25578,8 @@ static void paged_free_all(void) {
     }
     if (g_block_table) { cudaFree(g_block_table); g_block_table = NULL; }
     if (g_slot_ids) { cudaFree(g_slot_ids); g_slot_ids = NULL; }
+    if (g_tok_d) { cudaFree(g_tok_d); g_tok_d = NULL; }
+    if (h_pin_ctl) { cudaFreeHost(h_pin_ctl); h_pin_ctl = NULL; }
     if (g_iota) { cudaFree(g_iota); g_iota = NULL; }
     if (g_ones) { cudaFree(g_ones); g_ones = NULL; }
     if (g_pf_colslot) { cudaFree(g_pf_colslot); g_pf_colslot = NULL; } g_pf_colslot_cap = 0;
@@ -26193,6 +26229,10 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     size_t btn = (size_t)max_slots * g_pg_maxblk;
     if (cudaMalloc(&g_block_table, btn * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_slot_ids, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
+    if (cudaMalloc(&g_tok_d, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
+    if (cudaHostAlloc(&h_pin_ctl, (size_t)3 * max_slots * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
+        h_pin_ctl = NULL; paged_free_all(); return -6;
+    }
     if (cudaMalloc(&g_iota, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_ones, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_pg_logits, (size_t)max_slots * g_qwen.V * sizeof(float)) != cudaSuccess) { paged_free_all(); return -6; }
@@ -26636,12 +26676,8 @@ static inline int paged_lm_head_wide(void) {
 
 // One paged decode step over N active columns. column j -> slot_ids[j] (persistent slot);
 // tokens[j] is decoded at positions[j] (its own KV history via the block table).
-static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
-    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
-    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
-    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
-    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
-    int ret;
+// Host prework of a decode step: validation, block allocation, the step's max position.
+static int paged_decode_prep(const int *slot_ids_h, const int *positions, int N, int *dec_maxpos_out) {
     int dec_maxpos = 0;
     for (int j = 0; j < N; j++) {
         int slot = slot_ids_h[j];
@@ -26650,12 +26686,40 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         if (paged_ensure_blocks(slot, positions[j]) != 0) return -62;     // admission / pool full
         if (positions[j] > dec_maxpos) dec_maxpos = positions[j];
     }
-    paged_upload_tables(g_qwen.stream);
-    cudaMemcpyAsync(g_slot_ids, slot_ids_h, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    cudaMemcpyAsync(g_wide_pos, positions, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    for (int j = 0; j < N; j++)
-        k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
-            g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    *dec_maxpos_out = dec_maxpos;
+    return 0;
+}
+// TQ_KV_T4 tail of a decode step: the step's columns -> trellis for the next step (host-side ranges, eager in
+// both the stream and the graph mode: the ranges change every step).
+static int paged_decode_t4_tail(const int *slot_ids_h, const int *positions, int N) {
+    if (!g_pg_t4) return 0;
+    tq_t4_ranges rg; rg.nr = 0;
+    for (int j = 0; j < N; j++) {
+        int slot = slot_ids_h[j], len = positions[j] + 1;
+        if (len <= h_slot_encl[slot]) continue;
+        if (paged_t4_add_cols(rg, slot, h_slot_encl[slot], len, -1) != 0) return -83;
+        h_slot_encl[slot] = len;
+    }
+    return paged_t4_encode_ranges(rg, -1) != 0 ? -83 : 0;
+}
+// The step's device work once the block tables, slot ids and positions are on the device. graph_body = 0: the
+// eager step (tokens from the host, one embed launch per column; the launch sequence of 9da2d3b); graph_body = 1:
+// the sequence captured into a CUDA graph (TQ_GRAPH): the tokens come from g_tok_d in one launch, the MTP control
+// rows were uploaded by the prework (mtp_m = its column count) -- every kernel then runs with the eager step's
+// grid and parameters, so the replay is bitwise the eager step.
+static int paged_decode_body(const int *tokens, const int *slot_ids_h, const int *positions, int N,
+                             int dec_maxpos, int graph_body, int mtp_m) {
+    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
+    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
+    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
+    int ret;
+    if (graph_body)
+        k_tq_embed_lookup_nk<<<dim3((H + 255) / 256, N), 256, 0, g_qwen.stream>>>(g_wide_h, g_qwen.d_embed, g_tok_d, H);
+    else
+        for (int j = 0; j < N; j++)
+            k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
+                g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
     const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
     int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
@@ -26739,18 +26803,171 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                             cudaMemcpyDeviceToDevice, g_qwen.stream);
         }
     }
-    if (g_mtp_on && mtp_hook_decode(tokens, slot_ids_h, positions, N) != 0) return -82;   // MTP trunk slot pos-1
-    if (g_pg_t4) {                                          // the step's columns -> trellis for the next step
-        tq_t4_ranges rg; rg.nr = 0;
-        for (int j = 0; j < N; j++) {
-            int slot = slot_ids_h[j], len = positions[j] + 1;
-            if (len <= h_slot_encl[slot]) continue;
-            if (paged_t4_add_cols(rg, slot, h_slot_encl[slot], len, -1) != 0) return -83;
-            h_slot_encl[slot] = len;
-        }
-        if (paged_t4_encode_ranges(rg, -1) != 0) return -83;
+    if (g_mtp_on) {                                         // MTP trunk slot pos-1
+        if (graph_body) { if (mtp_hook_decode_kernels(mtp_m, N) != 0) return -82; }
+        else if (mtp_hook_decode(tokens, slot_ids_h, positions, N) != 0) return -82;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -80;
+}
+
+// The eager decode step (the stream sequence of 9da2d3b: tables, slot ids, positions, N embed launches, the body,
+// the MTP hook, the T4 tail).
+static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
+    int dec_maxpos = 0, ret;
+    if ((ret = paged_decode_prep(slot_ids_h, positions, N, &dec_maxpos)) != 0) return ret;
+    paged_upload_tables(g_qwen.stream);
+    cudaMemcpyAsync(g_slot_ids, slot_ids_h, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_wide_pos, positions, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    if ((ret = paged_decode_body(tokens, slot_ids_h, positions, N, dec_maxpos, 0, 0)) != 0) return ret;
+    return paged_decode_t4_tail(slot_ids_h, positions, N);
+}
+
+// ===== TQ_GRAPH: the decode step as a CUDA graph per shape class =====
+// Key = everything the captured launch sequence depends on besides the device buffers: N, the GQA key-split
+// count S (a function of N and the step's max position -- the split picker's cap changes every 256 positions
+// below ~16K at N = 1), the MTP column count, the mode flags. A small LRU of instantiated graphs; a miss captures
+// the body (cudaStreamCaptureModeRelaxed: a lazily grown buffer may be allocated during the capture, which drops
+// the older graphs through graph_invalidate) and instantiates it.
+#define TQ_GRAPH_CACHE 32
+struct tq_graph_ent { unsigned long long key; cudaGraphExec_t exec; unsigned tick; int nodes; };
+static tq_graph_ent g_graph_cache[TQ_GRAPH_CACHE];
+static int g_graph_n = 0;
+static unsigned g_graph_tick = 0;
+static long g_graph_hits = 0, g_graph_captures = 0, g_graph_evictions = 0;
+static double g_graph_capture_ms = 0.0;             // total host time spent capturing + instantiating
+static int g_graph_disabled = 0;                    // a capture failed: stay eager (logged once)
+static void graph_cache_clear(void) {
+    for (int i = 0; i < g_graph_n; i++) if (g_graph_cache[i].exec) cudaGraphExecDestroy(g_graph_cache[i].exec);
+    g_graph_n = 0;
+}
+static cudaGraphExec_t graph_cache_get(unsigned long long key) {
+    for (int i = 0; i < g_graph_n; i++)
+        if (g_graph_cache[i].key == key) { g_graph_cache[i].tick = ++g_graph_tick; g_graph_hits++; return g_graph_cache[i].exec; }
+    return NULL;
+}
+static void graph_cache_put(unsigned long long key, cudaGraphExec_t exec, int nodes) {
+    int slot = g_graph_n;
+    if (g_graph_n == TQ_GRAPH_CACHE) {              // evict the least recently used
+        slot = 0;
+        for (int i = 1; i < g_graph_n; i++) if (g_graph_cache[i].tick < g_graph_cache[slot].tick) slot = i;
+        if (g_graph_cache[slot].exec) cudaGraphExecDestroy(g_graph_cache[slot].exec);
+        g_graph_evictions++;
+    } else g_graph_n++;
+    g_graph_cache[slot].key = key; g_graph_cache[slot].exec = exec; g_graph_cache[slot].tick = ++g_graph_tick;
+    g_graph_cache[slot].nodes = nodes;
+}
+static double tq_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+// Capture `body` on g_qwen.stream and instantiate it. Returns NULL (and disables the graph path) on failure.
+template <typename Body>
+static cudaGraphExec_t graph_capture(const char *what, Body body, int *nodes_out) {
+    cudaStream_t st = g_qwen.stream;
+    double t0 = tq_now_ms();
+    cudaError_t e = cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[graph] %s: cudaStreamBeginCapture failed: %s -- staying eager\n", what, cudaGetErrorString(e));
+        g_graph_disabled = 1; return NULL;
+    }
+    int r = body();
+    cudaGraph_t graph = NULL;
+    cudaError_t e2 = cudaStreamEndCapture(st, &graph);
+    if (r != 0 || e2 != cudaSuccess || !graph) {
+        fprintf(stderr, "[graph] %s: capture failed (body %d, end %s) -- staying eager\n", what, r, cudaGetErrorString(e2));
+        if (graph) cudaGraphDestroy(graph);
+        cudaGetLastError();
+        g_graph_disabled = 1; return NULL;
+    }
+    size_t nn = 0; cudaGraphGetNodes(graph, NULL, &nn);
+    if (tq_graph_debug()) {
+        size_t ne = 0; cudaGraphGetEdges(graph, NULL, NULL, NULL, &ne);
+        size_t npdl = 0;
+        if (ne > 0) {
+            cudaGraphNode_t *from = (cudaGraphNode_t *)malloc(ne * sizeof(cudaGraphNode_t));
+            cudaGraphNode_t *to = (cudaGraphNode_t *)malloc(ne * sizeof(cudaGraphNode_t));
+            cudaGraphEdgeData *ed = (cudaGraphEdgeData *)malloc(ne * sizeof(cudaGraphEdgeData));
+            size_t ne2 = ne;
+            if (from && to && ed && cudaGraphGetEdges(graph, from, to, ed, &ne2) == cudaSuccess)
+                for (size_t i = 0; i < ne2; i++) if (ed[i].type == cudaGraphDependencyTypeProgrammatic) npdl++;
+            free(from); free(to); free(ed);
+        }
+        fprintf(stderr, "[graph] %s: %zu nodes, %zu edges (%zu programmatic), capture %.2f ms\n", what, nn, ne, npdl,
+                tq_now_ms() - t0);
+    }
+    double t1 = tq_now_ms();
+    cudaGraphExec_t exec = NULL;
+    e = cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraphDestroy(graph);
+    if (e != cudaSuccess || !exec) {
+        fprintf(stderr, "[graph] %s: cudaGraphInstantiate failed: %s -- staying eager\n", what, cudaGetErrorString(e));
+        cudaGetLastError();
+        g_graph_disabled = 1; return NULL;
+    }
+    double t2 = tq_now_ms();
+    if (tq_graph_debug()) fprintf(stderr, "[graph] %s: instantiate %.2f ms\n", what, t2 - t1);
+    g_graph_capture_ms += t2 - t0;
+    g_graph_captures++;
+    if (nodes_out) *nodes_out = (int)nn;
+    return exec;
+}
+// Stats for the tools / notes: graph replays, captures, evictions, cached graphs, capture time.
+extern "C" int qwn_graph_stats(long *hits, long *captures, long *evictions, int *cached, double *capture_ms) {
+    if (hits) *hits = g_graph_hits;
+    if (captures) *captures = g_graph_captures;
+    if (evictions) *evictions = g_graph_evictions;
+    if (cached) *cached = g_graph_n;
+    if (capture_ms) *capture_ms = g_graph_capture_ms;
+    return g_graph_disabled ? 1 : 0;
+}
+
+// The graph decode step. Returns 1 when the step is not covered (the caller runs the eager step), else the step's
+// status. Prework (eager, stream-ordered before the replay): block tables + encoded lengths, tokens / slot ids /
+// positions through the pinned staging rows into g_tok_d / g_slot_ids / g_wide_pos, the MTP control rows, the
+// attention partials for the step's S. Then the replay, then the T4 tail.
+static int run_paged_decode_step_graph(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
+    if (g_graph_disabled || !g_tok_d || !h_pin_ctl) return 1;
+    if (!paged_lm_head_wide() || paged_topk_pages() > 0) return 1;             // paths with host-side per-step work
+    if (!(paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
+          g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16)) return 1;   // the scalar attention picker
+    int dec_maxpos = 0, ret;
+    if ((ret = paged_decode_prep(slot_ids_h, positions, N, &dec_maxpos)) != 0) return ret;
+    cudaStream_t st = g_qwen.stream;
+    paged_upload_tables(st);
+    int *pt = h_pin_ctl, *ps = h_pin_ctl + g_pg_maxslots, *pp = h_pin_ctl + 2 * g_pg_maxslots;
+    for (int j = 0; j < N; j++) { pt[j] = tokens[j]; ps[j] = slot_ids_h[j]; pp[j] = positions[j]; }
+    cudaMemcpyAsync(g_tok_d, pt, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(g_slot_ids, ps, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(g_wide_pos, pp, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st);
+    int mtp_m = g_mtp_on ? mtp_hook_decode_prep(tokens, slot_ids_h, positions, N) : 0;
+    // the GQA key-split count the launcher will pick for this step (and its partials, allocated before the capture)
+    int S = paged_attn_split_S(N, dec_maxpos, 1);
+    if (S > 1 && ensure_attn_partials((size_t)g_qwen.nh * N * S) != 0) S = 1;
+    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    unsigned long long key = 1ull;                                   // kind 1 = decode step
+    key = (key << 8) | (unsigned)N;
+    key = (key << 8) | (unsigned)S;
+    key = (key << 8) | (unsigned)mtp_m;
+    key = (key << 4) | (unsigned)(fuse | (g_mtp_on << 1) | (g_pg_t4 << 2) | (g_pg_v4 << 3));
+    key = (key << 4) | (unsigned)(paged_attn_st_enabled() & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
+    key = (key << 4) | (unsigned)(g_pg_sink != NULL);
+    key = (key << 16) | (g_graph_gen & 0xffff);
+    cudaGraphExec_t exec = graph_cache_get(key);
+    if (!exec) {
+        int nodes = 0;
+        exec = graph_capture("decode", [&]() { return paged_decode_body(tokens, slot_ids_h, positions, N, dec_maxpos, 1, mtp_m); }, &nodes);
+        if (!exec) return 1;                                         // eager fallback (the prework is idempotent)
+        key = (key & ~0xffffull) | (g_graph_gen & 0xffff);           // a buffer grown inside the capture bumped it
+        graph_cache_put(key, exec, nodes);
+        if (tq_graph_debug())
+            fprintf(stderr, "[graph] decode: captured N=%d S=%d mtp_m=%d maxpos=%d (%d cached)\n", N, S, mtp_m, dec_maxpos, g_graph_n);
+    }
+    cudaError_t e = cudaGraphLaunch(exec, st);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[graph] decode: cudaGraphLaunch failed: %s\n", cudaGetErrorString(e));
+        return -84;
+    }
+    return paged_decode_t4_tail(slot_ids_h, positions, N);
 }
 
 extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, const int *positions,
@@ -26761,7 +26978,9 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
     int pdl = tq_pdl_enabled();
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
-    int ret = run_paged_decode_step_core(tokens, slot_ids, positions, N);
+    int ret = 1;
+    if (tq_graph_enabled()) ret = run_paged_decode_step_graph(tokens, slot_ids, positions, N);
+    if (ret == 1) ret = run_paged_decode_step_core(tokens, slot_ids, positions, N);
     g_pdl_on = g_pdl_small = 0;
     if (ret != 0) return ret;
     if (out_argmax)
@@ -26786,6 +27005,7 @@ extern "C" int qwn_paged_stats(int *free_blocks, int *total_blocks, int *page, i
 // head would take the fp16-accumulate EXL3 units instead. dev_out = NULL turns it off.
 extern "C" int qwn_paged_logits_sink(float *dev_out, int cap_cols, int head_cols) {
     if (!g_pg_ready) return -1;
+    graph_invalidate();                                      // the sink copy is a node of a captured step
     if (!dev_out) { g_pg_sink = NULL; g_pg_sink_cap = 0; g_pg_sink_head = 0; return 0; }
     if (cap_cols < 1 || head_cols < 1) return -2;
     if (!paged_lm_head_wide()) return -3;
@@ -26816,6 +27036,7 @@ __global__ void k_tq_linear_conv_chunk(float *out, float *state, const float *x,
 
 static int ensure_pf_colslot(int T) {
     if (g_pf_colslot_cap >= T) return 0;
+    graph_invalidate();
     if (g_pf_colslot) cudaFree(g_pf_colslot);
     if (cudaMalloc(&g_pf_colslot, (size_t)T * sizeof(int)) != cudaSuccess) { g_pf_colslot = NULL; g_pf_colslot_cap = 0; return -1; }
     g_pf_colslot_cap = T;
@@ -27049,6 +27270,7 @@ static void vf_free_all(void) {
 // Kept-input + logits buffers for waves of up to T columns (grown on demand, never shrunk).
 static int vf_ensure(int T) {
     if (g_vf_cap >= T) return 0;
+    graph_invalidate();
     int cap = (T + 15) & ~15;
     if (cap > TQ_VF_MAX_T) cap = TQ_VF_MAX_T;
     if (cap < T) return -1;
@@ -27571,6 +27793,7 @@ static int     *g_mtp_draft_d = NULL;                // [TQ_MTP_MAX_K][max_slots
 static int      h_mtp_ctl[TQ_MTP_CTL_ROWS][TQ_MTP_CTL_COLS];
 
 static void mtp_paged_free(void) {
+    graph_invalidate();
     if (g_mtp_k4) { cudaFree(g_mtp_k4); g_mtp_k4 = NULL; }
     if (g_mtp_kq4s) { cudaFree(g_mtp_kq4s); g_mtp_kq4s = NULL; }
     if (g_mtp_v8) { cudaFree(g_mtp_v8); g_mtp_v8 = NULL; }
@@ -27672,7 +27895,9 @@ static int mtp_trunk_write(const float *hsrc, const int *d_hidx, const int *d_to
 }
 
 // Decode step: (last hidden of the slot, tokens[j]) -> MTP slot positions[j]-1; then last hidden = g_wide_h[j].
-static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
+// Split in two so the graph path (TQ_GRAPH) can upload the control rows before the replay and capture the kernels:
+// prep = host rows + upload (returns m = the columns with a position > 0), kernels = the device work for that m.
+static int mtp_hook_decode_prep(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
     int m = 0;
     for (int j = 0; j < N; j++) {
         if (positions[j] <= 0) continue;
@@ -27681,11 +27906,18 @@ static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *
     }
     for (int j = 0; j < N; j++) h_mtp_ctl[4][j] = slot_ids_h[j];
     mtp_ctl_upload(5);
+    return m;
+}
+static int mtp_hook_decode_kernels(int m, int N) {
     int ret = mtp_trunk_write(g_mtp_last_h, mtp_ctl_row(1), mtp_ctl_row(0), mtp_ctl_row(2), mtp_ctl_row(3), m);
     if (ret != 0) return ret;
     k_tq_scatter_rows_nk<<<dim3((g_qwen.H + 255) / 256, N), 256, 0, g_qwen.stream>>>(
         g_mtp_last_h, mtp_ctl_row(4), g_wide_h, NULL, g_qwen.H);
     return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
+    int m = mtp_hook_decode_prep(tokens, slot_ids_h, positions, N);
+    return mtp_hook_decode_kernels(m, N);
 }
 
 // Prefill wave: in-wave pairs (col t -> token of col t+1) of every segment, the cross-wave pair of each
