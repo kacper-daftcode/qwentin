@@ -1112,6 +1112,24 @@ static __device__ __forceinline__ void tq_t4_kfrags(const uint4 kp, uint32_t pre
         if (k & 1) bk8[k >> 1] = frag; else bk0[k >> 1] = frag;
     }
 }
+// fp16 path (attention third pass, B2-eng): the table values themselves as the fp16 MMA operands -- no scale, no
+// conversion; the vector's scale is applied to the Q.K^T score column (K) or folded into the P row (V) afterwards.
+static __device__ __forceinline__ uint32_t tq_t4_bk_raw(uint32_t pair, const uint16_t *tab) {
+    return (uint32_t)tab[pair & 0xFFFu] | ((uint32_t)tab[(pair >> 4) & 0xFFFu] << 16);
+}
+static __device__ __forceinline__ void tq_t4_kfrags_raw(const uint4 kp, uint32_t prevb, int t4,
+                                                        const uint16_t *tab, uint32_t bk0[2], uint32_t bk8[2]) {
+    const uint32_t w[4] = {kp.x, kp.y, kp.z, kp.w};
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const uint32_t lowb = (k == 0) ? prevb : (w[k - 1] >> 24);
+        const uint32_t x = (w[k] << 8) | lowb, y = w[k] >> 24;
+        const uint32_t frag = tq_t4_bk_raw(tq_t4_pair(x, y, t4), tab);
+        if (k & 1) bk8[k >> 1] = frag; else bk0[k >> 1] = frag;
+    }
+}
+// the fp16 scales of two side words as an fp16x2 (lo = sw0's, hi = sw1's)
+static __device__ __forceinline__ uint32_t tq_t4_scale2(uint32_t sw0, uint32_t sw1) { return __byte_perm(sw0, sw1, 0x6521); }
 // P.V B-fragment values of one key row for the thread's four adjacent channels ch..ch+3
 // (ch = 32 warp + 4 gr): states (bits >> 4f) & 0xFFF of the 3 stream bytes at ch/2 .. ch/2 + 2.
 static __device__ __forceinline__ uint32_t tq_t4_vbits(const uint8_t *codes_row, uint32_t sw, int cb /* = ch/2 */) {
@@ -1125,6 +1143,9 @@ static __device__ __forceinline__ uint32_t tq_t4_f16x2_bf16(uint32_t h2) {
 }
 static __device__ __forceinline__ float tq_t4_val(uint32_t bits, int f, const uint16_t *tab, float sc) {
     return __half2float(__ushort_as_half(tab[(bits >> (4 * f)) & 0xFFFu])) * sc;
+}
+static __device__ __forceinline__ uint32_t tq_t4_val_raw(uint32_t bits, int f, const uint16_t *tab) {
+    return (uint32_t)tab[(bits >> (4 * f)) & 0xFFFu];
 }
 // scalar paths: value of channel d of a row (codes_row = the 128 code bytes, sw = its side word)
 static __device__ __forceinline__ float tq_t4_dq(const uint8_t *codes_row, uint32_t sw, int d, const uint16_t *tab) {
@@ -24427,7 +24448,12 @@ __global__ void __launch_bounds__(256, 2) k_tq_paged_attn_q4_gqa_f16(
 //  (2) P.V for a 16-key chunk holding own keys runs one MMA variant per own key kk (B = exact V at kk, trellis
 //      elsewhere) and each row takes the variant of its own key -- the per-column kernel's B for that row -- while rows
 //      whose own key lies elsewhere take the plain trellis MMA. Every other chunk / super-tile is the shared stream.
-template <int QT>
+// F16 = 1 (TQ_T4_ATTN_F16, the attention third pass on the trellis pool): Q, K, P and V as fp16 MMA operands. The K
+// and V operands are the table's fp16 values themselves (no per-element convert / multiply / bf16 pack); a key's
+// scale multiplies its score column after Q.K^T (one FMUL per score, folded into the rsc step) and a value row's
+// scale is folded into P (4 HMUL2 per 16 keys, as the int4 fp16 kernel does); exact own keys (fp16 staging) are the
+// operands as stored with scale 1. F16 = 0 is the bf16 path above (bitwise the per-column kernel's).
+template <int QT, int F16>
 static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
     float oacc[QT][4][4], uint32_t *sm, int tid, int warp, int lane, int gr, int t4,
     int it, int t0, int phys, int pos_max, int page, int nrows, int nkv, float rsc,
@@ -24455,14 +24481,23 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
         const uint32_t sw0 = tq_t4_side(kside, r0, nkv, kv_head), sw1 = tq_t4_side(kside, r1, nkv, kv_head);
         const float sc0 = tq_t4_scale(sw0), sc1 = tq_t4_scale(sw1);
         uint32_t prev0 = sw0 & 0xFFu, prev1 = sw1 & 0xFFu;
+        // F16: the scales of the C fragment's keys (tp + 2 t4 + j and tp + 8 + 2 t4 + j) live in the quad of lane 4 (2 t4 + j)
+        float ksc0[2] = {1.0f, 1.0f}, ksc1[2] = {1.0f, 1.0f};
+        if constexpr (F16) {
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                ksc0[j] = __shfl_sync(0xffffffffu, sc0, (2 * t4 + j) * 4);
+                ksc1[j] = __shfl_sync(0xffffffffu, sc1, (2 * t4 + j) * 4);
+            }
+        }
         if (!diag) {
             #pragma unroll
             for (int g = 0; g < 8; g++) {
                 const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
                 const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
                 uint32_t bk0[2], bk8[2], ek0[2], ek8[2];
-                tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8);
-                tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8);
+                if constexpr (F16) { tq_t4_kfrags_raw(kp0, prev0, t4, tab, bk0, bk8); tq_t4_kfrags_raw(kp1, prev1, t4, tab, ek0, ek8); }
+                else { tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8); tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8); }
                 prev0 = kp0.w >> 24; prev1 = kp1.w >> 24;
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
@@ -24470,10 +24505,16 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                     #pragma unroll
                     for (int q = 0; q < QT; q++) {
                         const uint32_t *a = &sm[TQ_SEG_QA + ((q * 16 + c) * 32 + lane) * 4];
-                        tq_mma_bf16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]);
-                        tq_mma_bf16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]);
+                        if constexpr (F16) { tq_mma_f16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]); tq_mma_f16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]); }
+                        else { tq_mma_bf16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]); tq_mma_bf16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]); }
                     }
                 }
+            }
+            if constexpr (F16) {
+                #pragma unroll
+                for (int q = 0; q < QT; q++)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) { s0[q][j] *= ksc0[j & 1]; s1[q][j] *= ksc1[j & 1]; }
             }
         } else {
             // the diagonal super-tile: trellis stream (s) + exact stream (x) whose B columns at the segment's
@@ -24490,27 +24531,43 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                 const uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
                 const uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
                 uint32_t bk0[2], bk8[2], ek0[2], ek8[2];
-                tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8);
-                tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8);
+                if constexpr (F16) { tq_t4_kfrags_raw(kp0, prev0, t4, tab, bk0, bk8); tq_t4_kfrags_raw(kp1, prev1, t4, tab, ek0, ek8); }
+                else { tq_t4_kfrags(kp0, prev0, t4, sc0, tab, bk0, bk8); tq_t4_kfrags(kp1, prev1, t4, sc1, tab, ek0, ek8); }
                 prev0 = kp0.w >> 24; prev1 = kp1.w >> 24;
                 #pragma unroll
                 for (int cc = 0; cc < 2; cc++) {
                     const int c = 2 * g + cc, ch = 16 * c + 2 * t4;
-                    const uint32_t xb0 = own0 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch)) : bk0[cc];
-                    const uint32_t xb8 = own0 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch + 8)) : bk8[cc];
-                    const uint32_t xe0 = own1 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch)) : ek0[cc];
-                    const uint32_t xe8 = own1 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch + 8)) : ek8[cc];
+                    uint32_t xb0, xb8, xe0, xe8;
+                    if constexpr (F16) {                              // exact keys: the fp16 pairs as stored
+                        xb0 = own0 ? *(const uint32_t *)(kf0 + ch) : bk0[cc];
+                        xb8 = own0 ? *(const uint32_t *)(kf0 + ch + 8) : bk8[cc];
+                        xe0 = own1 ? *(const uint32_t *)(kf1 + ch) : ek0[cc];
+                        xe8 = own1 ? *(const uint32_t *)(kf1 + ch + 8) : ek8[cc];
+                    } else {
+                        xb0 = own0 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch)) : bk0[cc];
+                        xb8 = own0 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf0 + ch + 8)) : bk8[cc];
+                        xe0 = own1 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch)) : ek0[cc];
+                        xe8 = own1 ? tq_t4_f16x2_bf16(*(const uint32_t *)(kf1 + ch + 8)) : ek8[cc];
+                    }
                     #pragma unroll
                     for (int q = 0; q < QT; q++) {
                         const uint32_t *a = &sm[TQ_SEG_QA + ((q * 16 + c) * 32 + lane) * 4];
-                        tq_mma_bf16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]);
-                        tq_mma_bf16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]);
-                        tq_mma_bf16_m16n8k16(x0[q], a, xb0, xb8);
-                        tq_mma_bf16_m16n8k16(x1[q], a, xe0, xe8);
+                        if constexpr (F16) {
+                            tq_mma_f16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]);
+                            tq_mma_f16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]);
+                            tq_mma_f16_m16n8k16(x0[q], a, xb0, xb8);
+                            tq_mma_f16_m16n8k16(x1[q], a, xe0, xe8);
+                        } else {
+                            tq_mma_bf16_m16n8k16(s0[q], a, bk0[cc], bk8[cc]);
+                            tq_mma_bf16_m16n8k16(s1[q], a, ek0[cc], ek8[cc]);
+                            tq_mma_bf16_m16n8k16(x0[q], a, xb0, xb8);
+                            tq_mma_bf16_m16n8k16(x1[q], a, xe0, xe8);
+                        }
                     }
                 }
             }
-            // a row's own key takes the exact score (C-fragment layout: j < 2 -> row gr, keys 2t4 + (j&1); j >= 2 -> row gr+8)
+            // a row's own key takes the exact score (C-fragment layout: j < 2 -> row gr, keys 2t4 + (j&1); j >= 2 -> row gr+8);
+            // F16: every other score takes its key's scale here (the exact key's scale is 1)
             #pragma unroll
             for (int q = 0; q < QT; q++) {
                 const int rl = q * 16 + gr, rh = rl + 8;
@@ -24519,8 +24576,13 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
                 for (int j = 0; j < 4; j++) {
                     const int k0 = tp + 2 * t4 + (j & 1), k1 = tp + 8 + 2 * t4 + (j & 1);
                     const int prow = (j < 2) ? pl : ph;
-                    if (k0 == prow) s0[q][j] = x0[q][j];
-                    if (k1 == prow) s1[q][j] = x1[q][j];
+                    if constexpr (F16) {
+                        s0[q][j] = (k0 == prow) ? x0[q][j] : s0[q][j] * ksc0[j & 1];
+                        s1[q][j] = (k1 == prow) ? x1[q][j] : s1[q][j] * ksc1[j & 1];
+                    } else {
+                        if (k0 == prow) s0[q][j] = x0[q][j];
+                        if (k1 == prow) s1[q][j] = x1[q][j];
+                    }
                 }
             }
         }
@@ -24576,8 +24638,13 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
         }
         if (t4 == 0) { wsum[warp * 32 + rl] = ls_lo; wsum[warp * 32 + rh] = ls_hi; }
         uint32_t *pst = &sm[TQ_SEG_PST + ((q * 8 + warp) * 32 + lane) * 4];
-        pst[0] = tq_pack_bf16(p00, p01); pst[1] = tq_pack_bf16(p02, p03);
-        pst[2] = tq_pack_bf16(p10, p11); pst[3] = tq_pack_bf16(p12, p13);
+        if constexpr (F16) {
+            pst[0] = tq_pack_f16(p00, p01); pst[1] = tq_pack_f16(p02, p03);
+            pst[2] = tq_pack_f16(p10, p11); pst[3] = tq_pack_f16(p12, p13);
+        } else {
+            pst[0] = tq_pack_bf16(p00, p01); pst[1] = tq_pack_bf16(p02, p03);
+            pst[2] = tq_pack_bf16(p10, p11); pst[3] = tq_pack_bf16(p12, p13);
+        }
     }
     __syncthreads();
     if (tid < QT * 16) {
@@ -24594,51 +24661,82 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
     const int cb = 16 * warp + 2 * gr;                            // stream byte of the thread's first channel
     for (int tt = 0; tt < 8; tt++) {
         const int r0 = t0 + tt * 16 + 2 * t4;
-        float v[4][4];                                            // [key q0,q1,q8,q9][f]: trellis V
+        float v[4][4];                                            // [key q0,q1,q8,q9][f]: trellis V (bf16 path, dequantized)
+        uint32_t vr[4][4];                                        // F16: the table's fp16 bits
+        uint32_t zs[4];
         #pragma unroll
         for (int rr = 0; rr < 4; rr++) {
             const size_t qq = TQ_GROW(r0 + (rr >> 1) * 8 + (rr & 1));
             const uint32_t z = tq_t4_side(vside, qq, nkv, kv_head);
             const uint32_t c = tq_t4_vbits(vcb + qq * cstride4, z, cb);
-            const float vs = tq_t4_scale(z);
-            #pragma unroll
-            for (int f = 0; f < 4; f++) v[rr][f] = tq_t4_val(c, f, tab, vs);
+            zs[rr] = z;
+            if constexpr (F16) {
+                #pragma unroll
+                for (int f = 0; f < 4; f++) vr[rr][f] = tq_t4_val_raw(c, f, tab);
+            } else {
+                const float vs = tq_t4_scale(z);
+                #pragma unroll
+                for (int f = 0; f < 4; f++) v[rr][f] = tq_t4_val(c, f, tab, vs);
+            }
         }
+        // F16: the V scales of the thread's key pairs (r0, r0+1) / (r0+8, r0+9) as fp16x2, folded into the P pairs
+        const uint32_t scv_lo = F16 ? tq_t4_scale2(zs[0], zs[1]) : 0u, scv_hi = F16 ? tq_t4_scale2(zs[2], zs[3]) : 0u;
         const int ca = max(seg_pos0, t0 + 16 * tt), ckb = min(seg_pos1, t0 + 16 * tt + 15);
         if (!(diag && ca <= ckb)) {                               // no own key in this chunk: the shared stream
             #pragma unroll
             for (int f = 0; f < 4; f++) {
-                const uint32_t b0 = tq_pack_bf16(v[0][f], v[1][f]), b1 = tq_pack_bf16(v[2][f], v[3][f]);
+                const uint32_t b0 = F16 ? (vr[0][f] | (vr[1][f] << 16)) : tq_pack_bf16(v[0][f], v[1][f]);
+                const uint32_t b1 = F16 ? (vr[2][f] | (vr[3][f] << 16)) : tq_pack_bf16(v[2][f], v[3][f]);
                 #pragma unroll
                 for (int q = 0; q < QT; q++) {
                     const uint32_t *pa = &sm[TQ_SEG_PST + ((q * 8 + tt) * 32 + lane) * 4];
-                    uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
-                    tq_mma_bf16_m16n8k16(oacc[q][f], a, b0, b1);
+                    if constexpr (F16) {
+                        uint32_t a[4] = {tq_hmul2(pa[0], scv_lo), tq_hmul2(pa[1], scv_lo), tq_hmul2(pa[2], scv_hi), tq_hmul2(pa[3], scv_hi)};
+                        tq_mma_f16_m16n8k16(oacc[q][f], a, b0, b1);
+                    } else {
+                        uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
+                        tq_mma_bf16_m16n8k16(oacc[q][f], a, b0, b1);
+                    }
                 }
             }
             continue;
         }
         // own keys ca..ckb in this chunk: per (q, f) the plain MMA for the rows whose own key lies elsewhere, then one
-        // variant MMA per own key kk (exact V at kk) for the rows owning kk
+        // variant MMA per own key kk (exact V at kk, P scale 1 there) for the rows owning kk
         #pragma unroll
         for (int q = 0; q < QT; q++) {
             const uint32_t *pa = &sm[TQ_SEG_PST + ((q * 8 + tt) * 32 + lane) * 4];
-            uint32_t a[4] = {pa[0], pa[1], pa[2], pa[3]};
+            uint32_t a[4];
+            if constexpr (F16) { a[0] = tq_hmul2(pa[0], scv_lo); a[1] = tq_hmul2(pa[1], scv_lo); a[2] = tq_hmul2(pa[2], scv_hi); a[3] = tq_hmul2(pa[3], scv_hi); }
+            else { a[0] = pa[0]; a[1] = pa[1]; a[2] = pa[2]; a[3] = pa[3]; }
             const int rl = q * 16 + gr, rh = rl + 8;
             const int pl = rl < nrows ? rpos[rl] : -1, ph = rh < nrows ? rpos[rh] : -1;
             #pragma unroll
             for (int f = 0; f < 4; f++) {
                 float res[4] = {oacc[q][f][0], oacc[q][f][1], oacc[q][f][2], oacc[q][f][3]};
-                tq_mma_bf16_m16n8k16(res, a, tq_pack_bf16(v[0][f], v[1][f]), tq_pack_bf16(v[2][f], v[3][f]));
+                const uint32_t b0 = F16 ? (vr[0][f] | (vr[1][f] << 16)) : tq_pack_bf16(v[0][f], v[1][f]);
+                const uint32_t b1 = F16 ? (vr[2][f] | (vr[3][f] << 16)) : tq_pack_bf16(v[2][f], v[3][f]);
+                if constexpr (F16) tq_mma_f16_m16n8k16(res, a, b0, b1); else tq_mma_bf16_m16n8k16(res, a, b0, b1);
                 for (int kk = ca; kk <= ckb; kk++) {
                     const int rel = kk - r0;                      // the thread's keys: r0, r0+1, r0+8, r0+9
-                    float ve = 0.0f;
-                    if (rel == 0 || rel == 1 || rel == 8 || rel == 9)
-                        ve = __half2float(__ushort_as_half(TQ_STGK(kk)[256 + 2 * cb + f]));
-                    const uint32_t vb0 = (rel == 0) ? tq_pack_bf16(ve, v[1][f]) : (rel == 1) ? tq_pack_bf16(v[0][f], ve) : tq_pack_bf16(v[0][f], v[1][f]);
-                    const uint32_t vb1 = (rel == 8) ? tq_pack_bf16(ve, v[3][f]) : (rel == 9) ? tq_pack_bf16(v[2][f], ve) : tq_pack_bf16(v[2][f], v[3][f]);
                     float t[4] = {oacc[q][f][0], oacc[q][f][1], oacc[q][f][2], oacc[q][f][3]};
-                    tq_mma_bf16_m16n8k16(t, a, vb0, vb1);
+                    if constexpr (F16) {
+                        uint32_t ve = 0u;
+                        if (rel == 0 || rel == 1 || rel == 8 || rel == 9) ve = (uint32_t)TQ_STGK(kk)[256 + 2 * cb + f];
+                        const uint32_t vb0 = (rel == 0) ? (ve | (vr[1][f] << 16)) : (rel == 1) ? (vr[0][f] | (ve << 16)) : b0;
+                        const uint32_t vb1 = (rel == 8) ? (ve | (vr[3][f] << 16)) : (rel == 9) ? (vr[2][f] | (ve << 16)) : b1;
+                        const uint32_t sl = (rel == 0) ? ((scv_lo & 0xFFFF0000u) | 0x3C00u) : (rel == 1) ? ((scv_lo & 0xFFFFu) | 0x3C000000u) : scv_lo;
+                        const uint32_t sh = (rel == 8) ? ((scv_hi & 0xFFFF0000u) | 0x3C00u) : (rel == 9) ? ((scv_hi & 0xFFFFu) | 0x3C000000u) : scv_hi;
+                        uint32_t av[4] = {tq_hmul2(pa[0], sl), tq_hmul2(pa[1], sl), tq_hmul2(pa[2], sh), tq_hmul2(pa[3], sh)};
+                        tq_mma_f16_m16n8k16(t, av, vb0, vb1);
+                    } else {
+                        float ve = 0.0f;
+                        if (rel == 0 || rel == 1 || rel == 8 || rel == 9)
+                            ve = __half2float(__ushort_as_half(TQ_STGK(kk)[256 + 2 * cb + f]));
+                        const uint32_t vb0 = (rel == 0) ? tq_pack_bf16(ve, v[1][f]) : (rel == 1) ? tq_pack_bf16(v[0][f], ve) : b0;
+                        const uint32_t vb1 = (rel == 8) ? tq_pack_bf16(ve, v[3][f]) : (rel == 9) ? tq_pack_bf16(v[2][f], ve) : b1;
+                        tq_mma_bf16_m16n8k16(t, a, vb0, vb1);
+                    }
                     if (pl == kk) { res[0] = t[0]; res[1] = t[1]; }
                     if (ph == kk) { res[2] = t[2]; res[3] = t[3]; }
                 }
@@ -24653,7 +24751,7 @@ static __device__ __forceinline__ void tq_gqa_seg_supertile_t4(
 
 // TQ_KV_T4 segment-aware verify attention: k_tq_paged_attn_q4_gqa_seg's geometry, bookkeeping, partial layout and
 // epilogue with tq_gqa_seg_supertile_t4 (trellis stream + exact own keys); the fp16 table in smem.
-template <int QT>
+template <int QT, int F16>
 __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
     float *out, const float *q_proj_base, const uint16_t *q_norm_w,
     const uint8_t *k4_pool, const uint8_t *v8_pool,
@@ -24730,7 +24828,8 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
             int c16 = tid >> 3, tt = (tid >> 1) & 3, rsel = tid & 1;
             int d0 = 16 * c16 + 2 * tt + 8 * rsel;
             int l = 4 * (row & 7) + tt, rr = ((row >> 3) & 1) + 2 * rsel;
-            sm[TQ_SEG_QA + (((row >> 4) * 16 + c16) * 32 + l) * 4 + rr] = tq_pack_bf16(qtmp[d0], qtmp[d0 + 1]);
+            sm[TQ_SEG_QA + (((row >> 4) * 16 + c16) * 32 + l) * 4 + rr] =
+                F16 ? tq_pack_f16(qtmp[d0], qtmp[d0 + 1]) : tq_pack_bf16(qtmp[d0], qtmp[d0 + 1]);
         }
         __syncthreads();
     }
@@ -24746,7 +24845,7 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
     for (int it = it_lo; it < it_hi; it++) {
         int t0d = it << 7;
         int physd = block_table[bt_base + (t0d >> page_log)];
-        tq_gqa_seg_supertile_t4<QT>(oacc, sm, tid, warp, lane, gr, t4, it, t0d, physd, pos_max, page, nrows, nkv, rsc,
+        tq_gqa_seg_supertile_t4<QT, F16>(oacc, sm, tid, warp, lane, gr, t4, it, t0d, physd, pos_max, page, nrows, nkv, rsc,
                                     kcb4, t4p.kside, vcb8, t4p.vside, kv_head, t4tab, t4p.f16s, slot, seg_pos0, seg_pos1);
     }
     // ---- output per row: S_t > 1 -> split partials (the per-column merge's layout); S_t == 1 -> final rows ----
@@ -24879,10 +24978,44 @@ static int paged_gqa_split_S_f16(int N, int pos_max, int qt, int kf16) {
 }
 // The key-split count of the kernel the launcher will pick for this mode (decode: qt = 1; verify: its QT).
 static int g_pg_v4 = 0;                         // TQ_KV_V4, read by qwn_paged_init (the pool's V is int4 like K)
-static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below): its kernels keep the GQA MMA picker
+static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below)
+// TQ_T4_ATTN_F16 (default 0): the trellis pool's decode step and verify wave run k_tq_paged_attn_q4_gqa_seg_t4<QT, 1>
+// (fp16 operands, one kernel for both); 0 = the bf16 per-column decode kernel + the bf16 segment kernel. MEASURED
+// 2026-10-16 (notes/session10-b2.md 11.1): gates pass (spec_paged_check verify == decode, 4K dec8 e2e dKL -0.00001
+// +-0.00004 vs the bf16 kernels) but speed-neutral (32K N=8: 335 vs 333 us per layer) -- the T4 kernels are LSU-bound
+// (table-lookup bank conflicts 3.4 wavefronts/LDS, 3x the FP4 kernel's global load requests), not ALU-bound; this
+// kernel is the vehicle for the table replication / V staging that would change that. Off until then.
+static int paged_attn_t4_f16_enabled(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 0; }
+    return c;
+}
+// resident-block capacity of the T4 fp16 kernel (QT = 1's: decode and verify share one picker, so a column's split
+// count -- and bits -- is the same in both)
+static int paged_attn_t4_cap(void) {
+    static int c = 0;
+    if (c == 0) {
+        int nb = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_tq_paged_attn_q4_gqa_seg_t4<1, 1>, 256, 0) != cudaSuccess || nb < 1) nb = 2;
+        c = nb * paged_sm_count();
+    }
+    return c;
+}
+static int paged_gqa_split_S_cap(int N, int pos_max, int cap) {
+    static int forced = -2;
+    if (forced == -2) { const char *e = getenv("TQ_PAGED_GQA_SPLIT"); forced = (e && *e) ? atoi(e) : -1; }
+    if (g_split_n_override > 0) N = g_split_n_override;
+    int nst = (pos_max + 128) >> 7;
+    int blocks0 = g_qwen.nkv * N;
+    int S = forced >= 1 ? forced : cap / blocks0;
+    if (S > nst / 2) S = nst / 2;
+    if (S > 64) S = 64;
+    return S < 1 ? 1 : S;
+}
 static int paged_attn_split_S(int N, int pos_max, int qt) {
     int st = paged_attn_st_enabled();
-    return (st >= 2 && g_pg_v4 && !g_pg_t4) ? paged_gqa_split_S_f16(N, pos_max, qt, st == 3) : paged_gqa_split_S(N, pos_max);
+    if (g_pg_t4) return paged_attn_t4_f16_enabled() ? paged_gqa_split_S_cap(N, pos_max, paged_attn_t4_cap()) : paged_gqa_split_S(N, pos_max);
+    return (st >= 2 && g_pg_v4) ? paged_gqa_split_S_f16(N, pos_max, qt, st == 3) : paged_gqa_split_S(N, pos_max);
 }
 
 // pick S so nh*N*S ~ 4x SM count, but only when few-client + long-ctx (else S=1 -> single kernel,
@@ -25089,6 +25222,22 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
             if (S > 1) paged_attn_merge(out, q_proj, positions, N, S, st, col_S);
             return cudaGetLastError() == cudaSuccess ? 0 : -1;
         }
+        if (t4 && !use_topk && paged_attn_t4_f16_enabled()) {
+            // TQ_KV_T4 fp16 path (attention third pass on the trellis pool): the decode step as N one-column segments,
+            // the verify wave as its slot sub-segments -- one kernel, so verify == decode bitwise
+            const bool seg = col_S && g_attn_seg_cnt > 0;
+            const int *c0 = seg ? g_attn_seg_c0 : g_iota, *sn = seg ? g_attn_seg_n : g_ones;
+            const int nseg = seg ? g_attn_seg_cnt : N, qt = seg ? g_attn_seg_qt : 1;
+#define TQ_T4F16_LAUNCH(QTV) \
+            tq_launch(g_pdl_small, k_tq_paged_attn_q4_gqa_seg_t4<QTV, 1>, dim3(nkv, nseg, S), dim3(256), 0, st, \
+                out, q_proj, q_norm_w, k4_pool, v8_pool, positions, slot_ids, col_S, c0, sn, \
+                block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S, N, \
+                g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml, t4p)
+            if (qt == 2) TQ_T4F16_LAUNCH(2); else TQ_T4F16_LAUNCH(1);
+#undef TQ_T4F16_LAUNCH
+            if (S > 1) paged_attn_merge(out, q_proj, positions, N, S, st, col_S);
+            return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        }
         if (col_S && g_attn_seg_cnt > 0) {
             // verify wave: one K/V stream per slot sub-segment (k_tq_paged_attn_q4_gqa_seg), rows = (column, q-head);
             // TQ_KV_T4: its twin with the exact-own-key diagonal patch (k_tq_paged_attn_q4_gqa_seg_t4)
@@ -25098,7 +25247,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
                 g_attn_seg_c0, g_attn_seg_n, block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S, N, \
                 g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml)
 #define TQ_SEG_LAUNCH_T4(QTV) \
-            tq_launch(g_pdl_small, k_tq_paged_attn_q4_gqa_seg_t4<QTV>, dim3(nkv, g_attn_seg_cnt, S), dim3(256), 0, st, \
+            tq_launch(g_pdl_small, k_tq_paged_attn_q4_gqa_seg_t4<QTV, 0>, dim3(nkv, g_attn_seg_cnt, S), dim3(256), 0, st, \
                 out, q_proj, q_norm_w, k4_pool, v8_pool, positions, slot_ids, col_S, \
                 g_attn_seg_c0, g_attn_seg_n, block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, S, N, \
                 g_qwen.eps, g_qwen.rope_theta, g_attn_pacc, g_attn_pml, t4p)
