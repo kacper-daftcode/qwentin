@@ -160,7 +160,7 @@ SPEC_MAX_T = 64      # verify wave column cap (qwn_paged_verify)
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, prefill_waves_per_step=2,
                  mixed_prefill=True, prefix_cache=True, park_ram_bytes=0, decode_steps_per_wave=0,
-                 spec=False, spec_k="auto"):
+                 spec=False, spec_k="auto", park_ram_ttl=0.0):
         self.L = lib
         ck(self.L.qwn_init(tqf.encode()), "init")
         self.page = page; self.max_slots = max_slots
@@ -208,6 +208,12 @@ class BatchedEngine:
         self.host_parked = {}       # key -> dict(ids, consumed, buf, nbytes, t)
         self.host_bytes = 0; self.host_key = 0
         self.host_hits = 0; self.host_saves = 0; self.host_save_s = 0.0; self.host_restore_s = 0.0
+        self.host_save_bytes = 0; self.host_restore_bytes = 0
+        # RAM-tier policy: LRU within --park-ram-gb (above), plus an optional age limit (--park-ram-ttl s, 0 = off):
+        # a parked session older than the TTL is dropped at the next admission (its blob freed) -- the follow-up
+        # that never came should not pin RAM for hours. Counters per reason for /health.
+        self.park_ram_ttl = float(park_ram_ttl or 0.0)
+        self.host_evict_lru = 0; self.host_evict_ttl = 0
         # Long-prompt prefill in flight, interleaved with decode steps: at most one at a time,
         # advanced by <= prefill_waves_per_step waves (<= WAVE_MAX columns each) per engine
         # iteration so the active decoders keep stepping (0 = legacy: whole prompt at once).
@@ -293,7 +299,7 @@ class BatchedEngine:
         # make room (LRU) within the RAM budget
         while self.host_parked and self.host_bytes + nbytes > self.park_ram_bytes:
             k = min(self.host_parked, key=lambda k: self.host_parked[k]["t"])
-            self.host_bytes -= self.host_parked.pop(k)["nbytes"]
+            self.host_bytes -= self.host_parked.pop(k)["nbytes"]; self.host_evict_lru += 1
         buf = (ctypes.c_char * nbytes)()
         t0 = time.time()
         rc = self.L.qwn_paged_slot_save(slot, upto, buf, nbytes)
@@ -304,7 +310,7 @@ class BatchedEngine:
         self.host_key += 1
         self.host_parked[self.host_key] = {"ids": p["ids"], "consumed": p["consumed"], "buf": buf,
                                            "nbytes": nbytes, "t": p["t"]}
-        self.host_bytes += nbytes; self.host_saves += 1; self.host_save_s += dt
+        self.host_bytes += nbytes; self.host_saves += 1; self.host_save_s += dt; self.host_save_bytes += nbytes
         print(f"[park] slot {slot} -> host: {p['consumed']} tokens, {nbytes / 2**20:.0f} MiB in {dt:.2f}s "
               f"({nbytes / 2**30 / max(dt, 1e-6):.1f} GB/s); host tier {len(self.host_parked)} sessions, "
               f"{self.host_bytes / 2**30:.1f} GiB", flush=True)
@@ -320,10 +326,17 @@ class BatchedEngine:
             print(f"[park] restore into slot {slot} failed rc={rc} ({h['consumed']} tokens)", flush=True)
             self.L.qwn_paged_reset_slot(slot)
             return False
-        self.host_hits += 1; self.host_restore_s += dt
+        self.host_hits += 1; self.host_restore_s += dt; self.host_restore_bytes += h["nbytes"]
         print(f"[park] host -> slot {slot}: {h['consumed']} tokens, {h['nbytes'] / 2**20:.0f} MiB in {dt:.2f}s "
               f"({h['nbytes'] / 2**30 / max(dt, 1e-6):.1f} GB/s)", flush=True)
         return True
+
+    def _sweep_host_ttl(self):
+        if self.park_ram_ttl <= 0 or not self.host_parked:
+            return
+        now = time.time()
+        for k in [k for k, h in self.host_parked.items() if now - h["t"] > self.park_ram_ttl]:
+            self.host_bytes -= self.host_parked.pop(k)["nbytes"]; self.host_evict_ttl += 1
 
     def _evict_lru(self):
         if not self.parked:
@@ -436,6 +449,7 @@ class BatchedEngine:
         while the prompt prefills at nearly full speed, instead of stalling for the whole prefill
         (17 s @32K, 115 s @128K). Decode-only steps keep qwn_paged_decode_step."""
         pf = self._pick_prefill()
+        self._ensure_decode_blocks()
         slots = list(self.active.keys())
         nd = len(slots)
         if pf["req"].n_prompt - pf["pos"] < 1 or nd >= WAVE_MAX:
@@ -490,7 +504,8 @@ class BatchedEngine:
         # Batch short queued requests (and short prefix-cache continuations) into one <=WAVE_MAX-
         # column ragged wave (1 weight read for all clients); a long (continuation) prefill runs
         # alone, one in flight at a time, advanced between decode steps by _loop.
-        free_blk = self._free_blocks() - self._prefill_reserved()
+        self._sweep_host_ttl()
+        free_blk = self._free_blocks() - self._prefill_reserved() - self._decode_reserved()
         wave = []; cols = 0
         while self.q:
             req = self.q[0]
@@ -519,7 +534,7 @@ class BatchedEngine:
                 if not victims:
                     break
                 self._evict(min(victims, key=lambda s: self.parked[s]["t"]))
-                free_blk = self._free_blocks() - self._prefill_reserved()
+                free_blk = self._free_blocks() - self._prefill_reserved() - self._decode_reserved()
             if need > free_blk:
                 break                                   # pool full even so -> wait (admission control)
             # slot
@@ -571,6 +586,19 @@ class BatchedEngine:
             ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
             self.free_slots.append(slot)
         self._finish(req)
+
+    def _decode_reserved(self):
+        # Every active decoder (and every prefill about to activate) may start a new page on any step or round
+        # (one block each; a round's <= 64 columns never span two new pages). Admission keeps these out of the
+        # pool budget so a decode step cannot find the pool empty (paged_step -62 failed EVERY active request).
+        return len(self.active) + len(self.prefills)
+
+    def _ensure_decode_blocks(self):
+        # Before a step/round: free blocks >= active decoders, evicting GPU-parked sessions (LRU) if needed.
+        need = len(self.active)
+        while self._free_blocks() < need and self._evict_lru():
+            pass
+        return self._free_blocks() >= need
 
     def _step(self):
         slots = list(self.active.keys())
@@ -695,6 +723,9 @@ class BatchedEngine:
                         for pf in list(self.prefills):
                             self._prefill_fail(pf, f"prefill failed: {e}")
                 have = bool(self.active) and not did_decode
+                if have and not self._ensure_decode_blocks():
+                    print(f"[engine] pool exhausted for {len(self.active)} decoders (free {self._free_blocks()}); "
+                          f"stepping anyway", flush=True)
             if have:
                 try:
                     if self.spec and self.spec_on:
@@ -916,6 +947,13 @@ def make_handler(eng, tok, args):
                                  "host_hits": eng.host_hits, "host_saves": eng.host_saves,
                                  "host_save_s": round(eng.host_save_s, 2),
                                  "host_restore_s": round(eng.host_restore_s, 2),
+                                 "host_save_gbs": round(eng.host_save_bytes / max(eng.host_save_s, 1e-9) / 1e9, 1),
+                                 "host_restore_gbs": round(eng.host_restore_bytes / max(eng.host_restore_s, 1e-9) / 1e9, 1),
+                                 "host_evict_lru": eng.host_evict_lru, "host_evict_ttl": eng.host_evict_ttl,
+                                 "park_ram_ttl_s": eng.park_ram_ttl,
+                                 "park_ram_gb": round(eng.park_ram_bytes / 2**30, 1),
+                                 "host_parked_oldest_s": round(time.time() - min(h["t"] for h in eng.host_parked.values()), 1) if eng.host_parked else 0,
+                                 "park_ring": os.environ.get("TQ_PARK_RING", "1"),
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "decoded_tokens": eng.decoded_tokens, "steps": eng.steps,
                                  "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k,
@@ -1098,7 +1136,7 @@ def serve(args):
                         mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
                         park_ram_bytes=int(args.park_ram_gb * 2**30),
                         decode_steps_per_wave=args.decode_steps_per_wave,
-                        spec=args.spec, spec_k=args.spec_k)
+                        spec=args.spec, spec_k=args.spec_k, park_ram_ttl=args.park_ram_ttl)
     fb, tb, pg, mb = eng._stats()
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
           f"{kv_summary(eng.L, tb, pg)}"
@@ -1212,6 +1250,9 @@ def main():
                     help="host-RAM budget for parked sessions evicted from the GPU (KV blocks + DeltaNet "
                          "state, ~26 KiB/token + 155 MiB each; LRU). 0 disables the host tier. Needs the "
                          "qwn_paged_slot_save/restore ABI in the engine library.")
+    ap.add_argument("--park-ram-ttl", type=float, default=0.0,
+                    help="drop host-parked sessions older than this many seconds (checked at every admission; "
+                         "0 = LRU only). /health reports host_evict_lru / host_evict_ttl and the oldest entry's age.")
     ap.add_argument("--embed-host", dest="embed_host", action="store_true", default=True,
                     help="keep the bf16 token-embedding table in pinned host memory (TQ_EMBED_HOST=1): no device "
                          "copy (0.95 GB as E2M3, 1.27 GB as E4M3) and no quantization error; each looked-up row "

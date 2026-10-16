@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
+#include <vector>
 
 #define TQ_MAX_LAYERS 64
 #define TQ_LAYER_LINEAR_ATTENTION 1
@@ -3980,6 +3982,7 @@ k_tq_qwen_rmsnorm_b(float *out, const float *x, const uint16_t *weight, int N, f
 __global__ void __launch_bounds__(1024, 1)
 k_tq_add_rmsnorm_b(float *out, float *resid, const float *a, const float *b,
                                    const uint16_t *weight, int N, float eps) {
+    tq_pdl_enter();
     __shared__ float smem[32];
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -19695,6 +19698,7 @@ static int ensure_wide_prefill_buffers(int N) {
 
 static int wide_quant_input(const float *d_x, int K, int N);
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N);
+static const float *g_exl3_x2 = NULL;          // optional SiLU gate partner of the recorded EXL3 input (set by wide_mlp)
 static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs, int n, int N);
 // Q4(K)+E4M3(V) batched/wide attention (defined in the roadmap-E section below). With
 // {k4,kq4s,v8,vscale}_stride = 0 every column shares ONE cache -> wide-prefill Q4 attention.
@@ -19708,7 +19712,21 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
 // Wide MLP for a chunk of n tokens: post-rmsnorm(resid) -> gate/up (wide, shared B-frag)
 // -> silu*mul -> down (wide) -> layer_out = resid + down. resid and layer_out are [n x H]
 // (token-major); may NOT alias. Returns 0; -1 if mlp weights aren't e2m3-SF (caller falls back).
-static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) {
+// TQ_FUSE_NORM (default 1): the decode/verify steps fuse (a) the residual add after o_proj / out_proj with the
+// post-attention norm, (b) SiLU * up into the down projection's fragment build, (c) the layer's final residual add
+// with the NEXT layer's input norm (the final norm after the last layer). Same expressions, same reduction order ->
+// bitwise identical to the separate kernels (k_tq_add_rmsnorm_b has k_tq_qwen_rmsnorm_b's reduction); -128 launches
+// per step. TQ_FUSE_NORM=0 reverts to the separate kernels.
+static int tq_fuse_norm(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_FUSE_NORM"); c = (e && *e) ? (atoi(e) != 0) : 1; }
+    return c;
+}
+// add_a/add_b (optional): resid = add_a + add_b is computed here, fused with the post norm. next_ln/next_norm
+// (optional): the final residual add also writes next_norm = rmsnorm(layer_out, next_ln).
+static int wide_mlp(tq_layer_t *l, float *resid, float *layer_out, int n,
+                    const float *add_a = NULL, const float *add_b = NULL,
+                    const uint16_t *next_ln = NULL, float *next_norm = NULL) {
     int H = g_qwen.H, I = g_qwen.I;
     int exl3_ok = l->mlp_gate.exl3 && l->mlp_up.exl3 && l->mlp_down.exl3;
     if (!exl3_ok &&
@@ -19716,19 +19734,36 @@ static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) 
           (l->mlp_down.e2m3 || l->mlp_down.e2m1) &&
           can_use_qmma_sf_weight(&l->mlp_gate) && !l->mlp_gate.row_major &&
           can_use_qmma_sf_weight(&l->mlp_down) && !l->mlp_down.row_major)) return -1;
-    tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
-              g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
+    if (add_a) {
+        tq_launch(g_pdl_small, k_tq_add_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
+                  g_wide_pn, resid, add_a, add_b, l->d_post_ln, H, g_qwen.eps);
+    } else {
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
+                  g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
+    }
     int ret = wide_quant_input(g_wide_pn, H, n);
     if (ret != 0) return ret;
     const tq_qmma_weight_t *gu[2] = {&l->mlp_gate, &l->mlp_up};
     float *gu_out[2] = {g_wide_gate, g_wide_up};
     if ((ret = wide_proj_group(gu, gu_out, 2, n)) != 0) return ret;
-    tq_launch(g_pdl_small, k_tq_silu_mul, dim3(((size_t)n * I + 255) / 256), dim3(256), 0, g_qwen.stream,
-              g_wide_mh, g_wide_gate, g_wide_up, (int)((size_t)n * I));
-    if ((ret = wide_quant_input(g_wide_mh, I, n)) != 0) return ret;
+    if (exl3_ok && tq_fuse_norm()) {
+        // the down projection's fragment build applies silu(gate) * up itself
+        if ((ret = wide_quant_input(g_wide_gate, I, n)) != 0) return ret;
+        g_exl3_x2 = g_wide_up;
+    } else {
+        tq_launch(g_pdl_small, k_tq_silu_mul, dim3(((size_t)n * I + 255) / 256), dim3(256), 0, g_qwen.stream,
+                  g_wide_mh, g_wide_gate, g_wide_up, (int)((size_t)n * I));
+        if ((ret = wide_quant_input(g_wide_mh, I, n)) != 0) return ret;
+    }
     if ((ret = wide_proj(&l->mlp_down, g_wide_down, n)) != 0) return ret;
-    tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)n * H + 255) / 256), dim3(256), 0, g_qwen.stream,
-              layer_out, resid, g_wide_down, (int)((size_t)n * H));
+    g_exl3_x2 = NULL;
+    if (next_ln) {
+        tq_launch(g_pdl_small, k_tq_add_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
+                  next_norm, layer_out, resid, g_wide_down, next_ln, H, g_qwen.eps);
+    } else {
+        tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)n * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                  layer_out, resid, g_wide_down, (int)((size_t)n * H));
+    }
     return 0;
 }
 
@@ -19832,7 +19867,7 @@ static __device__ __forceinline__ void tq_had128_warp(float &v0, float &v1, floa
 // Up to three Linears that share x (q/k/v, gate/up, qkv/z) in one launch: blockIdx.y picks the (buffer, suh) pair.
 struct tq_bfrag_set { uint32_t *b0, *b1, *b2; const uint16_t *s0, *s1, *s2; };
 
-__global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const float *x,
+__global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const float *x, const float *x2,
                                                        int K, int N, int Npad, int Kt16, int GP) {
     // the next GEMM may start fetching its weights; x comes from the predecessor and the previous GEMM
     // may still read bfrag, so wait before touching either
@@ -19845,6 +19880,11 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const f
     int n = wg / nblk, bk = wg - n * nblk;
     if (n >= Npad) return;
     float4 v = n < N ? *(const float4 *)(x + (size_t)n * K + bk * 128 + lane * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (x2 && n < N) {           // fused SiLU gate: x = silu(gate) * up, the expression of k_tq_silu_mul (same bits)
+        float4 u = *(const float4 *)(x2 + (size_t)n * K + bk * 128 + lane * 4);
+        v.x = (v.x / (1.0f + expf(-v.x))) * u.x; v.y = (v.y / (1.0f + expf(-v.y))) * u.y;
+        v.z = (v.z / (1.0f + expf(-v.z))) * u.z; v.w = (v.w / (1.0f + expf(-v.w))) * u.w;
+    }
     const uint16_t *sp = suh + bk * 128 + lane * 4;
     float v0 = v.x * tq_fp16_to_float(sp[0]), v1 = v.y * tq_fp16_to_float(sp[1]);
     float v2 = v.z * tq_fp16_to_float(sp[2]), v3 = v.w * tq_fp16_to_float(sp[3]);
@@ -20158,7 +20198,7 @@ static uint8_t *g_wproj_b = NULL; static float *g_wproj_bscale = NULL, *g_wproj_
 static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
 // EXL3: wide_quant_input only records the fp32 input (the transform depends on each Linear's suh);
 // exl3_wide_proj builds the fp16 fragments per projection.
-static const float *g_exl3_x = NULL; static int g_exl3_K = 0, g_exl3_N = 0;
+static const float *g_exl3_x = NULL; static int g_exl3_K = 0, g_exl3_N = 0;   // (g_exl3_x2 declared above)
 static uint32_t *g_exl3_b = NULL; static size_t g_exl3_b_words = 0;
 #define TQ_EXL3_CTR_STRIDE (2 + 8192)          // per slot: work/done/arrival counters, self-resetting
 #define TQ_EXL3_CTR_SLOTS 16
@@ -20343,7 +20383,7 @@ static int exl3_build_frags(const tq_qmma_weight_t *const *ws, int n, int N, siz
     set.s1 = n > 1 ? ws[1]->d_exl3_suh : ws[0]->d_exl3_suh;
     set.s2 = n > 2 ? ws[2]->d_exl3_suh : ws[0]->d_exl3_suh;
     int nwarps = 8 * Gt * (K / 128);
-    tq_launch(g_pdl_on, k_tq_exl3_bfrag, dim3((nwarps + 3) / 4, n), dim3(128), 0, g_qwen.stream, set, g_exl3_x,
+    tq_launch(g_pdl_on, k_tq_exl3_bfrag, dim3((nwarps + 3) / 4, n), dim3(128), 0, g_qwen.stream, set, g_exl3_x, g_exl3_x2,
               K, N, 8 * Gt, Kt16, GP);
     *need_w_out = need_w;
     return 0;
@@ -20403,7 +20443,7 @@ static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs
 // pow2 scale per 128-K block in g_wproj_bscale). Mirrors the bench path exactly.
 static int wide_quant_input(const float *d_x, int K, int N) {
     if (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) {      // fp16 fragments are built per Linear (suh)
-        g_exl3_x = d_x; g_exl3_K = K; g_exl3_N = N;
+        g_exl3_x = d_x; g_exl3_x2 = NULL; g_exl3_K = K; g_exl3_N = N;
         return 0;
     }
     int Kt = (K + 31) / 32, G = wide_ng(N), nblocks = (K + 127) / 128;  // NG groups (pow2); extras zeroed
@@ -23919,9 +23959,11 @@ static int mtp_hook_commit(int m);
 static void vf_free_all(void);                                       // spec verify/commit buffers (below)
 static void mtp_paged_free(void);                                    // paged MTP drafter pool (below)
 
+static void park_ring_free(void);
 static void paged_free_all(void) {
     vf_free_all();
     mtp_paged_free();
+    park_ring_free();
     for (int L = 0; L < TQ_MAX_LAYERS; L++) {
         if (g_pool_k4[L]) { cudaFree(g_pool_k4[L]); g_pool_k4[L] = NULL; }
         if (g_pool_kq4s[L]) { cudaFree(g_pool_kq4s[L]); g_pool_kq4s[L] = NULL; }
@@ -24490,6 +24532,188 @@ extern "C" size_t qwn_paged_token_bytes(void) {
 }
 
 // dir 0 = save (device -> host), 1 = restore (host -> device; the slot must already own the blocks)
+// ===== Parking through a pinned staging ring (B4) =====
+// paged_slot_xfer issued one pageable cudaMemcpyAsync per block-row span (~65K of <= 64 KB for a 128K session) ->
+// 5.5 GB/s out, ~16 GB/s in. Here the spans of a chunk (<= TQ_PARK_CHUNK bytes) are gathered on the device into a
+// staging buffer by one kernel, moved as ONE DMA to/from a pinned ring slot, and copied between the ring slot and the
+// caller's pageable blob by a few host threads -- the host memcpy of chunk k overlaps the DMA of chunk k+1 (save) /
+// k-1 (restore). Same host layout and span order as paged_slot_xfer (blobs are interchangeable). TQ_PARK_RING=0
+// restores the old path. M5 (notes): a concurrent 53 GB/s DMA costs other streams' small copies <= 0.1 ms.
+struct tq_span { const uint8_t *dev; size_t off; size_t bytes; };
+#define TQ_PARK_CHUNK ((size_t)32 << 20)
+#define TQ_PARK_RING 3
+#define TQ_PARK_MAX_SPANS 4096
+#define TQ_PARK_THREADS 8
+static uint8_t *g_park_pin[TQ_PARK_RING] = {0};
+static tq_span *g_park_spans_h[TQ_PARK_RING] = {0}, *g_park_spans_d[TQ_PARK_RING] = {0};
+static uint8_t *g_park_stage[2] = {0};
+static cudaEvent_t g_park_ev[TQ_PARK_RING] = {0};
+static int g_park_ready = 0;
+
+static void park_ring_free(void) {
+    for (int r = 0; r < TQ_PARK_RING; r++) {
+        if (g_park_pin[r]) { cudaFreeHost(g_park_pin[r]); g_park_pin[r] = NULL; }
+        if (g_park_spans_h[r]) { cudaFreeHost(g_park_spans_h[r]); g_park_spans_h[r] = NULL; }
+        if (g_park_spans_d[r]) { cudaFree(g_park_spans_d[r]); g_park_spans_d[r] = NULL; }
+        if (g_park_ev[r]) { cudaEventDestroy(g_park_ev[r]); g_park_ev[r] = NULL; }
+    }
+    for (int i = 0; i < 2; i++) if (g_park_stage[i]) { cudaFree(g_park_stage[i]); g_park_stage[i] = NULL; }
+    g_park_ready = 0;
+}
+static int g_park_ring_mode = -1;                  // -1 = from TQ_PARK_RING (default 1), else qwn_park_ring_set
+static int park_ring_enabled(void) {
+    static int c = -1;
+    if (g_park_ring_mode >= 0) return g_park_ring_mode;
+    if (c < 0) { const char *e = getenv("TQ_PARK_RING"); c = (e && *e) ? (atoi(e) != 0) : 1; }
+    return c;
+}
+// Test ABI: 1 = pinned staging ring, 0 = the per-span pageable path (analysis/park_bench.py A/B).
+extern "C" int qwn_park_ring_set(int on) { g_park_ring_mode = on ? 1 : 0; return 0; }
+static int park_ring_ensure(void) {
+    if (g_park_ready) return 0;
+    for (int r = 0; r < TQ_PARK_RING; r++) {
+        if (cudaHostAlloc((void **)&g_park_pin[r], TQ_PARK_CHUNK, cudaHostAllocDefault) != cudaSuccess) { park_ring_free(); return -1; }
+        if (cudaHostAlloc((void **)&g_park_spans_h[r], TQ_PARK_MAX_SPANS * sizeof(tq_span), cudaHostAllocDefault) != cudaSuccess) { park_ring_free(); return -1; }
+        if (cudaMalloc(&g_park_spans_d[r], TQ_PARK_MAX_SPANS * sizeof(tq_span)) != cudaSuccess) { park_ring_free(); return -2; }
+        if (cudaEventCreateWithFlags(&g_park_ev[r], cudaEventDisableTiming) != cudaSuccess) { park_ring_free(); return -3; }
+    }
+    for (int i = 0; i < 2; i++)
+        if (cudaMalloc(&g_park_stage[i], TQ_PARK_CHUNK) != cudaSuccess) { park_ring_free(); return -2; }
+    g_park_ready = 1;
+    return 0;
+}
+// span blockIdx.x: device rows -> stage + off (gather) / stage + off -> device rows (scatter); 16-B units.
+__global__ void k_tq_park_gather(const tq_span *spans, uint8_t *stage) {
+    const tq_span s = spans[blockIdx.x];
+    const uint4 *src = (const uint4 *)s.dev;
+    uint4 *dst = (uint4 *)(stage + s.off);
+    for (size_t i = threadIdx.x; i < s.bytes >> 4; i += blockDim.x) dst[i] = src[i];
+}
+__global__ void k_tq_park_scatter(const tq_span *spans, const uint8_t *stage) {
+    const tq_span s = spans[blockIdx.x];
+    const uint4 *src = (const uint4 *)(stage + s.off);
+    uint4 *dst = (uint4 *)const_cast<uint8_t *>(s.dev);
+    for (size_t i = threadIdx.x; i < s.bytes >> 4; i += blockDim.x) dst[i] = src[i];
+}
+static void park_memcpy_mt(void *dst, const void *src, size_t bytes) {
+    std::thread th[TQ_PARK_THREADS];
+    size_t per = ((bytes + TQ_PARK_THREADS - 1) / TQ_PARK_THREADS + 4095) & ~(size_t)4095;
+    int nt = 0;
+    for (size_t o = 0; o < bytes; o += per, nt++) {
+        size_t b = bytes - o < per ? bytes - o : per;
+        th[nt] = std::thread(memcpy, (char *)dst + o, (const char *)src + o, b);
+    }
+    for (int i = 0; i < nt; i++) th[i].join();
+}
+// The slot's spans in the host-layout order (device pointer, blob offset, bytes); also the total.
+static size_t park_spans(int slot, int upto_pos, std::vector<tq_span> &sp) {
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv, page = g_pg_page;
+    size_t qe = batched_q4s_elem_bytes();
+    size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+    int *row = h_block_table + (size_t)slot * g_pg_maxblk;
+    int n = upto_pos + 1, nb = (upto_pos >> g_pg_plog) + 1;
+    size_t off = 0;
+    auto add = [&](const void *dev, size_t bytes) { sp.push_back({(const uint8_t *)dev, off, bytes}); off += bytes; };
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
+            for (int lb = 0; lb < nb; lb++) {
+                int phys = row[lb], t0 = lb * page, cnt = n - t0;
+                if (cnt > page) cnt = page;
+                if (cnt <= 0) break;
+                size_t bo = (size_t)phys * page;
+                add(g_pool_k4[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                add((char *)g_pool_kq4s[L] + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+                if (g_pg_v4) {
+                    add(g_pool_v8[L] + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                    add((char *)g_pool_vscale[L] + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+                } else {
+                    add(g_pool_v8[L] + bo * kv_m, (size_t)cnt * kv_m);
+                    add(g_pool_vscale[L] + bo * nkv, (size_t)cnt * nkv * sizeof(float));
+                }
+            }
+        } else if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
+            add(g_pg_recur[L] + (size_t)slot * recur_f, recur_f * sizeof(float));
+            add(g_pg_conv[L] + (size_t)slot * conv_f, conv_f * sizeof(float));
+        }
+    }
+    if (g_mtp_on) {
+        for (int lb = 0; lb < nb; lb++) {
+            int phys = row[lb], t0 = lb * page, cnt = n - t0;
+            if (cnt > page) cnt = page;
+            if (cnt <= 0) break;
+            size_t bo = (size_t)phys * page;
+            add(g_mtp_k4 + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+            add((char *)g_mtp_kq4s + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+            if (g_pg_v4) {
+                add(g_mtp_v8 + bo * (kv_m >> 1), (size_t)cnt * (kv_m >> 1));
+                add((char *)g_mtp_vscale + bo * nkv * 16 * qe, (size_t)cnt * nkv * 16 * qe);
+            } else {
+                add(g_mtp_v8 + bo * kv_m, (size_t)cnt * kv_m);
+                add(g_mtp_vscale + bo * nkv, (size_t)cnt * nkv * sizeof(float));
+            }
+        }
+        add(g_mtp_last_h + (size_t)slot * g_qwen.H, (size_t)g_qwen.H * sizeof(float));
+    }
+    return off;
+}
+// dir 0 = save (device -> host blob), 1 = restore. Every span is a multiple of 16 B at 16-B aligned addresses.
+static int paged_slot_xfer_ring(int slot, int upto_pos, char *host, int dir) {
+    if (park_ring_ensure() != 0) return -8;
+    std::vector<tq_span> sp;
+    sp.reserve(80000);
+    size_t total = park_spans(slot, upto_pos, sp);
+    for (const tq_span &x : sp)
+        if ((x.bytes & 15) || ((uintptr_t)x.dev & 15) || x.bytes > TQ_PARK_CHUNK) return -9;
+    // chunks: [a, b) span ranges of <= TQ_PARK_CHUNK bytes and <= TQ_PARK_MAX_SPANS spans
+    std::vector<int> ca, cb; std::vector<size_t> coff, cbytes;
+    for (size_t i = 0; i < sp.size();) {
+        size_t base = sp[i].off, bytes = 0; size_t j = i;
+        while (j < sp.size() && bytes + sp[j].bytes <= TQ_PARK_CHUNK && (int)(j - i) < TQ_PARK_MAX_SPANS) { bytes += sp[j].bytes; j++; }
+        ca.push_back((int)i); cb.push_back((int)j); coff.push_back(base); cbytes.push_back(bytes);
+        i = j;
+    }
+    int nchunks = (int)ca.size();
+    cudaStream_t st = g_qwen.stream;
+    auto issue = [&](int k) -> int {
+        int r = k % TQ_PARK_RING, sg = k % 2, nsp = cb[k] - ca[k];
+        tq_span *hs = g_park_spans_h[r];
+        for (int i = 0; i < nsp; i++) { hs[i] = sp[ca[k] + i]; hs[i].off -= coff[k]; }
+        if (cudaMemcpyAsync(g_park_spans_d[r], hs, (size_t)nsp * sizeof(tq_span), cudaMemcpyHostToDevice, st) != cudaSuccess) return -4;
+        if (dir == 0) {
+            k_tq_park_gather<<<nsp, 256, 0, st>>>(g_park_spans_d[r], g_park_stage[sg]);
+            if (cudaMemcpyAsync(g_park_pin[r], g_park_stage[sg], cbytes[k], cudaMemcpyDeviceToHost, st) != cudaSuccess) return -4;
+        } else {
+            if (cudaMemcpyAsync(g_park_stage[sg], g_park_pin[r], cbytes[k], cudaMemcpyHostToDevice, st) != cudaSuccess) return -4;
+            k_tq_park_scatter<<<nsp, 256, 0, st>>>(g_park_spans_d[r], g_park_stage[sg]);
+        }
+        return cudaEventRecord(g_park_ev[r], st) == cudaSuccess ? 0 : -4;
+    };
+    int rc = 0;
+    if (dir == 0) {
+        // save: GPU gathers + DMAs chunk k+1/k+2 while the host copies chunk k out of its ring slot
+        for (int k = 0; k < nchunks && k < 2; k++) if ((rc = issue(k)) != 0) return rc;
+        for (int k = 0; k < nchunks; k++) {
+            if (cudaEventSynchronize(g_park_ev[k % TQ_PARK_RING]) != cudaSuccess) return -5;
+            park_memcpy_mt(host + coff[k], g_park_pin[k % TQ_PARK_RING], cbytes[k]);
+            if (k + 2 < nchunks && (rc = issue(k + 2)) != 0) return rc;
+        }
+    } else {
+        // restore: the host fills ring slot k+1 while the GPU moves + scatters chunk k
+        park_memcpy_mt(g_park_pin[0], host + coff[0], cbytes[0]);
+        if ((rc = issue(0)) != 0) return rc;
+        for (int k = 0; k < nchunks; k++) {
+            if (k + 1 < nchunks) {
+                int r = (k + 1) % TQ_PARK_RING;
+                if (k + 1 >= TQ_PARK_RING && cudaEventSynchronize(g_park_ev[r]) != cudaSuccess) return -5;   // slot's DMA done
+                park_memcpy_mt(g_park_pin[r], host + coff[k + 1], cbytes[k + 1]);
+                if ((rc = issue(k + 1)) != 0) return rc;
+            }
+        }
+    }
+    (void)total;
+    return cudaStreamSynchronize(st) == cudaSuccess ? 0 : -5;
+}
+
 static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
     int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv, page = g_pg_page;
     size_t qe = batched_q4s_elem_bytes();
@@ -24497,6 +24721,10 @@ static int paged_slot_xfer(int slot, int upto_pos, char *host, int dir) {
     int *row = h_block_table + (size_t)slot * g_pg_maxblk;
     int n = upto_pos + 1, nb = (upto_pos >> g_pg_plog) + 1;
     if (nb > h_slot_nb[slot]) return -3;                         // slot does not own that many blocks
+    if (park_ring_enabled()) {
+        int rc = paged_slot_xfer_ring(slot, upto_pos, host, dir);
+        if (rc != -8 && rc != -9) return rc;                     // -8/-9: ring unavailable -> the per-span path
+    }
     cudaMemcpyKind kind = dir ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
     char *p = host;
     #define TQ_XFER(dev, bytes) do { \
@@ -24604,13 +24832,17 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
     for (int j = 0; j < N; j++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
             g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
+        const uint16_t *next_ln = (L + 1 < g_qwen.L) ? g_qwen.layers[L + 1].d_input_ln : g_qwen.d_norm;
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
-            tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
-                      g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if (!norm_ready)
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                          g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -64;
             const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
             float *qkv_out[3] = {g_wide_q, g_wide_k, g_wide_v};
@@ -24621,16 +24853,22 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                                      N, dec_maxpos, L, positions, slot_ids_h, 1, g_qwen.stream) != 0) return -67;
             if ((ret = wide_quant_input(g_wide_core, attn_m, N)) != 0) return -68;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, N)) != 0) return -68;
-            tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)N * H + 255) / 256), dim3(256), 0, g_qwen.stream,
-                      g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)N * H));
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -69;
+            if (fuse) {
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N, g_wide_h, g_wide_o, next_ln, g_wide_norm)) != 0) return -69;
+                norm_ready = 1;
+            } else {
+                tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)N * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                          g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)N * H));
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -69;
+            }
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
-            tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
-                      g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if (!norm_ready)
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                          g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -71;
             const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
             float *qz_out[2] = {g_wide_qkv, g_wide_z};
@@ -24644,13 +24882,19 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                 return -75;
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, N)) != 0) return -76;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, N)) != 0) return -76;
-            tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)N * H + 255) / 256), dim3(256), 0, g_qwen.stream,
-                      g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)N * H));
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -77;
+            if (fuse) {
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N, g_wide_h, g_wide_o, next_ln, g_wide_norm)) != 0) return -77;
+                norm_ready = 1;
+            } else {
+                tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)N * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                          g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)N * H));
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -77;
+            }
         }
     }
-    tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
-              g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+    if (!norm_ready)
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                  g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     if (paged_lm_head_wide()) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;
         if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) return -78;
@@ -25250,13 +25494,17 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
     for (int j = 0; j < T; j++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
             g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
+        const uint16_t *next_ln = (L + 1 < g_qwen.L) ? g_qwen.layers[L + 1].d_input_ln : g_qwen.d_norm;
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
-            tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
-                      g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if (!norm_ready)
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                          g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -64;
             const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
             float *qkv_out[3] = {g_wide_q, g_wide_k, g_wide_v};
@@ -25267,16 +25515,22 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
                                      T, vf_maxpos, L, col_pos, col_slot, 1, g_qwen.stream) != 0) return -67;
             if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -68;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -68;
-            tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)T * H + 255) / 256), dim3(256), 0, g_qwen.stream,
-                      g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)T * H));
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -69;
+            if (fuse) {
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T, g_wide_h, g_wide_o, next_ln, g_wide_norm)) != 0) return -69;
+                norm_ready = 1;
+            } else {
+                tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)T * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                          g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)T * H));
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -69;
+            }
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
-            tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
-                      g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if (!norm_ready)
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                          g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -71;
             const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
             float *qz_out[2] = {g_vf_x[L], g_wide_z};                  // pre-conv input kept for the commit
@@ -25291,14 +25545,20 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
                       g_qwen.stream, g_wide_lcore, g_wide_z, l->d_linear_norm, lvh, ld, g_qwen.eps, g_vf_iota, value_dim);
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -76;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -76;
-            tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)T * H + 255) / 256), dim3(256), 0, g_qwen.stream,
-                      g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)T * H));
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -77;
+            if (fuse) {
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T, g_wide_h, g_wide_o, next_ln, g_wide_norm)) != 0) return -77;
+                norm_ready = 1;
+            } else {
+                tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)T * H + 255) / 256), dim3(256), 0, g_qwen.stream,
+                          g_wide_resid, g_wide_h, g_wide_o, (int)((size_t)T * H));
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -77;
+            }
         }
     }
     cudaMemcpyAsync(g_vf_hidden, g_wide_h, (size_t)T * H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-    tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
-              g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+    if (!norm_ready)
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                  g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -78;
     if ((ret = wide_proj(&g_qwen.lm_head, g_vf_logits, T)) != 0) return -78;
     tq_launch(g_pdl_small, k_tq_batched_argmax, dim3(T), dim3(256), 0, g_qwen.stream,
