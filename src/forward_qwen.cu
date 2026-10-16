@@ -22133,8 +22133,10 @@ static __device__ __forceinline__ void tq_t4_tile_coords(const tq_t4_job &jb, in
 // ~3 us) -- the two-kernel version with the traceback in global memory was latency-bound at ~100 us per launch for
 // the small batches of a verify wave / decode step (255 dependent L2 loads per tile). x from the fp16 staging row,
 // unit RMS with the fp16-rounded scale (kv_fakequant), codes + side word straight into the pool rows.
-__global__ void __launch_bounds__(TQ_T4_NT, 2)
-k_t4_encode(const tq_t4_job jb, const float *__restrict__ cb) {
+// The body is shared by the two kernels below: the job by value (kernel parameter; the eager decode / verify /
+// prefill paths) or read from device memory (k_t4_encode_dev: the graph-captured verify wave, whose jobs the host
+// writes before every replay). Same code, same arithmetic -> the same codes.
+static __device__ __forceinline__ void t4_encode_body(const tq_t4_job &jb, const float *__restrict__ cb) {
     constexpr int NT = TQ_T4_NT, NG = NT / 16, NW = NT / 32, SH = TQ_T4_L - 4;
     __shared__ float xs[256];
     __shared__ __align__(16) float ms[2][NG * TQ_T4_MROW];
@@ -22232,6 +22234,10 @@ k_t4_encode(const tq_t4_job jb, const float *__restrict__ cb) {
         *(uint32_t *)side = prefix | ((uint32_t)__half_as_ushort(__float2half(rms)) << 8);
     }
 }
+__global__ void __launch_bounds__(TQ_T4_NT, 2)
+k_t4_encode(const tq_t4_job jb, const float *__restrict__ cb) { t4_encode_body(jb, cb); }
+__global__ void __launch_bounds__(TQ_T4_NT, 2)
+k_t4_encode_dev(const tq_t4_job *__restrict__ jbp, const float *__restrict__ cb) { t4_encode_body(*jbp, cb); }
 
 // T4 = 1 (TQ_KV_T4): rows of complete pages are trellis codes (pr_chunk >= 0), rows of the slot's open
 // page FP4 in the staging arrays (stored as pr_chunk = -1 - staging row).
@@ -25213,7 +25219,8 @@ static float   *g_pg_conv[TQ_MAX_LAYERS] = {0};
 static int     *g_block_table = NULL, *h_block_table = NULL;
 static int     *g_slot_ids = NULL, *g_iota = NULL, *g_ones = NULL;   // g_iota/g_ones: pool-wide 0..max_slots-1 / all-ones
 static int     *g_tok_d = NULL;                                      // device token ids of the step's columns (TQ_GRAPH)
-static int     *h_pin_ctl = NULL;                                    // pinned [3][max_slots]: tokens, slot ids, positions
+static int     *h_pin_ctl = NULL;                                    // pinned [3][g_pin_cols]: tokens, slot ids, positions
+static int      g_pin_cols = 0;
 static int     *g_pf_colslot = NULL; static int g_pf_colslot_cap = 0;  // prefill wave column->slot
 static float   *g_pg_logits = NULL;
 static int     *g_pg_argmax = NULL;
@@ -25553,6 +25560,7 @@ static float   *g_mtp_last_h = NULL;                 // [max_slots][H]
 static int mtp_hook_decode(const int *tokens, const int *slot_ids_h, const int *positions, int N);
 static int mtp_hook_decode_prep(const int *tokens, const int *slot_ids_h, const int *positions, int N);
 static int mtp_hook_decode_kernels(int m, int N);
+static int mtp_draft_body(int N, int K, int max_pos);
 static int mtp_hook_prefill(const int *tokens, const int *col_pos, const int *seg_slot, const int *seg_off,
                             const int *seg_len, int K, int T);
 static int mtp_hook_commit(int m);
@@ -25633,27 +25641,42 @@ static void paged_upload_tables(cudaStream_t st) {
 // A batch of position ranges (staging rows -> pool rows), one launch set for every full-attention layer
 // (only_layer < 0) or one layer, K and V. Asynchronous on g_qwen.stream.
 struct tq_t4_ranges { unsigned src[TQ_T4_MAXR], dst[TQ_T4_MAXR]; int n[TQ_T4_MAXR]; int nr; };
-static int paged_t4_encode_ranges(const tq_t4_ranges &rg, int only_layer, cudaStream_t st = NULL) {
-    if (!st) st = g_qwen.stream;
-    if (!g_pg_t4 || !g_t4_cb) return -1;
-    if (rg.nr <= 0) return 0;
-    tq_t4_job jb;
-    memset(&jb, 0, sizeof(jb));
+// The encode job of `rg` for one full-attention layer (only_layer >= 0) or all of them; returns the tile count (< 0 = error).
+static int paged_t4_build_job(const tq_t4_ranges &rg, int only_layer, tq_t4_job *jb) {
+    memset(jb, 0, sizeof(*jb));
     int nf = 0;
     for (int L = 0; L < g_qwen.L; L++) {
         if (g_qwen.layer_types[L] != TQ_LAYER_FULL_ATTENTION) continue;
         if (only_layer >= 0 && L != only_layer) continue;
         if (nf >= TQ_T4_MAXL) return -3;
-        jb.src[nf] = g_t4_stg_f16[L];
-        jb.dk[nf] = g_pool_k4[L]; jb.dv[nf] = g_pool_v8[L];
-        jb.sk[nf] = g_t4_kside[L]; jb.sv[nf] = g_t4_vside[L];
+        jb->src[nf] = g_t4_stg_f16[L];
+        jb->dk[nf] = g_pool_k4[L]; jb->dv[nf] = g_pool_v8[L];
+        jb->sk[nf] = g_t4_kside[L]; jb->sv[nf] = g_t4_vside[L];
         nf++;
     }
     int tot = 0;
-    for (int r = 0; r < rg.nr; r++) { jb.src_row0[r] = rg.src[r]; jb.dst_row0[r] = rg.dst[r]; jb.pre[r] = tot; tot += rg.n[r]; }
-    jb.pre[rg.nr] = tot;
-    jb.nr = rg.nr; jb.npos = tot; jb.nkv = g_qwen.nkv; jb.nfull = nf;
-    const int ntiles = nf * tot * g_qwen.nkv * 2;
+    for (int r = 0; r < rg.nr; r++) { jb->src_row0[r] = rg.src[r]; jb->dst_row0[r] = rg.dst[r]; jb->pre[r] = tot; tot += rg.n[r]; }
+    jb->pre[rg.nr] = tot;
+    jb->nr = rg.nr; jb->npos = tot; jb->nkv = g_qwen.nkv; jb->nfull = nf;
+    return nf * tot * g_qwen.nkv * 2;
+}
+// TQ_GRAPH verify wave: the wave's per-layer encode jobs are built by the prework into the pinned h_t4_jobs
+// (one per full-attention layer, ordinal order) and uploaded to g_t4_jobs_d before the replay; while
+// g_t4_job_mode is set, paged_t4_encode_wave_layer launches k_t4_encode_dev on them (g_t4_job_tiles tiles).
+static tq_t4_job *h_t4_jobs = NULL, *g_t4_jobs_d = NULL;
+static int g_t4_job_mode = 0, g_t4_job_tiles = 0;
+static int paged_t4_ordinal(int L) {
+    int o = 0;
+    for (int i = 0; i < L; i++) if (g_qwen.layer_types[i] == TQ_LAYER_FULL_ATTENTION) o++;
+    return o;
+}
+static int paged_t4_encode_ranges(const tq_t4_ranges &rg, int only_layer, cudaStream_t st = NULL) {
+    if (!st) st = g_qwen.stream;
+    if (!g_pg_t4 || !g_t4_cb) return -1;
+    if (rg.nr <= 0) return 0;
+    tq_t4_job jb;
+    const int ntiles = paged_t4_build_job(rg, only_layer, &jb);
+    if (ntiles < 0) return ntiles;
     for (int t0 = 0; t0 < ntiles; t0 += TQ_T4_CHUNK) {
         int n = ntiles - t0 < TQ_T4_CHUNK ? ntiles - t0 : TQ_T4_CHUNK;
         jb.tile0 = t0;
@@ -25686,6 +25709,11 @@ static int paged_t4_encode_cols(int slot, int p0, int p1, int only_layer) {
 // into the pool for that layer, so every key the attention reads is trellis (the simulation's semantics).
 static int paged_t4_encode_wave_layer(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos,
                                       int K, int L, cudaStream_t st) {
+    if (g_t4_job_mode) {                                  // graph body: this layer's job was prepared by the prework
+        if (!g_t4_jobs_d || g_t4_job_tiles <= 0) return -5;
+        k_t4_encode_dev<<<g_t4_job_tiles, TQ_T4_NT, 0, st>>>(g_t4_jobs_d + paged_t4_ordinal(L), g_t4_cb);
+        return cudaGetLastError() == cudaSuccess ? 0 : -4;
+    }
     tq_t4_ranges rg; rg.nr = 0;
     for (int k = 0; k < K; k++) {
         int slot = seg_slot[k], first = col_pos[seg_off[k]], last = col_pos[seg_off[k] + seg_len[k] - 1];
@@ -25694,6 +25722,43 @@ static int paged_t4_encode_wave_layer(const int *seg_slot, const int *seg_off, c
         if (rc != 0) return rc;
     }
     return paged_t4_encode_ranges(rg, L, st);
+}
+// Graph prework of a verify wave: the wave's ranges (as paged_t4_encode_wave_layer builds them, without the flush
+// path) -> one job per full-attention layer into h_t4_jobs, uploaded to g_t4_jobs_d on `st`. Returns the tiles per
+// layer launch (0 = nothing to encode), < 0 = not representable (the caller stays eager).
+static int paged_t4_prep_wave_jobs(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos,
+                                   int K, cudaStream_t st) {
+    if (!h_t4_jobs || !g_t4_jobs_d) return -1;
+    tq_t4_ranges rg; rg.nr = 0;
+    for (int k = 0; k < K; k++) {
+        int slot = seg_slot[k], first = col_pos[seg_off[k]], last = col_pos[seg_off[k] + seg_len[k] - 1];
+        int p0 = first < h_slot_encl[slot] ? h_slot_encl[slot] : first, p1 = last + 1;
+        while (p0 < p1) {
+            int lb = p0 >> g_pg_plog, pend = (lb + 1) << g_pg_plog;
+            int n = (p1 < pend ? p1 : pend) - p0;
+            int phys = h_block_table[(size_t)slot * g_pg_maxblk + lb];
+            if (phys < 0) return -2;
+            if (rg.nr == TQ_T4_MAXR) return -3;
+            rg.src[rg.nr] = (unsigned)((size_t)slot * g_pg_page + (p0 & (g_pg_page - 1)));
+            rg.dst[rg.nr] = (unsigned)((size_t)phys * g_pg_page + (p0 & (g_pg_page - 1)));
+            rg.n[rg.nr] = n;
+            rg.nr++;
+            p0 += n;
+        }
+    }
+    if (rg.nr == 0) return 0;
+    int tiles = -1, nf = 0;
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] != TQ_LAYER_FULL_ATTENTION) continue;
+        if (nf >= TQ_T4_MAXL) return -4;
+        int t = paged_t4_build_job(rg, L, &h_t4_jobs[nf++]);
+        if (t < 0) return t;
+        if (tiles >= 0 && t != tiles) return -5;
+        tiles = t;
+    }
+    if (tiles > TQ_T4_CHUNK) return -6;                   // one launch per layer (a wave has <= 64 x nkv x 2 tiles)
+    cudaMemcpyAsync(g_t4_jobs_d, h_t4_jobs, (size_t)nf * sizeof(tq_t4_job), cudaMemcpyHostToDevice, st);
+    return tiles;
 }
 // The wave's columns are committed as written: advance encl (their trellis codes were produced per layer).
 static void paged_t4_wave_done(const int *seg_slot, const int *seg_off, const int *seg_len, const int *col_pos, int K) {
@@ -25767,6 +25832,9 @@ static void paged_t4_free(void) {
     if (g_t4_cb) { cudaFree(g_t4_cb); g_t4_cb = NULL; }
     if (g_t4_tab) { cudaFree(g_t4_tab); g_t4_tab = NULL; }
     if (g_t4_encl_d) { cudaFree(g_t4_encl_d); g_t4_encl_d = NULL; }
+    if (g_t4_jobs_d) { cudaFree(g_t4_jobs_d); g_t4_jobs_d = NULL; }
+    if (h_t4_jobs) { cudaFreeHost(h_t4_jobs); h_t4_jobs = NULL; }
+    g_t4_job_mode = 0; g_t4_job_tiles = 0;
     if (g_t4_stream) { cudaStreamSynchronize(g_t4_stream); cudaStreamDestroy(g_t4_stream); g_t4_stream = NULL; }
     if (g_t4_ev) { cudaEventDestroy(g_t4_ev); g_t4_ev = NULL; }
     if (g_t4_done) { cudaEventDestroy(g_t4_done); g_t4_done = NULL; }
@@ -25822,6 +25890,10 @@ static int paged_t4_alloc(int max_slots, int num_blocks, int page) {
     if (cudaMalloc(&g_t4_cb, 4096 * sizeof(float)) != cudaSuccess || cudaMalloc(&g_t4_tab, 4096 * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&g_t4_encl_d, (size_t)max_slots * sizeof(int)) != cudaSuccess) return -2;
     cudaMemsetAsync(g_t4_encl_d, 0, (size_t)max_slots * sizeof(int), g_qwen.stream);
+    if (cudaMalloc(&g_t4_jobs_d, (size_t)TQ_T4_MAXL * sizeof(tq_t4_job)) != cudaSuccess ||
+        cudaHostAlloc(&h_t4_jobs, (size_t)TQ_T4_MAXL * sizeof(tq_t4_job), cudaHostAllocDefault) != cudaSuccess) {
+        h_t4_jobs = NULL; return -2;
+    }
     { const char *e = getenv("TQ_KV_T4_ASYNC"); g_t4_async = (e && *e) ? (atoi(e) != 0) : 1; }
     int prio_lo = 0, prio_hi = 0;                           // the side stream gets the highest priority: its CTAs
     cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);   // are scheduled ahead of the attention's and are done
@@ -26229,9 +26301,13 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     size_t btn = (size_t)max_slots * g_pg_maxblk;
     if (cudaMalloc(&g_block_table, btn * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_slot_ids, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
-    if (cudaMalloc(&g_tok_d, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
-    if (cudaHostAlloc(&h_pin_ctl, (size_t)3 * max_slots * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
-        h_pin_ctl = NULL; paged_free_all(); return -6;
+    {   // TQ_GRAPH staging: tokens / slot ids / positions of a decode step (N <= max_slots) or a verify wave (T <= 64)
+        int cols = max_slots > 64 ? max_slots : 64;
+        if (cudaMalloc(&g_tok_d, (size_t)cols * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
+        if (cudaHostAlloc(&h_pin_ctl, (size_t)3 * cols * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
+            h_pin_ctl = NULL; paged_free_all(); return -6;
+        }
+        g_pin_cols = cols;
     }
     if (cudaMalloc(&g_iota, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_ones, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
@@ -26934,7 +27010,7 @@ static int run_paged_decode_step_graph(const int *tokens, const int *slot_ids_h,
     if ((ret = paged_decode_prep(slot_ids_h, positions, N, &dec_maxpos)) != 0) return ret;
     cudaStream_t st = g_qwen.stream;
     paged_upload_tables(st);
-    int *pt = h_pin_ctl, *ps = h_pin_ctl + g_pg_maxslots, *pp = h_pin_ctl + 2 * g_pg_maxslots;
+    int *pt = h_pin_ctl, *ps = h_pin_ctl + g_pin_cols, *pp = h_pin_ctl + 2 * g_pin_cols;
     for (int j = 0; j < N; j++) { pt[j] = tokens[j]; ps[j] = slot_ids_h[j]; pp[j] = positions[j]; }
     cudaMemcpyAsync(g_tok_d, pt, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(g_slot_ids, ps, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st);
@@ -27497,13 +27573,15 @@ static int vf_linear_core_seq(tq_layer_t *l, float *core_out, float *recur_base,
     return 0;
 }
 
-static int run_paged_verify_core(const int *tokens, const int *col_slot, const int *col_pos,
-                                 const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T) {
-    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
-    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
-    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
-    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
-    int ret;
+// Host + upload prework of a verify wave: buffers, blocks, the kept host copies, block tables / encoded lengths,
+// the column / segment arrays, the per-column key-split counts and the sub-segment list (g_attn_* for the
+// launcher). graph_mode = 1 (TQ_GRAPH): the caller's arrays go through the pinned staging rows (tokens into
+// g_tok_d), the wave's trellis encode jobs are built and uploaded (g_t4_job_mode), and the attention partials of
+// the wave's S are allocated here, so the captured body allocates nothing. Returns 0, or < 0 (-90/-91 as before;
+// -92 = not representable as a graph (graph_mode only)); *tiles_out = the T4 job tiles per layer launch.
+static int paged_verify_prep(const int *tokens, const int *col_slot, const int *col_pos,
+                             const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T,
+                             int graph_mode, int *vf_maxpos_out, int *tiles_out) {
     if (ensure_wide_prefill_buffers(T) != 0) return -90;
     if (ensure_pf_colslot(T) != 0) return -90;
     if (vf_ensure(T) != 0) return -90;
@@ -27517,12 +27595,26 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
     for (int j = 0; j < T; j++) { h_vf_tok[j] = tokens[j]; h_vf_pos[j] = col_pos[j]; }
     paged_upload_tables(g_qwen.stream);
     if (g_pg_t4) paged_t4_upload_wave_encl(seg_slot, seg_off, seg_len, col_pos, K, g_qwen.stream);
-    cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    *tiles_out = 0;
+    if (graph_mode) {
+        if (!g_tok_d || !h_pin_ctl || T > g_pin_cols) return -92;
+        int *pt = h_pin_ctl, *ps = h_pin_ctl + g_pin_cols, *pp = h_pin_ctl + 2 * g_pin_cols;
+        for (int j = 0; j < T; j++) { pt[j] = tokens[j]; ps[j] = col_slot[j]; pp[j] = col_pos[j]; }
+        cudaMemcpyAsync(g_tok_d, pt, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        cudaMemcpyAsync(g_pf_colslot, ps, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        cudaMemcpyAsync(g_wide_pos, pp, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        if (g_pg_t4) {
+            int tiles = paged_t4_prep_wave_jobs(seg_slot, seg_off, seg_len, col_pos, K, g_qwen.stream);
+            if (tiles <= 0) return -92;                   // nothing to encode / not representable: eager
+            *tiles_out = tiles;
+        }
+    } else {
+        cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    }
     cudaMemcpyAsync(g_vf_seg_d, h_vf_seg_slot, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_vf_seg_d + TQ_VF_MAX_SEG, h_vf_seg_off, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_vf_seg_d + 2 * TQ_VF_MAX_SEG, h_vf_seg_len, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    const int *d_sslot = g_vf_seg_d, *d_soff = g_vf_seg_d + TQ_VF_MAX_SEG, *d_slen = g_vf_seg_d + 2 * TQ_VF_MAX_SEG;
     // each column's GQA key-split count = the one a decode step would pick at ITS position (a wave can span a
     // tile boundary where the context clamp changes S), so the attention bits match the step's column by column
     int vf_qt = 1;
@@ -27554,9 +27646,28 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
         cudaMemcpyAsync(g_vf_segn, h_n, (size_t)cnt * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
         g_attn_seg_c0 = g_vf_segc0; g_attn_seg_n = g_vf_segn; g_attn_seg_cnt = cnt; g_attn_seg_qt = qt;
     }
-    for (int j = 0; j < T; j++)
-        k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
-            g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    if (graph_mode && g_attn_col_S_max > 1 &&          // the launcher's partials, before the capture
+        ensure_attn_partials((size_t)g_qwen.nh * T * g_attn_col_S_max) != 0) return -92;
+    *vf_maxpos_out = vf_maxpos;
+    return 0;
+}
+// The wave's device work (the kernel sequence; graph_body = 1: tokens from g_tok_d in one launch, the trellis
+// encode of the wave's columns from the prepared device jobs -- see paged_verify_prep).
+static int paged_verify_body(const int *tokens, const int *col_slot, const int *col_pos,
+                             const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T,
+                             int vf_maxpos, int graph_body) {
+    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
+    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
+    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
+    int ret;
+    const int *d_sslot = g_vf_seg_d, *d_soff = g_vf_seg_d + TQ_VF_MAX_SEG, *d_slen = g_vf_seg_d + 2 * TQ_VF_MAX_SEG;
+    if (graph_body)
+        k_tq_embed_lookup_nk<<<dim3((H + 255) / 256, T), 256, 0, g_qwen.stream>>>(g_wide_h, g_qwen.d_embed, g_tok_d, H);
+    else
+        for (int j = 0; j < T; j++)
+            k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
+                g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
     const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
     int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
@@ -27634,6 +27745,57 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -80;
 }
+// The eager verify wave (the stream sequence of 9da2d3b).
+static int run_paged_verify_core(const int *tokens, const int *col_slot, const int *col_pos,
+                                 const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T) {
+    int vf_maxpos = 0, tiles = 0;
+    int ret = paged_verify_prep(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T, 0, &vf_maxpos, &tiles);
+    if (ret != 0) return ret;
+    return paged_verify_body(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T, vf_maxpos, 0);
+}
+// TQ_GRAPH: the verify wave as a graph per (K, T, encode tiles, key-split max, sub-segment count / QT, flags).
+// Returns 1 when not covered (the caller runs the eager wave; the prework is idempotent).
+static int run_paged_verify_graph(const int *tokens, const int *col_slot, const int *col_pos,
+                                  const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T) {
+    if (g_graph_disabled || paged_topk_pages() > 0) return 1;
+    if (!(paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
+          g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16)) return 1;
+    int vf_maxpos = 0, tiles = 0;
+    int ret = paged_verify_prep(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T, 1, &vf_maxpos, &tiles);
+    if (ret == -92) return 1;
+    if (ret != 0) return ret;
+    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    unsigned long long key = 2ull;                                   // kind 2 = verify wave
+    key = (key << 8) | (unsigned)K;
+    key = (key << 8) | (unsigned)T;
+    key = (key << 12) | (unsigned)tiles;
+    key = (key << 8) | (unsigned)g_attn_col_S_max;
+    key = (key << 8) | (unsigned)g_attn_seg_cnt;
+    key = (key << 4) | (unsigned)(g_attn_seg_qt & 3) | ((unsigned)(g_exl3_ng_max == 8) << 2) | ((unsigned)(g_split_n_override > 0) << 3);
+    key = (key << 4) | (unsigned)(fuse | (g_pg_t4 << 1) | (g_pg_v4 << 2) | ((g_pg_sink != NULL) << 3));
+    key = (key << 4) | (unsigned)(paged_attn_st_enabled() & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
+    key = (key << 8) | (g_graph_gen & 0xff);
+    cudaGraphExec_t exec = graph_cache_get(key);
+    if (!exec) {
+        int nodes = 0;
+        g_t4_job_mode = g_pg_t4 ? 1 : 0; g_t4_job_tiles = tiles;
+        exec = graph_capture("verify", [&]() {
+            return paged_verify_body(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T, vf_maxpos, 1); }, &nodes);
+        g_t4_job_mode = 0; g_t4_job_tiles = 0;
+        if (!exec) return 1;
+        key = (key & ~0xffull) | (g_graph_gen & 0xff);
+        graph_cache_put(key, exec, nodes);
+        if (tq_graph_debug())
+            fprintf(stderr, "[graph] verify: captured K=%d T=%d tiles=%d Smax=%d segs=%d qt=%d maxpos=%d (%d cached)\n",
+                    K, T, tiles, g_attn_col_S_max, g_attn_seg_cnt, g_attn_seg_qt, vf_maxpos, g_graph_n);
+    }
+    cudaError_t e = cudaGraphLaunch(exec, g_qwen.stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[graph] verify: cudaGraphLaunch failed: %s\n", cudaGetErrorString(e));
+        return -84;
+    }
+    return 0;
+}
 
 // ABI. tokens/col_slot/col_pos: T concatenated columns; seg_slot/seg_off/seg_len: K segments covering
 // them in order (one segment per slot, columns of a segment at consecutive positions). out_argmax[T]
@@ -27670,7 +27832,9 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     g_exl3_ng_max = (ng8 && T > 32) ? 8 : 4;
     g_split_n_override = vf_split_by_slots() ? K : 0;
     g_vf_K = 0;
-    int ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    int ret = 1;
+    if (tq_graph_enabled()) ret = run_paged_verify_graph(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    if (ret == 1) ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
     g_attn_col_S = NULL; g_attn_col_S_max = 0;
     g_attn_seg_c0 = g_attn_seg_n = NULL; g_attn_seg_cnt = 0; g_attn_seg_qt = 0;
     g_split_n_override = 0;
@@ -27991,9 +28155,67 @@ extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, co
     for (int k = 0; k < K; k++) for (int i = 0; i < N; i++) h_mtp_ctl[3 + k][i] = positions[i] + k;
     paged_upload_tables(g_qwen.stream);
     mtp_ctl_upload(3 + K);
-    const int *d_slot = mtp_ctl_row(0);
     int pdl = tq_pdl_enabled();
     g_pdl_on = pdl != 0; g_pdl_small = pdl == 2;
+    int ret = 0;
+    // TQ_GRAPH: the K chained steps as one graph per (N, K, the key-split counts of the K steps: S is monotone in
+    // the position and moves at most once inside K <= 16 consecutive positions -> (S_0, first step with S_0 + 1)).
+    int use_graph = 0;
+    if (tq_graph_enabled() && !g_graph_disabled && paged_topk_pages() == 0 &&
+        paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
+        g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
+        int S0 = paged_attn_split_S(N, max_pos, 1), jump = K, Smax = S0, ok = 1;
+        for (int k = 1; k < K; k++) {
+            int Sk = paged_attn_split_S(N, max_pos + k, 1);
+            if (Sk > Smax) Smax = Sk;
+            if (Sk != S0 && jump == K) jump = k;
+            if (Sk != (k < jump ? S0 : S0 + 1)) ok = 0;
+        }
+        if (ok && (Smax <= 1 || ensure_attn_partials((size_t)g_qwen.nh * N * Smax) == 0)) {
+            unsigned long long key = 3ull;                           // kind 3 = MTP draft
+            key = (key << 8) | (unsigned)N;
+            key = (key << 8) | (unsigned)K;
+            key = (key << 8) | (unsigned)S0;
+            key = (key << 8) | (unsigned)jump;
+            key = (key << 4) | (unsigned)((g_pg_t4) | (g_pg_v4 << 1) | ((g_pg_sink != NULL) << 2));
+            key = (key << 4) | (unsigned)(paged_attn_st_enabled() & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
+            key = (key << 16) | (g_graph_gen & 0xffff);
+            cudaGraphExec_t exec = graph_cache_get(key);
+            if (!exec) {
+                int nodes = 0;
+                exec = graph_capture("draft", [&]() { return mtp_draft_body(N, K, max_pos); }, &nodes);
+                if (exec) {
+                    key = (key & ~0xffffull) | (g_graph_gen & 0xffff);
+                    graph_cache_put(key, exec, nodes);
+                    if (tq_graph_debug())
+                        fprintf(stderr, "[graph] draft: captured N=%d K=%d S0=%d jump=%d maxpos=%d (%d cached)\n", N, K, S0, jump, max_pos, g_graph_n);
+                }
+            }
+            if (exec) {
+                use_graph = 1;
+                if (cudaGraphLaunch(exec, g_qwen.stream) != cudaSuccess) {
+                    fprintf(stderr, "[graph] draft: cudaGraphLaunch failed\n"); ret = -18;
+                }
+            }
+        }
+    }
+    if (!use_graph && ret == 0) ret = mtp_draft_body(N, K, max_pos);
+    g_pdl_on = g_pdl_small = 0;
+    if (ret != 0) { cudaStreamSynchronize(g_qwen.stream); return ret; }
+    int tmp[TQ_MTP_MAX_K * TQ_MTP_CTL_COLS];
+    for (int k = 0; k < K; k++)
+        cudaMemcpyAsync(tmp + k * N, g_mtp_draft_d + (size_t)k * g_pg_maxslots, (size_t)N * sizeof(int),
+                        cudaMemcpyDeviceToHost, g_qwen.stream);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -16;
+    for (int i = 0; i < N; i++) for (int k = 0; k < K; k++) drafts[i * K + k] = tmp[k * N + i];
+    return cudaGetLastError() == cudaSuccess ? 0 : -17;
+}
+// The drafter's K chained MTP steps (device work after the control rows are uploaded; the same sequence eager
+// or captured).
+static int mtp_draft_body(int N, int K, int max_pos) {
+    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
+    tq_layer_t *mt = &g_qwen.mtp_layer;
+    const int *d_slot = mtp_ctl_row(0);
     int ret = 0;
     for (int k = 0; k < K && ret == 0; k++) {
         const int *d_tok = k == 0 ? mtp_ctl_row(1) : g_mtp_draft_d + (size_t)(k - 1) * g_pg_maxslots;
@@ -28021,15 +28243,7 @@ extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, co
         tq_launch(g_pdl_small, k_tq_batched_argmax, dim3(N), dim3(256), 0, g_qwen.stream,
                   g_mtp_draft_d + (size_t)k * g_pg_maxslots, g_pg_logits, g_qwen.V, N);
     }
-    g_pdl_on = g_pdl_small = 0;
-    if (ret != 0) { cudaStreamSynchronize(g_qwen.stream); return ret; }
-    int tmp[TQ_MTP_MAX_K * TQ_MTP_CTL_COLS];
-    for (int k = 0; k < K; k++)
-        cudaMemcpyAsync(tmp + k * N, g_mtp_draft_d + (size_t)k * g_pg_maxslots, (size_t)N * sizeof(int),
-                        cudaMemcpyDeviceToHost, g_qwen.stream);
-    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -16;
-    for (int i = 0; i < N; i++) for (int k = 0; k < K; k++) drafts[i * K + k] = tmp[k * N + i];
-    return cudaGetLastError() == cudaSuccess ? 0 : -17;
+    return ret;
 }
 
 // ============================ Chunked prefill ============================
