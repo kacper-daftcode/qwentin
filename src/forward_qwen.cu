@@ -20051,10 +20051,20 @@ struct tq_exl3_win {
             ib[g] = i2 % NW;
         }
     }
-    // Per-lane direct loads of the group words (2 x 32-bit per group per tile per lane).
+    // Per-lane direct loads of the group words (2 x 32-bit per group per tile per lane). STREAM: evict-first
+    // (decode-size N reads a tile once); wide N re-reads every tile from its token-group units, so it keeps the
+    // normal L2 policy (ld.global.nc) -- ncu had the 128-column kernel at 72-77 % L2 hits, long-scoreboard bound.
+    template <bool STREAM = true>
     __device__ __forceinline__ void load(const uint32_t *tile, uint32_t *r) const {
         #pragma unroll
-        for (int g = 0; g < NGRP; g++) { r[2 * g] = __ldcs(tile + ia[g]); r[2 * g + 1] = __ldcs(tile + ib[g]); }
+        for (int g = 0; g < NGRP; g++) {
+            if (STREAM) { r[2 * g] = __ldcs(tile + ia[g]); r[2 * g + 1] = __ldcs(tile + ib[g]); }
+            else        { r[2 * g] = __ldg(tile + ia[g]);  r[2 * g + 1] = __ldg(tile + ib[g]); }
+        }
+    }
+    // L2 prefetch of a tile some tiles ahead of the register ring (one line per lane group; no registers)
+    __device__ __forceinline__ void prefetch(const uint32_t *tile) const {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(tile + ia[0]));
     }
     __device__ __forceinline__ void frag(const uint32_t *r, uint32_t &a0, uint32_t &a1, uint32_t &a2, uint32_t &a3) const {
         __half w[8];
@@ -20151,6 +20161,21 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const f
 // KB=7 keeps 8 words per lane per tile in the prefetch ring (NCW=2): at 4 blocks/SM (64 registers)
 // it spills, and the local-memory traffic halves its decode bandwidth (750 vs ~1400 GB/s for KB=6);
 // 2 blocks/SM (128 registers) run it spill-free at ~1200 GB/s (3 blocks at 80 registers still spill).
+// Wide units (NG = 8, the 128-column prefill waves). ncu (session 10, B2-eng): tensor pipe 41-47 % active, 3-4 warps per
+// scheduler with 0.5-0.7 eligible, a warp issues every ~10 cycles of which 4 are long-scoreboard (the per-lane weight
+// loads): latency-bound. prefetch.global.L2 of the tile TQ_EXL3_L2PF tiles ahead of the register ring turns the ring's
+// loads into L2 hits (no registers): <5,8> 105 -> 100 us, <6,8> 78 -> 75 (-3.6 % of the wave's GEMM time, bitwise);
+// KB=7 (4 groups, 8 ring words per lane) got slower with it and keeps the plain ring. The normal-L2-policy loads
+// (TQ_EXL3_WIDE_LDG=1, ld.global.nc instead of evict-first) measured +5 % and stay off. Both measured 2026-10-16.
+#ifndef TQ_EXL3_WIDE_LDG
+#define TQ_EXL3_WIDE_LDG 0
+#endif
+#ifndef TQ_EXL3_L2PF
+#define TQ_EXL3_L2PF 6
+#endif
+#ifndef TQ_EXL3_L2PF_KB7
+#define TQ_EXL3_L2PF_KB7 0
+#endif
 template <int KB, int NG>
 __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                                                            const uint16_t *trellis, const uint32_t *bfrag,
@@ -20250,10 +20275,17 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
         };
         // Register ring: pf[d] holds the lane's words of tile kt+d (direct per-lane loads of
         // the two words of each codeword group; L1 absorbs the overlap between lanes).
+        constexpr bool STREAM = !(TQ_EXL3_WIDE_LDG && NG >= 8);
+        constexpr int L2PF = (NG == 8 && (KB != 7 || TQ_EXL3_L2PF_KB7)) ? TQ_EXL3_L2PF : 0;   // NG=16 (lm_head) spills more with it
         uint32_t pf[PF][RW];
         #pragma unroll
         for (int d = 0; d < PF; d++)
-            if (t0 + d < t1) win.load(tr + (size_t)(t0 + d) * kstride, pf[d]);
+            if (t0 + d < t1) win.template load<STREAM>(tr + (size_t)(t0 + d) * kstride, pf[d]);
+        if (L2PF > 0) {
+            #pragma unroll
+            for (int d = PF; d < PF + L2PF; d++)
+                if (t0 + d < t1) win.prefetch(tr + (size_t)(t0 + d) * kstride);
+        }
         if (!waited) { tq_pdl_wait(); waited = true; }
         int kt = t0;
         // main loop: PF tiles in hand and PF more guaranteed ahead -> no per-tile branches
@@ -20263,7 +20295,8 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
                 uint32_t r[RW];
                 #pragma unroll
                 for (int q = 0; q < RW; q++) r[q] = pf[d][q];
-                win.load(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                if (L2PF > 0 && kt + d + PF + L2PF < t1) win.prefetch(tr + (size_t)(kt + d + PF + L2PF) * kstride);
                 uint32_t a0, a1, a2, a3;
                 win.frag(r, a0, a1, a2, a3);
                 tile_mma(a0, a1, a2, a3, kt + d);
@@ -20278,7 +20311,7 @@ __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : 2) k_tq
                 uint32_t r[RW];
                 #pragma unroll
                 for (int q = 0; q < RW; q++) r[q] = pf[d][q];
-                if (kt + d + PF < t1) win.load(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
+                if (kt + d + PF < t1) win.template load<STREAM>(tr + (size_t)(kt + d + PF) * kstride, pf[d]);
                 uint32_t a0, a1, a2, a3;
                 win.frag(r, a0, a1, a2, a3);
                 tile_mma(a0, a1, a2, a3, kt + d);
