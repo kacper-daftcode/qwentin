@@ -4240,6 +4240,8 @@ static void tq_launch(bool pdl, void (*kern)(KArgs...), dim3 grid, dim3 block, s
 // through device buffers uploaded before the replay, so the replayed kernels run with exactly the eager step's
 // parameters (bitwise identical). Every device buffer a captured step may reference is owned by the engine and
 // (re)allocated only in a handful of places; each of them bumps g_graph_gen, which drops every cached graph.
+// TQ_GRAPH=1: the paged decode step as a graph; TQ_GRAPH=2: also the verify wave and the MTP draft (measured: no
+// gain over the eager spec round, and the verify key varies with the wave's column count -> more captures).
 static int tq_graph_enabled(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TQ_GRAPH"); v = (e && *e) ? atoi(e) : 0; if (v < 0) v = 0; }
@@ -27890,7 +27892,7 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     g_split_n_override = vf_split_by_slots() ? K : 0;
     g_vf_K = 0;
     int ret = 1;
-    if (tq_graph_enabled()) ret = run_paged_verify_graph(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    if (tq_graph_enabled() >= 2) ret = run_paged_verify_graph(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
     if (ret == 1) ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
     g_attn_col_S = NULL; g_attn_col_S_max = 0;
     g_attn_seg_c0 = g_attn_seg_n = NULL; g_attn_seg_cnt = 0; g_attn_seg_qt = 0;
@@ -28218,7 +28220,7 @@ extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, co
     // TQ_GRAPH: the K chained steps as one graph per (N, K, the key-split counts of the K steps: S is monotone in
     // the position and moves at most once inside K <= 16 consecutive positions -> (S_0, first step with S_0 + 1)).
     int use_graph = 0;
-    if (tq_graph_enabled() && !g_graph_disabled && paged_topk_pages() == 0 &&
+    if (tq_graph_enabled() >= 2 && !g_graph_disabled && paged_topk_pages() == 0 &&
         paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
         g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
         int S0 = paged_attn_split_S(N, max_pos, 1), jump = K, Smax = S0, ok = 1;
