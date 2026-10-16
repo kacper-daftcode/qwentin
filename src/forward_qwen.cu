@@ -22025,12 +22025,16 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
     float gg = -expf(A_log[head]) * softplus;
     float decay = expf(gg);
     float *state = rstate + (size_t)head * dim * dim;
-    float st[(128 + G - 1) / G];
-    int nkk = 0;
+    // dim == 128 (checked by the launcher): constant-trip loops keep the state slice in registers (the runtime-bound
+    // form put st[] in local memory: STACK 64); same kk order -> same bits.
+    constexpr int NKK = 128 / G;
+    float st[NKK];
     float psum = 0.0f;
-    for (int kk = klane; kk < dim; kk += G) {
+    #pragma unroll
+    for (int j = 0; j < NKK; j++) {
+        int kk = klane + j * G;
         float sval = state[(size_t)kk * dim + tid];
-        st[nkk++] = sval;
+        st[j] = sval;
         psum += sval * kn[kk];
     }
     #pragma unroll
@@ -22038,12 +22042,12 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, float *recurre
     float kv_mem = __shfl_sync(0xffffffffu, psum, 0, G) * decay;
     float delta = (v[tid] - kv_mem) * beta;
     float pcore = 0.0f;
-    nkk = 0;
-    for (int kk = klane; kk < dim; kk += G) {
-        float newv = st[nkk] * decay + kn[kk] * delta;
+    #pragma unroll
+    for (int j = 0; j < NKK; j++) {
+        int kk = klane + j * G;
+        float newv = st[j] * decay + kn[kk] * delta;
         state[(size_t)kk * dim + tid] = newv;
         pcore += newv * qn[kk];
-        nkk++;
     }
     #pragma unroll
     for (int off = G >> 1; off > 0; off >>= 1) pcore += __shfl_down_sync(0xffffffffu, pcore, off, G);
@@ -22060,7 +22064,7 @@ static int paged_linear_core(tq_layer_t *l, float *core_base, float *recur_base,
     int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
     int dim = g_qwen.linear_value_head_dim;
     int lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
-    bool lc_par_ok = lc_g > 0 && dim > 0 && dim <= 128 && (dim & (dim - 1)) == 0 && dim * lc_g <= 1024;
+    bool lc_par_ok = lc_g > 0 && dim == 128 && dim * lc_g <= 1024;      // the paged cores unroll over dim == 128
     bool lc_hs_ok = lc_par_ok && lc_hs >= 2 && (dim % lc_hs) == 0 && lc_g >= lc_hs &&
                     ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) ||
                      (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
@@ -24899,6 +24903,9 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
 // With the split pickers pinned (TQ_QMMA_SF_K_SPLIT, TQ_PAGED_GQA_SPLIT) the column logits are
 // bit-identical to the decode step's (analysis/spec_paged_check.py); unpinned, a column's k-splits
 // follow T instead of N (the same "not batch-invariant" band as decode at different N).
+// Per linear layer: the kept verify inputs and the slot states (device table for the fused commit replay).
+struct tq_vf_lp { float *x; const float *b; const float *a; float *recur; float *conv;
+                  const uint16_t *conv_w; const float *A_log; const uint16_t *dt_bias; };
 #define TQ_VF_MAX_T 64
 #define TQ_VF_MAX_SEG 256
 // TQ_VF_SPLIT_BY_SLOTS=1 (default): the verify's GEMM k-splits and attention key-splits are picked for its slot
@@ -24926,6 +24933,7 @@ static float *g_vf_hidden = NULL;                    // [cap][H] pre-final-norm 
 static int   *g_vf_iota = NULL;                      // 0..cap-1 (gated-norm column ids)
 static int   *g_vf_colS = NULL;                      // [cap] per-column GQA key-split count (= the decode step's at that pos)
 static int   *g_vf_segc0 = NULL, *g_vf_segn = NULL;  // [cap] sub-segments (col0, n) for the segment-aware attention
+static tq_vf_lp *g_vf_lp = NULL; static int g_vf_nlin = 0;   // per-linear-layer pointer table (fused commit replay)
 static int   *g_vf_seg_d = NULL;                     // device: [3][TQ_VF_MAX_SEG] slot/off/len of the verify wave
 static int   *g_vf_cseg_d = NULL;                    // device: [3][TQ_VF_MAX_SEG] slot/off/len of a commit list
 static int    g_vf_K = 0, g_vf_T = 0;                // the pending verify wave (0 = none)
@@ -24947,6 +24955,7 @@ static void vf_free_all(void) {
     if (g_vf_colS) { cudaFree(g_vf_colS); g_vf_colS = NULL; }
     if (g_vf_segc0) { cudaFree(g_vf_segc0); g_vf_segc0 = NULL; }
     if (g_vf_segn) { cudaFree(g_vf_segn); g_vf_segn = NULL; }
+    if (g_vf_lp) { cudaFree(g_vf_lp); g_vf_lp = NULL; } g_vf_nlin = 0;
     if (g_vf_seg_d) { cudaFree(g_vf_seg_d); g_vf_seg_d = NULL; }
     if (g_vf_cseg_d) { cudaFree(g_vf_cseg_d); g_vf_cseg_d = NULL; }
     g_vf_cap = 0; g_vf_K = 0; g_vf_T = 0;
@@ -24979,6 +24988,21 @@ static int vf_ensure(int T) {
     int hi[TQ_VF_MAX_T];
     for (int i = 0; i < cap; i++) hi[i] = i;
     cudaMemcpyAsync(g_vf_iota, hi, (size_t)cap * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    {   // the per-layer pointer table of the fused commit replay
+        tq_vf_lp h_lp[TQ_MAX_LAYERS];
+        int n = 0;
+        for (int L = 0; L < g_qwen.L; L++) {
+            if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+            tq_layer_t *l = &g_qwen.layers[L];
+            h_lp[n].x = g_vf_x[L]; h_lp[n].b = g_vf_b[L]; h_lp[n].a = g_vf_a[L];
+            h_lp[n].recur = g_pg_recur[L]; h_lp[n].conv = g_pg_conv[L];
+            h_lp[n].conv_w = l->d_linear_conv1d; h_lp[n].A_log = l->d_linear_A_log; h_lp[n].dt_bias = l->d_linear_dt_bias;
+            n++;
+        }
+        if (cudaMalloc(&g_vf_lp, (size_t)n * sizeof(tq_vf_lp)) != cudaSuccess) { vf_free_all(); return -3; }
+        cudaMemcpyAsync(g_vf_lp, h_lp, (size_t)n * sizeof(tq_vf_lp), cudaMemcpyHostToDevice, g_qwen.stream);
+        g_vf_nlin = n;
+    }
     cudaStreamSynchronize(g_qwen.stream);
     g_vf_cap = cap;
     return 0;
@@ -24987,14 +25011,11 @@ static int vf_ensure(int T) {
 // Causal conv over the columns of each segment (grid.y), window loaded from the slot's conv state;
 // same shift + append + sum order as k_tq_linear_conv_update_paged per column. write_state=0 leaves
 // the slot state untouched (verify), 1 stores the final window (commit replay).
-__global__ void k_tq_linear_conv_seq_paged(float *out, float *state_base, const float *x,
-                                           const uint16_t *conv_weight, int channels, int kernel_size,
-                                           const int *seg_slot, const int *seg_off, const int *seg_len,
-                                           int state_stride, int write_state) {
-    tq_pdl_enter();
+static __device__ __forceinline__ void tq_linear_conv_seq_body(
+        float *out, float *state_base, const float *x, const uint16_t *conv_weight, int channels, int kernel_size,
+        const int *seg_slot, const int *seg_off, const int *seg_len, int state_stride, int write_state, int seg) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= channels) return;
-    int seg = blockIdx.y;
     int slot = seg_slot[seg], off = seg_off[seg], n = seg_len[seg];
     float *s = state_base + (size_t)slot * state_stride + (size_t)i * kernel_size;
     const uint16_t *wt = conv_weight + (size_t)i * kernel_size;
@@ -25010,22 +25031,36 @@ __global__ void k_tq_linear_conv_seq_paged(float *out, float *state_base, const 
     }
     if (write_state) for (int j = 0; j < kernel_size; j++) s[j] = win[j];
 }
+__global__ void k_tq_linear_conv_seq_paged(float *out, float *state_base, const float *x,
+                                           const uint16_t *conv_weight, int channels, int kernel_size,
+                                           const int *seg_slot, const int *seg_off, const int *seg_len,
+                                           int state_stride, int write_state) {
+    tq_pdl_enter();
+    tq_linear_conv_seq_body(out, state_base, x, conv_weight, channels, kernel_size, seg_slot, seg_off, seg_len,
+                            state_stride, write_state, blockIdx.y);
+}
+// Commit replay of ALL linear layers in one launch (grid.z = layer): the conv runs IN PLACE over the kept pre-conv
+// input (per channel the read of column t precedes the write of column t) and stores the window.
+__global__ void k_tq_linear_conv_seq_paged_all(const tq_vf_lp *lp, int channels, int kernel_size,
+                                               const int *seg_slot, const int *seg_off, const int *seg_len, int state_stride) {
+    tq_pdl_enter();
+    const tq_vf_lp p = lp[blockIdx.z];
+    tq_linear_conv_seq_body(p.x, p.conv, p.x, p.conv_w, channels, kernel_size, seg_slot, seg_off, seg_len,
+                            state_stride, 1, blockIdx.y);
+}
 
 // The per-token DeltaNet recurrence of k_tq_linear_decode_core_hs_paged<G, HS> carried through the
 // columns of a segment (grid.y) with the state slice in registers: same thread layout, same per-column
 // math and reduction order, so the column outputs and the final state equal n sequential launches of
 // the per-token kernel. core_out = NULL skips the core (commit replay); write_state stores the state.
 template <int G, int HS>
-__global__ void k_tq_linear_core_seq_paged(float *core_out, float *recurrent_state,
-                                           const float *qkv_conv, const float *b_proj, const float *a_proj,
-                                           const float *A_log, const uint16_t *dt_bias,
-                                           int value_heads, int key_heads, int dim,
-                                           const int *seg_slot, const int *seg_off, const int *seg_len,
-                                           int recur_stride, int conv_dim, int core_stride, int write_state) {
-    tq_pdl_enter();
+static __device__ __forceinline__ void tq_linear_core_seq_body(
+        float *core_out, float *recurrent_state, const float *qkv_conv, const float *b_proj, const float *a_proj,
+        const float *A_log, const uint16_t *dt_bias, int value_heads, int key_heads, int dim,
+        const int *seg_slot, const int *seg_off, const int *seg_len,
+        int recur_stride, int conv_dim, int core_stride, int write_state, int seg) {
     extern __shared__ float smem[];
     float *qn = smem, *kn = smem + dim, *red = smem + 2 * dim;
-    int seg = blockIdx.y;
     int slot = seg_slot[seg], off = seg_off[seg], n = seg_len[seg];
     float *rstate = recurrent_state + (size_t)slot * recur_stride;
     int blk = blockIdx.x, head = blk / HS, part = blk % HS;
@@ -25035,50 +25070,64 @@ __global__ void k_tq_linear_core_seq_paged(float *core_out, float *recurrent_sta
     int tid = part * tids_per + tid_local;
     int group = value_heads / key_heads, key_head = head / group, key_dim = key_heads * dim;
     float *state = rstate + (size_t)head * dim * dim;
-    float st[(128 + G - 1) / G];
+    constexpr int NKK = 128 / G;                      // dim == 128: constant-trip loops keep st[] in registers
+    float st[NKK];
     int nkk = 0;
-    for (int kk = klane; kk < dim; kk += G) st[nkk++] = state[(size_t)kk * dim + tid];
+    // The segment's inputs are all known up front: the next column's q/k/v/b/a are loaded while this column runs
+    // (software pipelining; the per-column math and reduction order are unchanged -> the state stays bitwise).
+    // bs >= dim for every valid (G, HS) config, so thread t owns q[t]/k[t] (t < dim) and v[tid].
+    float q_c = 0.0f, k_c = 0.0f, v_c = 0.0f, b_c = 0.0f, a_c = 0.0f;
+    {
+        const float *qc = qkv_conv + (size_t)off * conv_dim;
+        if (t < dim) { q_c = qc[key_head * dim + t]; k_c = qc[key_dim + key_head * dim + t]; }
+        v_c = qc[2 * key_dim + head * dim + tid];
+        b_c = b_proj[(size_t)off * value_heads + head]; a_c = a_proj[(size_t)off * value_heads + head];
+    }
+    #pragma unroll
+    for (int j = 0; j < NKK; j++) st[j] = state[(size_t)(klane + j * G) * dim + tid];
+    (void)nkk;
     for (int s = 0; s < n; s++) {
         int col = off + s;
-        const float *qc = qkv_conv + (size_t)col * conv_dim;
-        const float *q = qc + key_head * dim;
-        const float *k = qc + key_dim + key_head * dim;
-        const float *v = qc + 2 * key_dim + head * dim;
-        for (int i = t; i < dim; i += bs) red[i] = q[i] * q[i];
+        float q_n = 0.0f, k_n = 0.0f, v_n = 0.0f, b_n = 0.0f, a_n = 0.0f;
+        if (s + 1 < n) {
+            const float *qc = qkv_conv + (size_t)(col + 1) * conv_dim;
+            if (t < dim) { q_n = qc[key_head * dim + t]; k_n = qc[key_dim + key_head * dim + t]; }
+            v_n = qc[2 * key_dim + head * dim + tid];
+            b_n = b_proj[(size_t)(col + 1) * value_heads + head]; a_n = a_proj[(size_t)(col + 1) * value_heads + head];
+        }
+        if (t < dim) red[t] = q_c * q_c;
         __syncthreads();
         float qsum = tq_block_reduce_sum_sh(red, dim, t);
         __syncthreads();
-        for (int i = t; i < dim; i += bs) red[i] = k[i] * k[i];
+        if (t < dim) red[t] = k_c * k_c;
         __syncthreads();
         float ksum = tq_block_reduce_sum_sh(red, dim, t);
         __syncthreads();
-        for (int i = t; i < dim; i += bs) {
-            qn[i] = q[i] * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
-            kn[i] = k[i] * rsqrtf(ksum + 1.0e-6f);
+        if (t < dim) {
+            qn[t] = q_c * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
+            kn[t] = k_c * rsqrtf(ksum + 1.0e-6f);
         }
         __syncthreads();
-        float beta = 1.0f / (1.0f + expf(-b_proj[(size_t)col * value_heads + head]));
-        float softplus_arg = a_proj[(size_t)col * value_heads + head] + tq_bf16_to_float(dt_bias[head]);
+        float beta = 1.0f / (1.0f + expf(-b_c));
+        float softplus_arg = a_c + tq_bf16_to_float(dt_bias[head]);
         float softplus = log1pf(expf(-fabsf(softplus_arg))) + fmaxf(softplus_arg, 0.0f);
         float gg = -expf(A_log[head]) * softplus;
         float decay = expf(gg);
         float psum = 0.0f;
-        nkk = 0;
-        for (int kk = klane; kk < dim; kk += G) {
-            float sval = st[nkk++];
-            psum += sval * kn[kk];
-        }
+        #pragma unroll
+        for (int j = 0; j < NKK; j++) psum += st[j] * kn[klane + j * G];
         #pragma unroll
         for (int o = G >> 1; o > 0; o >>= 1) psum += __shfl_down_sync(0xffffffffu, psum, o, G);
         float kv_mem = __shfl_sync(0xffffffffu, psum, 0, G) * decay;
-        float delta = (v[tid] - kv_mem) * beta;
+        float delta = (v_c - kv_mem) * beta;
+        q_c = q_n; k_c = k_n; v_c = v_n; b_c = b_n; a_c = a_n;
         float pcore = 0.0f;
-        nkk = 0;
-        for (int kk = klane; kk < dim; kk += G) {
-            float newv = st[nkk] * decay + kn[kk] * delta;
-            st[nkk] = newv;
+        #pragma unroll
+        for (int j = 0; j < NKK; j++) {
+            int kk = klane + j * G;
+            float newv = st[j] * decay + kn[kk] * delta;
+            st[j] = newv;
             pcore += newv * qn[kk];
-            nkk++;
         }
         #pragma unroll
         for (int o = G >> 1; o > 0; o >>= 1) pcore += __shfl_down_sync(0xffffffffu, pcore, o, G);
@@ -25087,9 +25136,30 @@ __global__ void k_tq_linear_core_seq_paged(float *core_out, float *recurrent_sta
         __syncthreads();                                  // qn/kn/red are rebuilt for the next column
     }
     if (write_state) {
-        nkk = 0;
-        for (int kk = klane; kk < dim; kk += G) state[(size_t)kk * dim + tid] = st[nkk++];
+        #pragma unroll
+        for (int j = 0; j < NKK; j++) state[(size_t)(klane + j * G) * dim + tid] = st[j];
     }
+}
+template <int G, int HS>
+__global__ void k_tq_linear_core_seq_paged(float *core_out, float *recurrent_state,
+                                           const float *qkv_conv, const float *b_proj, const float *a_proj,
+                                           const float *A_log, const uint16_t *dt_bias,
+                                           int value_heads, int key_heads, int dim,
+                                           const int *seg_slot, const int *seg_off, const int *seg_len,
+                                           int recur_stride, int conv_dim, int core_stride, int write_state) {
+    tq_pdl_enter();
+    tq_linear_core_seq_body<G, HS>(core_out, recurrent_state, qkv_conv, b_proj, a_proj, A_log, dt_bias, value_heads,
+                                   key_heads, dim, seg_slot, seg_off, seg_len, recur_stride, conv_dim, core_stride,
+                                   write_state, blockIdx.y);
+}
+template <int G, int HS>
+__global__ void k_tq_linear_core_seq_paged_all(const tq_vf_lp *lp, int value_heads, int key_heads, int dim,
+                                               const int *seg_slot, const int *seg_off, const int *seg_len,
+                                               int recur_stride, int conv_dim) {
+    tq_pdl_enter();
+    const tq_vf_lp p = lp[blockIdx.z];
+    tq_linear_core_seq_body<G, HS>(NULL, p.recur, p.x, p.b, p.a, p.A_log, p.dt_bias, value_heads, key_heads, dim,
+                                   seg_slot, seg_off, seg_len, recur_stride, conv_dim, 0, 1, blockIdx.y);
 }
 
 // Launch the sequential core over nseg segments (device seg arrays). core_out NULL = state replay only.
@@ -25099,7 +25169,7 @@ static int vf_linear_core_seq(tq_layer_t *l, float *core_out, float *recur_base,
     int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
     int dim = g_qwen.linear_value_head_dim;
     int lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
-    bool lc_par_ok = lc_g > 0 && dim > 0 && dim <= 128 && (dim & (dim - 1)) == 0 && dim * lc_g <= 1024;
+    bool lc_par_ok = lc_g > 0 && dim == 128 && dim * lc_g <= 1024;      // the paged cores unroll over dim == 128
     bool lc_hs_ok = lc_par_ok && lc_hs >= 2 && (dim % lc_hs) == 0 && lc_g >= lc_hs &&
                     ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) ||
                      (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
@@ -25319,16 +25389,40 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
     const int *d_cslot = g_vf_cseg_d, *d_coff = g_vf_cseg_d + TQ_VF_MAX_SEG, *d_clen = g_vf_cseg_d + 2 * TQ_VF_MAX_SEG;
     int pdl = tq_pdl_enabled();
     g_pdl_small = pdl == 2;
-    for (int L = 0; L < g_qwen.L; L++) {
-        if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
-        tq_layer_t *l = &g_qwen.layers[L];
-        tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged, dim3((conv_dim + 255) / 256, m), dim3(256), 0,
-                  g_qwen.stream, g_wide_conv, g_pg_conv[L], (const float *)g_vf_x[L], l->d_linear_conv1d, conv_dim,
-                  g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f, 1);
-        if (vf_linear_core_seq(l, NULL, g_pg_recur[L], g_wide_conv, g_vf_b[L], g_vf_a[L],
-                               d_cslot, d_coff, d_clen, m, recur_f, conv_dim, value_dim, 1) != 0) {
-            g_pdl_small = 0;
-            return -7;
+    static int fused = -1;
+    if (fused < 0) { const char *e = getenv("TQ_VF_COMMIT_FUSED"); fused = (e && *e) ? (atoi(e) != 0) : 1; }
+    if (fused && g_vf_lp) {
+        // all 48 linear layers in two launches (grid.z = layer): 48 x 8 x 192 blocks fill the GPU instead of 48 x 1.13
+        // waves of a 1536-block launch; the per-thread math (and so the state) is the per-layer kernels' bit for bit
+        int heads = lvh, dim = ld, lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
+        bool ok = lc_g > 0 && dim == 128 && lc_hs >= 2 && lc_g >= lc_hs &&
+                  ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) || (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
+        if (!ok) { g_pdl_small = 0; return -7; }
+        tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged_all, dim3((conv_dim + 255) / 256, m, g_vf_nlin), dim3(256), 0,
+                  g_qwen.stream, (const tq_vf_lp *)g_vf_lp, conv_dim, g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f);
+        size_t shA = (size_t)3 * dim * sizeof(float);
+        dim3 gridA(heads * lc_hs, m, g_vf_nlin), blkA((dim / lc_hs) * lc_g);
+        #define VF_CORE_ALL(GG, HH) \
+            tq_launch(g_pdl_small, k_tq_linear_core_seq_paged_all<GG, HH>, gridA, blkA, shA, g_qwen.stream, \
+                      (const tq_vf_lp *)g_vf_lp, heads, lkh, dim, d_cslot, d_coff, d_clen, recur_f, conv_dim)
+        if (lc_g == 8 && lc_hs == 8) VF_CORE_ALL(8, 8);
+        else if (lc_g == 8 && lc_hs == 4) VF_CORE_ALL(8, 4);
+        else if (lc_g == 8 && lc_hs == 2) VF_CORE_ALL(8, 2);
+        else if (lc_g == 4 && lc_hs == 4) VF_CORE_ALL(4, 4);
+        else VF_CORE_ALL(4, 2);
+        #undef VF_CORE_ALL
+    } else {
+        for (int L = 0; L < g_qwen.L; L++) {
+            if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+            tq_layer_t *l = &g_qwen.layers[L];
+            tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged, dim3((conv_dim + 255) / 256, m), dim3(256), 0,
+                      g_qwen.stream, g_wide_conv, g_pg_conv[L], (const float *)g_vf_x[L], l->d_linear_conv1d, conv_dim,
+                      g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f, 1);
+            if (vf_linear_core_seq(l, NULL, g_pg_recur[L], g_wide_conv, g_vf_b[L], g_vf_a[L],
+                                   d_cslot, d_coff, d_clen, m, recur_f, conv_dim, value_dim, 1) != 0) {
+                g_pdl_small = 0;
+                return -7;
+            }
         }
     }
     g_pdl_small = 0;
