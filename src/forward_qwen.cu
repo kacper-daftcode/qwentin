@@ -26992,6 +26992,7 @@ static cudaGraphExec_t graph_capture(const char *what, Body body, int *nodes_out
         fprintf(stderr, "[graph] %s: cudaStreamBeginCapture failed: %s -- staying eager\n", what, cudaGetErrorString(e));
         g_graph_disabled = 1; return NULL;
     }
+    unsigned gen0 = g_graph_gen;
     int r = body();
     cudaGraph_t graph = NULL;
     cudaError_t e2 = cudaStreamEndCapture(st, &graph);
@@ -27000,6 +27001,16 @@ static cudaGraphExec_t graph_capture(const char *what, Body body, int *nodes_out
         if (graph) cudaGraphDestroy(graph);
         cudaGetLastError();
         g_graph_disabled = 1; return NULL;
+    }
+    if (g_graph_gen != gen0) {
+        // A lazily sized buffer grew (cudaFree + cudaMalloc) inside the capture: nodes recorded before the growth
+        // still name the old allocation. Drop this graph, run the step eagerly (the buffers are now sized), and
+        // capture again on the next call with this key (the generation is part of every key).
+        if (tq_graph_debug())
+            fprintf(stderr, "[graph] %s: a buffer grew inside the capture (gen %u -> %u) -- eager this step, recapture next\n",
+                    what, gen0, g_graph_gen);
+        cudaGraphDestroy(graph);
+        return NULL;
     }
     size_t nn = 0; cudaGraphGetNodes(graph, NULL, &nn);
     if (tq_graph_debug()) {
