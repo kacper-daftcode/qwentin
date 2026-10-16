@@ -27387,7 +27387,19 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
     if (!g_pg_ready) return -1;
     if (!g_qwen.kv_q4) return -2;
     if (K < 1 || T < 1) return -3;
-    if (T > 128) return -6;   // wave cap = the fast activation quantizer's 128-column smem limit
+    // Wave cap: 128 columns = the FP6 path's fast activation quantizer smem limit (the EXL3 path builds its fragments
+    // per Linear and has no such limit). TQ_WAVE_MAX (session 10, prefill thread; <= 256) lifts it for the A/B of
+    // 256-column waves; the trellis pool keeps one in-flight staging page per slot, so it stays at <= page there.
+    static int wave_max = -1;
+    if (wave_max < 0) {
+        const char *e = getenv("TQ_WAVE_MAX");
+        wave_max = (e && *e) ? atoi(e) : 128;
+        if (wave_max < 1) wave_max = 1;
+        if (wave_max > 256) wave_max = 256;
+        if (!(g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) && wave_max > 128) wave_max = 128;
+    }
+    if (T > wave_max) return -6;
+    if (g_pg_t4 && T > g_pg_page) return -6;
     for (int k = 0; k < K; k++) {
         if (seg_slot[k] < 0 || seg_slot[k] >= g_pg_maxslots) return -4;
         if (seg_len[k] < 1) return -5;
