@@ -24842,9 +24842,10 @@ static int paged_gqa_split_S_f16(int N, int pos_max, int qt, int kf16) {
 }
 // The key-split count of the kernel the launcher will pick for this mode (decode: qt = 1; verify: its QT).
 static int g_pg_v4 = 0;                         // TQ_KV_V4, read by qwn_paged_init (the pool's V is int4 like K)
+static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below): its kernels keep the GQA MMA picker
 static int paged_attn_split_S(int N, int pos_max, int qt) {
     int st = paged_attn_st_enabled();
-    return (st >= 2 && g_pg_v4) ? paged_gqa_split_S_f16(N, pos_max, qt, st == 3) : paged_gqa_split_S(N, pos_max);
+    return (st >= 2 && g_pg_v4 && !g_pg_t4) ? paged_gqa_split_S_f16(N, pos_max, qt, st == 3) : paged_gqa_split_S(N, pos_max);
 }
 
 // pick S so nh*N*S ~ 4x SM count, but only when few-client + long-ctx (else S=1 -> single kernel,
@@ -24928,7 +24929,7 @@ static int      g_pg_ready = 0;
 // Prefill waves encode their columns per layer before that layer's attention (every key trellis = the
 // exllamav3 simulation); decode / verify steps attend their own new columns as FP4 and encode them afterwards
 // (decode step) / at qwn_paged_commit (verify). The MTP drafter's KV rows (g_mtp_*) stay FP4.
-static int g_pg_t4 = 0;
+// g_pg_t4: defined above (split picker)
 static uint8_t *g_t4_kside[TQ_MAX_LAYERS] = {0}, *g_t4_vside[TQ_MAX_LAYERS] = {0};
 static uint16_t *g_t4_stg_f16[TQ_MAX_LAYERS] = {0};
 static float   *g_t4_cb = NULL;                       // [4096] fp32 codebook (analysis order)
