@@ -5,7 +5,7 @@ What both servers get from here (flags via add_hardening_args):
   --api-key KEY       when set, every path except /health needs `Authorization: Bearer KEY` (401 otherwise)
   --max-body-bytes N  request bodies above N bytes are refused with 413 before they are read (default 32 MiB)
   --max-tokens-cap N  a request's max_tokens above N is clamped to N; the clamp is reported in the response's
-                      x_qwentin (max_tokens_clamped_from / max_tokens_cap) and finish_reason reads "length" (default 4096)
+                      x_qwentin (max_tokens_clamped_from / max_tokens_cap) and finish_reason reads "length" (default 16384)
   --socket-timeout S  read / write timeout of a client socket: a connection that stops sending its request or stops
                       reading the response is closed after S seconds of blocking (default 600; the servers' --timeout is
                       the admission wait, a different thing)
@@ -21,7 +21,7 @@ import json
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
-DEFAULT_MAX_TOKENS_CAP = 4096
+DEFAULT_MAX_TOKENS_CAP = 16384
 DEFAULT_SOCKET_TIMEOUT_S = 600.0
 OPEN_PATHS = ("/health",)
 

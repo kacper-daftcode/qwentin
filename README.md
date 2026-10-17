@@ -605,7 +605,7 @@ MiB of DeltaNet state each; a 117K-token session restores in well under a second
 (`tools/serve_common.py`, unit-tested without a GPU in `tests/test_serve_common.py`): `--api-key KEY`
 makes every path except `/health` require `Authorization: Bearer KEY` (401 otherwise; `/spec` and
 `/v1/*` included), `--max-body-bytes` (32 MiB) refuses larger bodies with 413 before reading them,
-`--max-tokens-cap` (4096) clamps a request's `max_tokens` and reports the clamp in
+`--max-tokens-cap` (16384) clamps a request's `max_tokens` and reports the clamp in
 `x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (the response's `finish_reason` is then
 `length`), and `--socket-timeout` (600 s) closes client connections that stop sending a request or
 stop reading a stream. Serving on `--host 0.0.0.0` should always come with `--api-key` (and a reverse
@@ -704,7 +704,7 @@ Server arguments (`tools/serve_batched.py --help` has the full text):
 | `--pdl` / `--no-pdl` | on | `TQ_PDL=1` |
 | `--wide-attn-mma` / `--no-wide-attn-mma` | on | tensor-core ragged prefill attention for the waves (`TQ_WIDE_ATTN_MMA`; needs `--page >= 128`); without it the waves use the scalar decode kernel per column (~6× slower prefill) |
 | `--timeout s`, `--model-name`, `--host`, `--port` | 300, qwentin-qwen3.6-27b-batched, 127.0.0.1, 8100 | admission wait when all slots are busy, the `model` name clients send, bind address (loopback by default), port |
-| `--api-key KEY`, `--max-body-bytes N`, `--max-tokens-cap N`, `--socket-timeout s` | unset, 32 MiB, 4096, 600 | request-side hardening, shared with `serve_openai.py` (`tools/serve_common.py`): with a key every path but `/health` needs `Authorization: Bearer KEY` (401 otherwise); bodies above the limit get 413 before being read (411 without `Content-Length`); a request's `max_tokens` above the cap is clamped and the clamp reported as `x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (finish_reason `length`); a client socket that stops sending or stops reading is closed after the timeout |
+| `--api-key KEY`, `--max-body-bytes N`, `--max-tokens-cap N`, `--socket-timeout s` | unset, 32 MiB, 16384, 600 | request-side hardening, shared with `serve_openai.py` (`tools/serve_common.py`): with a key every path but `/health` needs `Authorization: Bearer KEY` (401 otherwise); bodies above the limit get 413 before being read (411 without `Content-Length`); a request's `max_tokens` above the cap is clamped and the clamp reported as `x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (finish_reason `length`); a client socket that stops sending or stops reading is closed after the timeout |
 | `--selftest`, `--bench ...` | — | staggered join/leave correctness vs single-stream; steady-state paged decode bench (`--bench-p` prompt tokens, `--bench-ns` slot counts) — both run with spec off |
 
 <sub>Provenance: `tools/serve_batched.py` at this commit (`--help` is authoritative); the defaults are the ones served on 2026-10-17 with engine `2cf671c` / library md5 `e454a29c3caf` (CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0) and gated in `docs/evidence/cand7-all.log`.</sub>
