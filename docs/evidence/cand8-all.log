@@ -1,0 +1,36 @@
+[cand8-all] start 16:34:00; cand 484bdb825c36 = b2e7a3f TQ_GDN_PREFILL default 1 / --gdn-prefill d; served e454a29c3caf = 92ff977 bench: first reproduce.sh run on
+== gate 1: plab trellis pool N=3/8: new bare == served; new+TQ_GDN_PREFILL=0 == served   16:34:00
+[plab] N=3: new defaults == served: True (max |d| 0); new + TQ_GDN_PREFILL=0 == served: True (max |d| 0)
+[plab] N=8: new defaults == served: True (max |d| 0); new + TQ_GDN_PREFILL=0 == served: True (max |d| 0)
+[gate1] PASS
+== gate 2: spec exactness, bare new defaults, 4K + 32K   16:35:14
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE, pure defaults   16:36:41
+   server up after 10 s, pid 2068084, 29894 MiB
+batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/slot; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED_AT
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=13.332s e2e=13.376s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=13.303s e2e=13.346s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=13.31s e2e=13.374s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=76.936s e2e=76.987s ans='HE-215844-MW' exp=['HE-215844-MW'] 
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=77.048s e2e=77.1s ans='AB-416549-JJ' exp=['AB-416549-JJ'] 
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=77.156s e2e=77.207s ans='ND-297860-GH' exp=['ND-297860-GH'] 
+wall 271.8s, 6 probes
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2594 tokens in 20.6s = 125.8 tok/s (concurrency 1); per-request mean 125.3 tok/s; rounds 762, tokens/round 3.39
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2594 tokens in 43.3s = 59.8 tok/s (concurrency 1); per-request mean 59.4 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 157.2 (min 157.2, max 157.2), aggregate 157.2; 300 tokens in 2.1s; rounds 84 s
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 73.8 (min 66.0, max 85.0), aggregate 587.9; 2400 tokens in 5.1s; rounds 136 st
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1; speed rc 0
+[gate3] PASS
+== ALL PASS -> landing cand-1101 on main   16:44:41
+patches/0079-gdn-prefill-session-11-TQ_GDN_PREFILL-1-hoisted-prep.patch
+patches/0080-gdn-prefill-branch-free-fp16-SR-rounding-interleavab.patch
+patches/0081-gdn-prefill-per-sub-chunk-cp.async-double-buffered-s.patch
+patches/0082-serve_batched-gdn-prefill-no-gdn-prefill-TQ_GDN_PREF.patch
+patches/0083-TQ_GDN_PREFILL-default-1-gdn-prefill-default-on-sess.patch
+[cand8-all] LANDED 16:44:41: build-qwen/libforward_qwen.so = 484bdb825c36 (old .92ff977); main = b2e7a3f TQ_GDN_PREFILL default 1 / --gdn-prefill default on 
+[cand8-all] rollback: cp /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.92ff977 /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && git -C /mnt/nvme/qwen256k/qwentin reset --hard 92ff977
