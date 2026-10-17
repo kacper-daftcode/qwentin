@@ -8,7 +8,7 @@
 # Runner requirements (one machine): an RTX 5090 (or another SM120 card with >= 32 GB), driver >= 610, CUDA 13.1 at
 # /usr/local/cuda-13.1 (or NVCC=... in the runner's env), the pinned Python environment (requirements.txt), and the
 # model files on local disk, exposed to the job through runner-level environment variables:
-#   QWENTIN_TQF        /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf     (README "Convert a model")
+#   QWENTIN_TQF        /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf     (README "Convert")
 #   QWENTIN_MODEL_DIR  /path/to/Qwen3.8-27B                            (tokenizer + chat template)
 #   QWENTIN_CORPUS     /path/to/vllm/vllm                              (optional; the needle / speed prompts' code tree)
 #   QWENTIN_REF_DIR    /path/to/Qwen3.8-27B   and   QWENTIN_E2E_DIR /path/to/runs/e2e   (optional; enables --quality)
