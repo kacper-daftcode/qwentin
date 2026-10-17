@@ -1,0 +1,138 @@
+# Changelog
+
+Releases are git tags; the numbers of a release are pinned at its tag and backed by a log in
+[`docs/evidence/`](docs/evidence/README.md) (every gate log names the engine commit and the library md5 it ran).
+Measurement dates are UTC. "Bitwise" means the lever reproduces the previous kernels' outputs bit for bit
+(`tools/paged_logit_ab.py`, max |d| 0), so it was landed on speed alone; everything else went through the quality
+yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
+
+## [Unreleased]
+
+Nothing yet.
+
+## [v0.10] — 2026-10-17
+
+The 2026-10 served stack: **Qwen3.8-27B on one RTX 5090 (32 GB), 576K pooled context tokens across 12 sessions at FP8
+quality, speculative decoding on every stream**, through the batched OpenAI-compatible server (`tools/serve_batched.py`).
+Engine `b2e7a3f` (`src/forward_qwen.cu`; the DeltaNet prefill kernels on by default, otherwise the kernels of
+`2cf671c`), library `build-qwen/libforward_qwen.so` md5 `484bdb825c36`, served line `--max-slots 12 --num-blocks 4500`
+with no flags, CUDA 13.1, driver 610.57.04, RTX 5090 at 550 W.
+
+### Numbers pinned at this tag
+
+| | value | log |
+|---|---|---|
+| Pooled KV capacity | **576 000 tokens** (4500 × 128-token pages, 12 slots × up to 256K) at **29 894 MiB** | `docs/evidence/cand8-all.log` gate 3 |
+| Needle-in-a-repository | **6/6** at 32K and 128K (3 depths × 3 decoys) | `cand8-all.log` gate 3 |
+| Time to first token, cold | **13.3 s @32K · 77.0 s @128K** (15.9 / 86.6 s before the DeltaNet prefill lever) | `cand8-all.log` gate 3 (`cand7-all.log` for the previous values) |
+| Decode per stream @32K, N = 1 / 4 / 8, spec on | **167 / 109 / 81 tok/s** — the gate runs read 157–169 / 74–81 (run-to-run ±2 %; the accepted draft length depends on the text: 3.4–3.6 tokens per round on the vLLM-repository corpus, 2.7 on this repository's code) | `final-speed.log` (R), `cand7-all.log` gate 3, `cand8-all.log` gate 3 |
+| Decode per stream @32K, spec off | 65 / 56 / 47 tok/s | `final-speed.log` (R) |
+| Decode per stream @128K, N = 1 | **133 tok/s** | `cand7-all.log` gate 3, `final-speed.log` (R) |
+| Decode under a concurrent long prefill (8 sessions, 32K / 96K / 160K) | 40 / 25 / 43 tok/s per client | `final-t5.log` g1 |
+| Quality vs the bf16 original | **KL 0.0022–0.0027, top-1 99.0–99.1 %** (the FP8 checkpoint: 0.0037 / 98.7 %); T1 EvalPlus = the FP8 reference | `final-e2e.log`, `e2e/*.json`, `evalplus/` |
+| 16 GB variant (4.25 bpw, 2 slots) | 51K tokens at 16 006 MiB, 184 tok/s @32K, KL 0.0110 (weights) | `p16-check.log` |
+| 24 GB variant (1 slot) | a full 256K single session at FP8 quality, 161 tok/s @32K, 113 @240K | `b2eng-t14-spec.log` |
+
+Decode and quality were measured on engine `2cf671c` (library `e454a29c3caf`, `cand7-all.log`); `b2e7a3f` changes only
+the prefill waves and reproduces the decode path bit for bit (`cand8-all.log` gate 1), so those rows carry over. The
+same-day stock-vLLM baselines (NVFP4 on one card: 147–179K tokens, 71.5 / 51.4 tok/s, TTFT 3.1 / 25.2 s; FP8 on two
+cards: 493K, 76.8 / 60.3 / 50.4, 4.4 / 24.1 s) are in `docs/evidence/baselines-vllm-20261017.md`.
+
+### Added since the 2026-08 build
+
+- **EXL3 trellis weights** (2026-09-25 → 10-14; `--exl3`, header flag `0x800`). exllamav3 checkpoints copied verbatim
+  into the `.tqf` and dequantized on the fly into fp16 HMMA GEMMs (prefill) and GEMVs (decode): the served opt-5.75
+  recipe (`tools/recipes/qwen3_8-27b-exl3-opt5.75.yaml`: K = 5 on 34 % of the weights, 6 on 55 %, 7 on 10 %, 6-bit head)
+  is ~18.5 GiB at FP8 quality where the FP8 checkpoint itself (27.5 GiB) does not fit the card; the 4.25 bpw t45-s425
+  recipe is the 16 GB model. Decode GEMV: KB = 7 at 2 blocks/SM, k-split picker, programmatic dependent launch
+  (`TQ_PDL`, −0.55…−0.61 ms per step, bitwise), one fragment build per input-sharing group, L2 prefetch (−3.6 % GEMM).
+- **Trellis-coded KV cache** (`--kv-t4`, 2026-10-15/16). Every committed (token, KV head) K and V vector as a
+  12-bit-state bitshift trellis code (4 bits per value) over the Hadamard-rotated head with an fp16 RMS scale: 132 bytes
+  per vector, **16.5 KiB/token** (FP4 K+V 20.0, int4 K + E4M3 V 26.2). Lloyd-trained codebook shipped
+  (`tools/codebooks/lloyd_kv12a.f32`); a fused CUDA Viterbi encoder on a side stream (in-flight columns attended exact
+  from an fp16 staging page); decode inside the attention kernel. Passes the FP8 gate at opt-5.75 where FP4 K+V does
+  not; +39 % pooled tokens over the 10-13 stack (opt-6.25 + FP4 V, 422K).
+- **EXL3 MTP speculative decoding in the batched server** (`--spec`, 2026-10-15; `--mtp-exl3` in the converter, flag
+  `0x1000`). The checkpoint's own MTP layer as 4-bpw EXL3 records (0.25 GB) drafts K tokens per slot
+  (`qwn_paged_mtp_draft`), one ragged verify wave scores all slots' drafts through the decode-step kernels with
+  per-column key splits (`qwn_paged_verify`), the accepted prefix is committed by replaying the DeltaNet recurrence
+  (`qwn_paged_commit`). ~3.4 accepted tokens per round at K = 4; 2.5–2.7× per stream at N = 1, 1.9× at N = 4, 1.7× at
+  N = 8 @32K; outputs bit for bit the plain decode's (`tools/spec_paged_check.py` ALL PASS, `tools/spec_server_ab.py`
+  10/10). `--spec-k auto` = 4 / 3 / 2 by active slots.
+- **DeltaNet recurrent state in fp16 with deterministic stochastic rounding** (`--dstate fp16sr`, `TQ_DSTATE_BF16=4`,
+  2026-10-16/17). 155 → 80 MiB per slot, **+51K pooled tokens per card** (4100 → 4500 blocks, 525K → 576K), −0.38 ms per
+  step at 32K N = 8; neutral on the yardstick at 4K / 32K / 64K where bf16 and fp16 round-to-nearest fail.
+- **Decode step as one CUDA graph with concurrent GEMM groups** (`TQ_GRAPH=1 TQ_GEMM_FORK=1`, 2026-10-16/17). The
+  paged decode step captured per (N, key split, MTP columns, flags) into an LRU of graphs; the 2nd/3rd Linear of an
+  input-sharing group on side streams. −0.35 ms per step at every N and context, bitwise.
+- **fp16 staged trellis attention** (`TQ_T4_ATTN_F16=1`, 2026-10-16/17). One fp16-operand kernel for the decode step and
+  the verify wave over the trellis pool, cp.async-staged V codes: 335 → 277 µs per layer at 32K N = 8, −1.0 ms per step;
+  the opt-in set it leads is +20–28 % at 128K; same quality.
+- **Prefill GEMM units** (2026-10-16/17, bitwise). 128-token EXL3 GEMM units at one block per SM (`TQ_EXL3_WIDE_NG16`),
+  paired codeword decode, a 4-row bf16 kernel for the DeltaNet `in_proj_b/a` (`TQ_EXL3_BF16_R4`): −5.1 % per 32K prefill
+  wave, −2.6 % at 128K; served-line TTFT 32K 17.1 → 16.0 s, 128K 93–98 → 87.4 s (`cand5-all.log`).
+- **Gated-DeltaNet prefill kernels** (`TQ_GDN_PREFILL=1` / `--gdn-prefill`, 2026-10-17, session 11, bitwise). A
+  hoisted prep kernel does the state-independent work once per wave; a register-resident chunk kernel keeps the
+  recurrent state in registers across the 16 sub-chunks with the same FMA chains, contractions and SR seeds as the
+  10-16 kernels. DeltaNet 14.95 → 2.76 ms per 128-column wave (22.8 % → 5.0 % of the wave); the wave 65.7 → 55.0 ms at
+  32K, 116.5 → 106.0 ms at 128K; **served-line TTFT 15.9 → 13.3 s @32K, 86.6 → 77.0 s @128K**; decode unchanged
+  (`cand8-all.log`).
+- **Host-RAM parking of idle sessions** (2026-09-22 → 10-16). Evicted sessions' KV pages + DeltaNet state saved and
+  restored through a pinned staging ring at 37–45 GB/s (`--park-ram-gb`, `--park-ram-ttl`; a 32K session leaves or
+  returns in ~16–19 ms); the slot-level prefix cache continues a returning conversation from its parked state; the
+  pool-exhaustion bug (every active request failing at ~95 % occupancy) fixed.
+- **The batched server itself** (`tools/serve_batched.py`, 2026-09-21 → 10-17): paged KV + continuous batching over 12
+  slots, long-prompt prefill in ≤ 128-column ragged waves that carry the active slots' decode steps, SRPT prefill order,
+  slot-level prefix cache, token streaming, `--decode-steps-per-wave 1` (one speculative round between mixed waves:
+  decoders under a long prefill 13 / 8 / 11 → 43 / 28 / 43 tok/s per client, `final-t5.log`), GQA tensor-core decode
+  attention (`TQ_PAGED_ATTN_ST=3` fp16 kernels for the FP4 / E4M3 pools), FP4 V (`--kv-v4`), the bf16 embedding table
+  in pinned host RAM (`--embed-host`), `[admit]` / `[req]` log lines, `/health` and `/spec`.
+- **Request-side hardening** (2026-10-17, both servers, `tools/serve_common.py`): loopback bind by default, `--api-key`,
+  `--max-body-bytes` (32 MiB), `--max-tokens-cap` (16384), `--socket-timeout` (600 s); unit-tested without a GPU.
+- **Evidence pack and reproduction** (2026-10-17): `docs/evidence/` (the gate logs `cand4` … `cand8-all.log`,
+  `final-*.log`, `p16-check.log`, `b2eng-t14-spec.log`, the scripts that produced them, the vLLM baseline note, the
+  EvalPlus logs, the e2e run files, a cell-by-cell map from each README number to its log line); the quality yardstick
+  made public (`tools/qwentin_e2e.py`, `exl3_diff.py`, `e2e_frontier.py`, `dequant_fp8_to_bf16.py`, `evalplus.sh`,
+  `docs/QUALITY.md`); `bench/reproduce.sh` (build → model check → served line → needle / A-B / speed → results JSON
+  with the environment block, `--quality`, `--dry-run`); the verification tools (`code_needle.py`, `spec_speed.py`,
+  `spec_server_ab.py`, `spec_paged_check.py`, `paged_logit_ab.py`); CI (compile check of the engine TU, ruff, pytest,
+  the dry run) and the disabled nightly 5090 gate; `pyproject.toml` / `requirements.txt` with the measured pins;
+  `docs/TQF_FORMAT.md`; `tools/inspect_tqf.py` PASS / FAIL verdicts and the EXL3-aware payload walk.
+
+### Changed
+
+- Served defaults (`serve_batched.py` + engine): `--kv-v4 --kv-t4 --spec --dstate fp16sr --decode-steps-per-wave 1
+  --gdn-prefill --pdl --embed-host --park-ram-gb 64`; `TQ_PAGED_ATTN_ST=3 TQ_T4_ATTN_F16=1 TQ_GRAPH=1 TQ_GEMM_FORK=1
+  TQ_DSTATE_BF16=4 TQ_GDN_PREFILL=1 TQ_EXL3_WIDE_NG16=1 TQ_EXL3_BF16_R4=1`. Each previous served line is one set of
+  off-switches away, bit for bit (`docs/FLAGS.md`).
+- `tools/convert_qwen_tqf.py`: the production FP6 recipe (`--block-scaled always --block-layout qmma-e2m3
+  --block-scale-policy pow2` + the MTP section) is the default for a HF checkpoint; the old `auto` (which silently fell
+  back to plain FP8 without the MTP head) is behind `--legacy-fp8`; a WARNING whenever the output is neither production
+  format; `--exl3` / `--mtp-exl3` for EXL3 checkpoints.
+- `serve_openai.py`: `--residual-map` (a neutral affine residual-stream map after layer L) replaces `--bark-all-day` /
+  `--ot-*`; the 2026-08 spellings are hidden aliases for one more release. The server binds `127.0.0.1` by default (was
+  `0.0.0.0`). `tools/residual_map_check.py` (was `ot_hook_check.py`) is the generic kernel-vs-numpy parity check.
+- README: a release page (pitch, one table, the reproduction); the narrative, architecture, flags, variants and the
+  FP6 path moved intact to `docs/NOTES.md`, `docs/ARCHITECTURE.md`, `docs/FLAGS.md`, `docs/VARIANTS.md`,
+  `docs/legacy-fp6.md`.
+
+### Moved out of this repository
+
+- `tools/bark_autotune.py`, the LLobotomy demo and the scale sweep of the steering hook (to the LLobotomy repositories).
+
+### Not re-measured
+
+- The FP6 single-stream path (`serve_openai.py`, FP6 E2M3 + int4/E4M3 KV + MTP tree, Reservoir Dogs) still runs, but
+  its numbers are the 2026-08 ones (CUDA 13.3, driver 595) — `docs/legacy-fp6.md`. Quest page top-k
+  (`TQ_PAGED_TOPK_PAGES`) is built, measured to fail the FP8 gate below ~75 % of the pages, and kept off.
+
+## 2026-08 build (untagged; the README of 2026-08-18, commit `95952dd`)
+
+FP6 E2M3 block-scaled weights (`mma.sync ...kind::mxf8f6f4.block_scale`), int4-K / E4M3-V KV cache, the single-stream
+server with the MTP covering tree, Reservoir Dogs and `--bark-all-day`; a 256K single session on one 32 GB card
+(FP6 quality: KL 0.0139 / top-1 97.4 % on the 2026-10 yardstick), 142 tok/s @32K cold / 212 on prefix-cached turns,
+2 059 prompt tok/s, needle 4/4 @239K; the batched server of that build held 196K pooled tokens (FP6). Kept as
+`docs/legacy-fp6.md`.
+
+[Unreleased]: https://github.com/kacper-daftcode/qwentin/compare/v0.10...HEAD
+[v0.10]: https://github.com/kacper-daftcode/qwentin/releases/tag/v0.10
