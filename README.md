@@ -432,7 +432,9 @@ keep watching the drafter through it all: if an aggressive scale hurts accept-le
   cmake at the toolkit's `nvcc` (below); a build configured against a different runtime than its
   headers reads 1 SM and silently never splits the decode attention.
 - Python 3.10+ (measured with 3.14) with `torch`, `transformers`, `numpy`, `safetensors`,
-  `tokenizers`; the HTTP verification tools also need `httpx`.
+  `tokenizers`; the HTTP verification tools also need `httpx`. The measured versions are pinned in
+  `requirements.txt` / `pyproject.toml` (`pip install -r requirements.txt`; torch 2.14.0 from the
+  cu130 wheel index, transformers 5.17.0, safetensors 0.8.0, numpy 2.5.3).
 - For the EXL3 path: stock upstream [exllamav3](https://github.com/turboderp-org/exllamav3)
   (commit `02aef45` or newer: it carries `convert.py -rcp` and the `sc_measure.py` /
   `sc_optimize.py` sensitivity pipeline) to quantize the checkpoint, and the **original bf16**

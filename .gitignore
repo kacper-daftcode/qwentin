@@ -6,6 +6,8 @@ build-*/
 *.log
 !docs/evidence/**/*.log
 __pycache__/
+*.egg-info/
+.pytest_cache/
 
 bench/calib/
 bench/calib_v2/

@@ -1,0 +1,16 @@
+# Runtime dependencies of tools/*.py -- mirrors [project.dependencies] in pyproject.toml (the versions every
+# 2026-10-17 number was measured with; Python >= 3.10, measured with 3.14.4).
+#
+# torch must be the CUDA 13.0 build (torch==2.14.0+cu130): the extra index below provides it; PyPI's default
+# 2.14.0 wheel is a different CUDA build and will not match the 13.1 toolkit the engine is built with.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.0
+transformers==5.17.0
+safetensors==0.8.0
+numpy==2.5.3
+httpx==0.28.1
+tokenizers==0.23.2
+
+# Optional (docs/QUALITY.md): pip install -e /path/to/exllamav3 (upstream 02aef45 or newer), evalplus, lm-eval,
+# pyyaml==6.0.3 for the tools/recipes/*.yaml bitrate recipes (read by exllamav3's convert.py -rcp).
+# Dev: ruff==0.17.1 pytest==9.1.1  (pip install -e '.[dev]')
