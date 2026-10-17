@@ -49,8 +49,9 @@ Earlier libraries that appear in the logs (all on `main`, each the gated predece
 | the vLLM columns: FP8 does not fit one 5090 (OOM after 27.48 GiB), NVFP4 147–179K tokens / 71.5 / 51.4 tok/s / TTFT 3.1 / 25.2 s, FP8 TP2 493K / 76.8 / 60.3 / 50.4 / 4.4 / 24.1 s, needle 6/6 | `baselines-vllm-20261017.md` — the summary table (a), the exact `docker run` / `vllm serve` commands, image digest `nightly-49cb2bbf71cfd36ee5aa33d1e184b1cddff55294` = vLLM `0.32.0rc1.dev281+g49cb2bbf7`, the NVFP4 checkpoint's provenance (llm-compressor 0.14.0, recipe, the fused-global-scale repair), the caveats (c) | measured 2026-10-17 on the same cards; the per-run vLLM logs (`logs/baseline-*.log`) and JSON results (`runs/baseline/*.json`) stay in the research repo (listed at the end of the note) |
 
 Not in this pack (no 2026-10 gate log exists for them): the legacy FP6 single-stream table (2026-08 build, CUDA 13.3 /
-driver 595), the RTX PRO 6000 rows, the `--bark-all-day` scale sweep (2026-08-16) and the 2026-06 batched-server
-rows — they are carried over from the 2026-08 README unchanged and are labelled as such in their footers.
+driver 595), the RTX PRO 6000 rows and the 2026-06 batched-server rows — they are carried over from the 2026-08 README
+unchanged and are labelled as such in their footers. (The 2026-08 scale sweep of the residual-stream steering hook
+moved out of this repository together with the steering maps it was measured for.)
 
 ## Reading the logs
 

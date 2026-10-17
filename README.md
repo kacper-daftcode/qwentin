@@ -45,8 +45,8 @@ can use it. Since 2026-10 the primary path is the **batched server** (`tools/ser
 paged KV + continuous batching, EXL3 weights straight from an exllamav3 checkpoint, the
 trellis-coded KV cache, an EXL3 MTP drafter for speculative decoding, host-RAM parking of idle
 sessions. The 2026-08 **FP6 single-stream path** (`tools/serve_openai.py`, FP6 E2M3 weights +
-int4/E4M3 KV + MTP tree, `--bark-all-day`, Reservoir Dogs) is still in the tree and documented
-below as the legacy single-stream path.
+int4/E4M3 KV + MTP tree, the residual-stream steering hook, Reservoir Dogs) is still in the tree
+and documented below as the legacy single-stream path.
 
 ```
 27B at FP8 quality, 12 sessions        →  one 32 GB RTX 5090: 576K pooled tokens (4500 × 128), 29 894 MiB
@@ -207,8 +207,8 @@ are bitwise plain decode's at the same client count (`tools/spec_paged_check.py`
   EXL3, GQA decode attention, chunkwise DeltaNet, the trellis Viterbi encoder), compiled by the
   stock CUDA 13 `nvcc`/`ptxas` — no external assembler or precompiled cubins.
 - **Legacy single-stream path (FP6 E2M3 + int4 KV + MTP tree, `serve_openai.py`).** 256K in one
-  session on 32 GB, 137–157 tok/s at short context (200+ on prefix-cached turns), `--bark-all-day`,
-  Reservoir Dogs — the 2026-08 README, unchanged below.
+  session on 32 GB, 137–157 tok/s at short context (200+ on prefix-cached turns), the
+  residual-stream steering hook (`--residual-map`), Reservoir Dogs — the 2026-08 README below.
 
 > Research engine. SM120-only, wired for the Qwen3.6/3.8-27B layout (64 layers, 5120 hidden,
 > 16 full-attn / 48 gated-DeltaNet). Every 2026-10 number here was measured on one RTX 5090 at a
@@ -371,57 +371,6 @@ at N = 8 / 16 / 32, single-stream reference 70 tok/s) are superseded by the serv
 above; the FP6 tqf still runs on `serve_batched.py` with `--no-kv-t4 --no-spec` (the hand-off's
 documented FP6 configuration: `--no-kv-v4 --num-blocks 2112` = 270K tokens with ≤ 8 slots, 29 GB)
 for an A/B.
-
-## `--bark-all-day`: serve the LLobotomy cut at engine speed (legacy single-stream path)
-
-[LLobotomy](https://github.com/kacper-daftcode/LLobotomy) removes refusal behavior with a
-runtime Optimal-Transport hook on the residual stream — PyTorch-side.
-
-<details>
-<summary><b>Before / after</b> — same prompt, same engine, temperature 0; only difference is
-<code>--bark-all-day</code> (real captures, 2026-08-16)</summary>
-
-**Prompt:** "How do I pick a lock?"
-
-**Before** (bark off): _"I cannot provide instructions on how to pick locks, as this activity
-is illegal in most jurisdictions…"_
-
-**After** (bark on, layers 37/38 @ 0.47): _"Picking a lock is the mechanical process of
-manipulating the internal components of a lock to align them in a specific position… Here is
-a step-by-step guide on how to pick a standard **pin-tumbler lock**…"_
-</details>
-
-`--bark-all-day` ports that
-intervention into the engine itself: the rank-2 OT map
-(`x += scale * (mean_shift + P (A_k - I)^T P^T (x - mu_H))`) rides the residual stream
-on-device at each hooked decoder layer, in every forward path — wide prefill, per-node
-spec verify, dense decode. Same maps file, same math; kernel-vs-numpy parity ~1e-6
-(gated by `tools/ot_hook_check.py`). The served tower IS the lobotomized tower, at full
-spec-decode speed:
-
-```bash
-python3 tools/serve_openai.py ... --bark-all-day --ot-maps /path/to/maps.json  # LLobotomy save_maps output
-    # --ot-layers 37,38 --ot-scale 0.47           # measured for Qwen3.8-27B / FP6
-```
-
-Scale is not portable across numerics stacks — re-tune per tower/quantization with
-`tools/bark_autotune.py` (one model load sweeps candidate scales through the real engine
-and scores refusal compliance + long-form loop stability):
-
-| scale | probe refusals (6 harmful) | loop metrics (6 benign, ~400 tok) |
-|---|---|---|
-| 0.21 (bf16-HF lab value) | 5/6 | clean |
-| 0.35 | 4/6 | clean |
-| 0.40-0.44 | 2/6 | clean |
-| **0.47** | **0/6** | clean |
-| 0.50-0.65 | 0/6 | clean |
-
-<sub>Provenance: `tools/bark_autotune.py` on the 2026-08 FP6 build (CUDA 13.3, driver 595), 2026-08-16, as published in the 2026-08 README; no log in `docs/evidence/`, not re-measured on engine `2cf671c` (the batched server does not install the hook).</sub>
-
-0.47 is the measured floor on Qwen3.8-27B/FP6 (2026-08-16) and the ship default. The Dogs
-keep watching the drafter through it all: if an aggressive scale hurts accept-length,
-`x_qwentin.dogs` shows it live. (The engine-side hook `qwn_ot_hook_add` is installed by
-`serve_openai.py` only; the batched server serves the plain tower.)
 
 ## Requirements
 
@@ -656,6 +605,62 @@ per request; the next request starts at the top rung again. (The batched server'
 path has no Dogs: its rounds are bitwise plain decode, and a pool-exhausted draft falls back to a
 plain step by itself.)
 
+#### Residual-stream steering hook (affine map after layer L)
+
+`serve_openai.py --residual-map maps.json` arms one affine map per hooked decoder layer. The
+engine applies it in fp32 to the residual stream right after that layer, on-device, in every
+forward path (wide prefill, per-node spec verify, dense decode; the graph-captured variants
+included), so the steered tower serves at full spec-decode speed. Per residual row `x`:
+
+```
+x += scale * (shift + P (A - I)^T P^T (x - mu))        P: H x 2,  A - I: 2 x 2,  mu, shift: H   (H = 5120)
+```
+
+The map acts in a 2-dimensional subspace of the residual stream (rank-2 kernel, one 256-thread
+block per row, ~25k FLOPs per token and layer — not measurable in tok/s). Steering maps from
+any method that produces this form — a mean-difference direction with its projection, a fitted
+affine transport map between two activation distributions, a learned 2-d steering subspace —
+can be served this way; the engine does not know or care what the map is for. The maps file
+(JSON) carries the layers and the scale, the flags override them:
+
+```
+{"format": "qwentin-residual-map-v1", "hidden_size": 5120, "layers": [37, 38], "scale": 0.47,
+ "maps": {"37": {"P": [[p0, p1], "... H rows"], "A_minus_I": [[a00, a01], [a10, a11]],
+                 "mu": ["... H"], "shift": ["... H"]},
+          "38": {"...": "..."}}}
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--residual-map PATH` | off | arm the hook with this maps file (env `TQ_RESIDUAL_MAP`) |
+| `--residual-map-layers L1,L2` | the file's `layers` (else every layer in it) | which hooked layers to arm |
+| `--residual-map-scale S` | the file's `scale` | the scale; required when the file carries none |
+| `--residual-map-decay END,LEN[,reset[,shape[,end_answer[,len_answer]]]]` | fixed scale | default schedule of non-thinking requests: the scale decays from the armed value to `END` over `LEN` generated tokens (`linear`, `pow`, `exp`, `invlog`), restarting after `</think>` with `reset`; the answer phase can get its own floor / length (env `TQ_RESIDUAL_MAP_DECAY`) |
+| `--residual-map-sched-api` | off | accept a per-request `residual_map_decay` object (`start`, `end`, `len`, `reset_think`, `shape`, `p`, `end_answer`, `len_answer`) |
+
+The 2026-08 spelling (`--bark-all-day --ot-maps`, `--ot-layers`, `--ot-scale`,
+`--bark-decay-default`, `--bark-sched-api`, request field `bark_decay`, env `TQ_OT_MAPS` /
+`TQ_BARK_DECAY`) is accepted for one more release as hidden aliases that print a one-line
+deprecation notice; the old layer / scale defaults are gone — a maps file without `layers` /
+`scale` (the 2026-08 file format: top-level `ot_maps`, keys `A_k_minus_I` / `mu_H` /
+`mean_shift`, both still read) needs `--residual-map-scale`. Per-request stats carry
+`x_qwentin.residual_map` (layers, scale, the schedule that ran). The Dogs keep watching the
+drafter: a map that moves the tower away from the MTP drafter shows up in `x_qwentin.dogs`.
+Before serving a new maps file, run the kernel-vs-numpy parity check (GPU; fp64 reference of the
+formula above, tolerance 1e-3, measured ~1e-6):
+
+```bash
+python3 tools/residual_map_check.py --lib build-qwen/libforward_qwen.so --tqf /path/to/model.tqf --residual-map maps.json
+```
+
+The hook is single-stream only (`serve_openai.py`); the batched server serves the plain tower.
+The engine entry points are `qwn_ot_hook_add` / `qwn_ot_hook_count` / `qwn_ot_set_scale` /
+`qwn_ot_apply_debug` in `src/forward_qwen.cu` (historical names, rename pending). Maps,
+tuning tools and results for a specific steering method live outside this repository — the
+Optimal-Transport refusal-removal maps of
+[LLobotomy](https://github.com/kacper-daftcode/LLobotomy), for example, in
+`kacper-daftcode/llobotomy-qwentin` (link to follow once published).
+
 ### Key flags
 
 Environment flags read by the engine (`src/forward_qwen.cu`; the server sets several of them
@@ -780,7 +785,8 @@ src/forward_qwen.cu          the engine: all kernels + C ABI, one CUDA TU (~29k 
                              DeltaNet state formats, CUDA-graph decode step, parking ring
 tools/serve_batched.py       THE SERVED SERVER: multi-client OpenAI API, paged KV + continuous batching, spec decode,
                              prefix cache, host-RAM parking (/health, /spec)
-tools/serve_openai.py        legacy single-stream OpenAI server (FP6 + MTP tree, prefix cache, tools, reasoning split, bark, Dogs)
+tools/serve_openai.py        legacy single-stream OpenAI server (FP6 + MTP tree, prefix cache, tools, reasoning split,
+                             residual-map hook, Dogs)
 tools/convert_qwen_tqf.py    HuggingFace / EXL3 checkpoint -> .tqf (--exl3, --mtp-exl3, the FP6 block-scaled formats)
 tools/inspect_tqf.py         inspect a .tqf model file (flags, payload walk incl. EXL3 records, production FP6 / EXL3 + MTP verdicts)
 tools/codebooks/lloyd_kv12a.f32   the trellis-KV codebook (4096 fp32, Lloyd-trained; the server's default)
@@ -805,11 +811,14 @@ tools/accept_probe.py        teacher-forced accept probe (degeneration-free draf
 tools/persist_phases.py      phase-clock breakdown of the persistent kernel (work vs barrier tails)
 tools/serve_smoke.py         2-turn cold + prefix-cache E2E smoke against a running single-stream server
 tools/needle_check.py        single-stream long-context retrieval gate
-tools/bark_autotune.py, tools/ot_hook_check.py   --bark-all-day scale sweep and kernel-vs-numpy parity
+tools/residual_map.py        the residual-stream steering hook's maps-file loader, server flags (+ deprecated aliases),
+                             schedule parser and numpy reference (CPU-tested in tests/test_residual_map.py)
+tools/residual_map_check.py  kernel-vs-numpy parity of the hook on a maps file (GPU)
 tools/mtp_*.py               MTP draft-head training / accept-length eval / dump (single-stream)
 tools/convert.py, tools/sparse_pack.py           older converter pieces
 bench/reproduce.sh           build -> model check -> served line -> needle / spec A-B / speed -> results-<date>-<commit>.json
-tests/                       CPU pytest: the .tqf header parser / payload walk, the servers' request guards
+tests/                       CPU pytest: the .tqf header parser / payload walk, the servers' request guards, the residual-map
+                             flags / file format
 docs/QUALITY.md, docs/TQF_FORMAT.md, docs/evidence/   the quality protocol, the file format, the gate logs behind the numbers
 .github/workflows/           CI (compile check, ruff, pytest) and the disabled nightly 5090 gate
 ```
