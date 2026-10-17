@@ -28,7 +28,7 @@ v3 additions (default-off; behavior identical to the v2 trainer unless set):
   CKPT_PREFIX      checkpoint dir prefix (default: OUT + "_ckpt")
 """
 from __future__ import annotations
-import glob, json, math, os, sys
+import glob, json, math, os
 import numpy as np
 import torch
 import torch.nn as nn

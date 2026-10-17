@@ -15,7 +15,6 @@ Run (GPU7, prod Q4 config):
 """
 from __future__ import annotations
 import argparse, ctypes, os, subprocess
-import numpy as np
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIGTEXT = os.path.join(HERE, "src", "forward_qwen.cu")

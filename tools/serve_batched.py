@@ -259,8 +259,8 @@ class BatchedEngine:
             if rc == -3:
                 # --spec is the default since 10-16: a tqf without the EXL3 MTP section (an older ...-mtp.tqf) runs
                 # plain decode instead of refusing to start (convert_qwen_tqf.py --mtp-exl3 makes the -mtp4.tqf).
-                self.spec_off_reason = (f"the tqf has no EXL3 MTP section (qwn_paged_mtp_init -> -3); use the --mtp-exl3 "
-                                        f"tqf (...-mtp4.tqf) for speculative decoding")
+                self.spec_off_reason = ("the tqf has no EXL3 MTP section (qwn_paged_mtp_init -> -3); use the --mtp-exl3 "
+                                        "tqf (...-mtp4.tqf) for speculative decoding")
                 print(f"[spec] WARNING: speculative decoding OFF: {self.spec_off_reason}", flush=True)
                 self.spec = self.spec_on = False
             elif rc != 0:

@@ -43,7 +43,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
-import sys
 import time
 
 import numpy as np
@@ -314,7 +313,7 @@ def main():
         print(f"    {d:>5} {'t+'+str(d+1):>9} {np_top1[d-1]:>7.2f}% {np_top8[d-1]:>7.2f}% "
               f"{np_cumul[d-1]:>11.2f}%", flush=True)
     print(f"    => idealized mean accept-length (1 + sum cumul top-8) = {ideal_accept:.3f}", flush=True)
-    print(f"    (plan model targets: top-8 ~95.6/85.3/76.2/68.6 -> E[committed] ~1.96/2.77/3.39/3.82)",
+    print("    (plan model targets: top-8 ~95.6/85.3/76.2/68.6 -> E[committed] ~1.96/2.77/3.39/3.82)",
           flush=True)
 
     def cfg_tag(tau, b):
@@ -344,7 +343,7 @@ def main():
     best = 1.0 + float(np.mean(accept[best_cf][D]))
     cov1_best = float(np.mean(np.array(accept[best_cf][D]) >= 1) * 100)
     print(f"  HEADLINE (D={D}): best tree [{cfg_tag(*best_cf)}] mean accept-length = {best:.3f}", flush=True)
-    print(f"           (committed tokens/round incl. the main-model free token)", flush=True)
+    print("           (committed tokens/round incl. the main-model free token)", flush=True)
     print(f"           idealized (full top-8 covering, teacher-forced) = {ideal_accept:.3f}", flush=True)
     print(f"           depth-1 coverage: tree={cov1_best:.1f}%  teacher-forced top-8={np_top8[0]:.1f}%",
           flush=True)

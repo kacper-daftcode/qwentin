@@ -19,7 +19,6 @@ Run (GPU7 ONLY):
 """
 from __future__ import annotations
 import argparse, ctypes, os, subprocess, time
-import numpy as np
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIGTEXT = os.path.join(HERE, "src", "forward_qwen.cu")
@@ -121,7 +120,6 @@ def main():
             print("\n" + "=" * 72, flush=True)
             print(f"  VRAM PROBE: clients that allocate @ ctx={args.vram_probe} (KV mode={kv_mode})", flush=True)
             print("=" * 72, flush=True)
-            usable = 31.36  # GiB, RTX 5090 usable (per live doc)
             for N in range(1, args.probe_nmax + 1):
                 rc = L.qwn_batched_init(N, args.vram_probe)
                 if rc != 0:
@@ -184,7 +182,7 @@ def main():
         t_single = (time.time() - t0) / M
         single_tps = 1.0 / t_single
         print("\n" + "=" * 72, flush=True)
-        print(f"  THROUGHPUT: batched aggregate tok/s vs N-sequential single-stream", flush=True)
+        print("  THROUGHPUT: batched aggregate tok/s vs N-sequential single-stream", flush=True)
         print(f"  (single-stream decode = {1000*t_single:.3f} ms/tok = {single_tps:.1f} tok/s)", flush=True)
         print("=" * 72, flush=True)
         print(f"  {'N':>4} {'ms/step':>9} {'agg tok/s':>11} {'per-cli tok/s':>14} "

@@ -455,6 +455,14 @@ qwentin-forward-qwen -j` as in the previous README works as well once `nvcc` is 
 Builds are code-reproducible, not byte-reproducible: nvcc embeds per-build-directory metadata,
 two builds of one commit differ in md5 but have identical SASS.
 
+CI (`.github/workflows/ci.yml`, CPU only): a compile-only check of `src/forward_qwen.cu` with the
+CMake flags in the `nvidia/cuda:13.1.2-devel-ubuntu24.04` container (`-gencode=arch=compute_120f,code=sm_120f -c`,
+~1 min, 0.9 GB), `ruff check tools/ tests/` (config in `pyproject.toml`), and `pytest tests/` (the `.tqf`
+header parser / payload walk on synthetic files, the servers' request guards) on Python 3.10 and
+3.12, plus a `--dry-run` of `bench/reproduce.sh`. The GPU gate — `bench/reproduce.sh` end to end on
+a self-hosted RTX 5090 — is `.github/workflows/nightly-5090.yml`, scheduled nightly but disabled
+until a runner exists (it runs only when the repository variable `QWENTIN_NIGHTLY_RUNNER` is `true`).
+
 ## Convert a model
 
 ### EXL3 (the served format): exllamav3 quantization, then `.tqf`

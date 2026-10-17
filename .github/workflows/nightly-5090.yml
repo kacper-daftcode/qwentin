@@ -1,0 +1,68 @@
+# Nightly GPU gate on a self-hosted RTX 5090 runner: bench/reproduce.sh end to end (build, model check, the served
+# line, needle / spec A-B / speed, optional quality) -> bench/results-<date>-<commit>.json as an artifact.
+#
+# DISABLED until a runner exists: the job runs only when the repository variable QWENTIN_NIGHTLY_RUNNER is "true"
+# (Settings -> Secrets and variables -> Actions -> Variables) and a runner with the labels below is registered.
+# The schedule is in place so that flipping the variable is the only step; workflow_dispatch allows a manual run.
+#
+# Runner requirements (one machine): an RTX 5090 (or another SM120 card with >= 32 GB), driver >= 610, CUDA 13.1 at
+# /usr/local/cuda-13.1 (or NVCC=... in the runner's env), the pinned Python environment (requirements.txt), and the
+# model files on local disk, exposed to the job through runner-level environment variables:
+#   QWENTIN_TQF        /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf     (README "Convert a model")
+#   QWENTIN_MODEL_DIR  /path/to/Qwen3.8-27B                            (tokenizer + chat template)
+#   QWENTIN_CORPUS     /path/to/vllm/vllm                              (optional; the needle / speed prompts' code tree)
+#   QWENTIN_REF_DIR    /path/to/Qwen3.8-27B   and   QWENTIN_E2E_DIR /path/to/runs/e2e   (optional; enables --quality)
+# The job never touches other GPUs (CUDA_VISIBLE_DEVICES from QWENTIN_GPU, default 0) and only kills the server it
+# started (bench/reproduce.sh traps EXIT).
+name: nightly-5090
+
+on:
+  schedule:
+    - cron: "17 3 * * *"        # 03:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      quality:
+        description: "also run the KL / top-1 yardstick (needs QWENTIN_REF_DIR / QWENTIN_E2E_DIR on the runner)"
+        type: boolean
+        default: false
+
+jobs:
+  reproduce:
+    name: bench/reproduce.sh on the 5090 runner
+    if: ${{ vars.QWENTIN_NIGHTLY_RUNNER == 'true' }}
+    runs-on: [self-hosted, linux, x64, rtx5090]
+    timeout-minutes: 90
+    concurrency:
+      group: nightly-5090            # one GPU, one run at a time
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: environment
+        run: |
+          nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit --format=csv
+          ${NVCC:-/usr/local/cuda-13.1/bin/nvcc} --version | tail -2
+          ${PYTHON:-python3} -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
+          test -f "$QWENTIN_TQF" && test -d "$QWENTIN_MODEL_DIR"
+      - name: reproduce
+        # the runner-level QWENTIN_* variables (set in the runner's .env) become bench/reproduce.sh's inputs
+        run: |
+          export TQF="$QWENTIN_TQF" MODEL_DIR="$QWENTIN_MODEL_DIR" GPU="${QWENTIN_GPU:-0}" PORT=8190
+          [ -z "${QWENTIN_CORPUS:-}" ] || export CORPUS="$QWENTIN_CORPUS"
+          QUALITY=""
+          if [ "${{ inputs.quality }}" = "true" ] && [ -n "${QWENTIN_REF_DIR:-}" ] && [ -n "${QWENTIN_E2E_DIR:-}" ]; then
+            export REF_DIR="$QWENTIN_REF_DIR" E2E_DIR="$QWENTIN_E2E_DIR"; QUALITY="--quality"
+          fi
+          bench/reproduce.sh --tag "nightly-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" $QUALITY
+      - name: summary
+        run: |
+          f=$(ls -t bench/results-*.json | head -1)
+          echo "## $f" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d['summary'], indent=1)); print(json.dumps({k: d['environment'][k] for k in ('commit','lib_md5','driver','nvcc_version','torch','transformers')}, indent=1))" "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results
+          path: |
+            bench/results-*.json
+            bench/work-*/*.log
+          retention-days: 90

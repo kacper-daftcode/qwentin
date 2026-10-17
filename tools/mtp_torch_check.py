@@ -13,7 +13,7 @@ import numpy as np
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mtp_spec_smoke import load_lib, Eng, prefill, ck
-from mtp_calib_train import MTPHead, load_tensors, MTP_NAMES, P0 as TRAIN_P0
+from mtp_calib_train import MTPHead, load_tensors, MTP_NAMES
 from transformers import AutoTokenizer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

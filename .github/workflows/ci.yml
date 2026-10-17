@@ -1,0 +1,66 @@
+# CPU-only CI: compile check of the engine TU, lint of the Python tools, pytest of the GPU-free pieces.
+# The GPU gate (bench/reproduce.sh on a 5090) is a separate, self-hosted workflow: nightly-5090.yml.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cuda-compile:
+    name: "nvcc compile check (CUDA 13.1, sm_120f, -c only)"
+    runs-on: ubuntu-latest
+    # The newest 13.1.x devel image on Docker Hub (the served build used CUDA 13.1 / nvcc V13.1.115 =
+    # cuda_13.1.r13.1/compiler.37061995_0; 13.1.2 is the same minor). A `-c` compile needs no GPU and no driver.
+    container: nvidia/cuda:13.1.2-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          nvcc --version
+          gcc --version | head -1
+      - name: compile src/forward_qwen.cu (the exact flags CMakeLists.txt generates, object only)
+        run: |
+          set -o pipefail
+          nvcc -Dqwentin_forward_qwen_EXPORTS -std=c++17 -Xcompiler=-fPIC -O3 \
+               -gencode=arch=compute_120f,code=sm_120f \
+               -x cu -c src/forward_qwen.cu -o /tmp/forward_qwen.o 2>&1 | tee /tmp/nvcc.log
+          ls -la /tmp/forward_qwen.o
+          echo "warnings: $(grep -c 'warning' /tmp/nvcc.log || true)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nvcc-log
+          path: /tmp/nvcc.log
+
+  ruff:
+    name: "ruff (tools/, tests/)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.17.1
+      - name: ruff check (config in pyproject.toml [tool.ruff])
+        run: ruff check tools/ tests/
+
+  pytest:
+    name: "pytest (CPU: .tqf header parser / payload walk, server hardening)"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install pytest (the tests import only the stdlib and tools/inspect_tqf.py, serve_common.py, serve_batched.py)
+        run: pip install pytest==9.1.1
+      - run: python -m pytest -q tests/
+      - name: bench/reproduce.sh parses and dry-runs
+        run: |
+          bash -n bench/reproduce.sh tools/evalplus.sh
+          bench/reproduce.sh --dry-run --no-build --tag ci > /tmp/dry.log
+          grep -q "tools/serve_batched.py" /tmp/dry.log

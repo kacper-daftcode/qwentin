@@ -12,7 +12,6 @@ Usage:
 """
 
 import argparse
-import math
 import os
 import struct
 import sys

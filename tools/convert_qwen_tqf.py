@@ -779,7 +779,6 @@ def tensor_specs(config, names: set[str]) -> list[TensorSpec]:
     text = as_text_config(config)
     hidden = int(text.hidden_size)
     intermediate = int(text.intermediate_size)
-    layers = int(text.num_hidden_layers)
     vocab = int(text.vocab_size)
     heads = int(text.num_attention_heads)
     kv_heads = int(text.num_key_value_heads)

@@ -335,7 +335,7 @@ def main():
 
     # ---- report ----------------------------------------------------------------
     print("\n" + "=" * 74, flush=True)
-    print(f"  Qwen3.6-27B native MTP head — draft acceptance vs dense greedy", flush=True)
+    print("  Qwen3.6-27B native MTP head — draft acceptance vs dense greedy", flush=True)
     print(f"  tokens={n}   hidden-extraction sanity={sanity:.2f}%   "
           f"dequant-rel-err={worst:.3%}", flush=True)
     print("=" * 74, flush=True)
