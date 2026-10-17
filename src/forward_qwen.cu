@@ -4415,9 +4415,14 @@ __global__ void __launch_bounds__(256) k_tq_pattn_merge(
     }
 }
 
-static int pattn_gqa_mode(void) {                       // TQ_PATTN_GQA: 0 (default) = the per-head bf16 kernel
+// TQ_PATTN_GQA: 0 = the per-head bf16 prefill attention kernel (the 10-16 path, bit for bit); 1 = the GQA-grouped tensor-core
+// kernel on the trellis pool with fp32 accumulation -- DEFAULT since 2026-10-17 (session 11: attention 17.0 -> 9.3 ms per
+// 128-column wave at 32K, 67.6 -> 34.2 at 128K; e2e dKL within the CI at 4K / 32K on two seeds, spec exactness ALL PASS,
+// needle 6/6; notes/session11-pattn.md); 3 / 4 / 5 = fp16-accumulate variants (opt-in: a position-dependent +0.00005 dKL
+// at >= 24K); 2 = instrumentation.
+static int pattn_gqa_mode(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_PATTN_GQA"); c = e ? atoi(e) : 0; }
+    if (c < 0) { const char *e = getenv("TQ_PATTN_GQA"); c = (e && *e) ? atoi(e) : 1; }
     return c;
 }
 static int pattn_split_override(void) {                 // TQ_PATTN_S: force the key-split count (experiments)
