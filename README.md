@@ -477,9 +477,10 @@ python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work-27b-t45 -o /path/to/Q
 #  for the measurement; our fork added a layer-split option for several 32 GB cards, upstream needs one big GPU.)
 
 # 2) EXL3 checkpoint -> .tqf (CPU only, ~3 min). The Linears are copied verbatim as trellis records
-#    (header flag 0x800, --exl3 auto reads quantization_config.json); TQ_EMIT_MTP=1 --mtp-exl3 stores the
-#    checkpoint's own 4-bpw MTP layer as EXL3 records (flag 0x1000) -- the paged drafter behind --spec reads
-#    exactly that. Without --mtp-exl3 the server runs with speculative decoding OFF after a warning.
+#    (header flag 0x800, --exl3 auto reads quantization_config.json); --mtp-exl3 stores the checkpoint's own
+#    4-bpw MTP layer as EXL3 records (flag 0x1000) -- the paged drafter behind --spec reads exactly that
+#    (TQ_EMIT_MTP=1 is the default since 2026-10 and may be omitted; the converter warns when an EXL3 source
+#    is converted without --mtp-exl3). Without it the server runs with speculative decoding OFF after a warning.
 cd qwentin
 TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-opt5.75 \
     -o /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf --mtp-exl3          # 21.3 GB
@@ -487,20 +488,23 @@ TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-t45-s4
     -o /path/to/qwen3_8-27b-exl3-t45-s425-mtp4.tqf --mtp-exl3         # 16.7 GB, the 16 GB variant
 ```
 
-`python3 tools/inspect_tqf.py model.tqf` reports the flags; an EXL3 file with the MTP section for
-`--spec` has bits `0x800` and `0x1000` set (`mtp_exl3: true`). `--mtp-source /path/to/Qwen3.8-27B`
-instead of `--mtp-exl3` writes a bf16 MTP head (`-mtp.tqf`) for the single-stream MTP tools; the
-batched server's drafter needs the EXL3 one. Only `serve_batched.py` runs EXL3 files;
-`serve_openai.py` needs the FP6 format below.
+`python3 tools/inspect_tqf.py model.tqf` reports the flags, walks the payload (EXL3 records included:
+per-bitrate histogram, byte-exact size check) and prints two verdict lines — `verdict EXL3 + MTP ...
+PASS` is the file `--spec` needs (bits `0x800`, `0x400` and `0x1000` set; `--expect exl3-mtp` makes
+that an exit code). `--mtp-source /path/to/Qwen3.8-27B` instead of `--mtp-exl3` writes a bf16 MTP
+head (`-mtp.tqf`) for the single-stream MTP tools; the batched server's drafter needs the EXL3 one
+(the converter warns when an EXL3 source is converted without either). Only `serve_batched.py` runs
+EXL3 files; `serve_openai.py` needs the FP6 format below. The format itself: `docs/TQF_FORMAT.md`.
 
 ### FP6 E2M3 (the legacy single-stream format)
 
 ```bash
 # FP6 (E2M3) block-scaled weights + MTP head — the production format of the single-stream path (~22.6 GB).
-# ALL of --block-scaled always, --block-layout qmma-e2m3 and TQ_EMIT_MTP=1 are
-# required: --block-scaled defaults to `auto`, which on a BF16 checkpoint silently
-# falls back to plain global-scale FP8 (ignoring --block-layout), and without
-# TQ_EMIT_MTP=1 the MTP head is dropped (no spec-decode).
+# Since 2026-10 this recipe IS the converter's default for a HF checkpoint: --block-scaled always
+# --block-layout qmma-e2m3 --block-scale-policy pow2 and the MTP section on (the flags below are
+# therefore optional and kept for explicitness). The pre-2026-10 defaults (`auto`, which on a BF16
+# checkpoint silently fell back to plain global-scale FP8 without the MTP head) are behind --legacy-fp8,
+# and the converter prints a WARNING whenever the output is not one of the two production formats.
 # Optional: TQ_GPU_PACK=1 quantizes/packs on the GPU via the built
 # libforward_qwen.so (much faster than the ~13 min numpy path).
 # The SAME command converts the official Qwen3.8-27B-FP8 checkpoint:
@@ -514,11 +518,14 @@ TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.6-27B \
     --block-scaled always --block-layout qmma-e2m3 --block-scale-policy pow2
 ```
 
-`.tqf` is qwentin's on-disk format: quantized weights in the QMMA fragment layout (or EXL3
-trellis records), the non-quant tensors (embeddings, norms, conv1d) in bf16, and the MTP draft
-head for spec-decode. A production FP6 file reports `block_scaled_e2m3: True` and
-`has_mtp_section: True` (header flags `0x53d`); `flags: 0x1d` / `has_mtp_section: False` (and
-~28 GB instead of ~22.6) is plain FP8 without the MTP head — reconvert with the exact flags above.
+`.tqf` is qwentin's on-disk format (`docs/TQF_FORMAT.md`): quantized weights in the QMMA fragment
+layout (or EXL3 trellis records), the non-quant tensors (embeddings, norms, conv1d) in bf16, and
+the MTP draft head for spec-decode. A production FP6 file reports `verdict production FP6 ... PASS`
+in `tools/inspect_tqf.py` (`block_scaled_e2m3: True`, `has_mtp_section: True`, header flags
+`0x53d`); `flags: 0x1d` / `has_mtp_section: False` (and ~28 GB instead of ~22.6) is plain FP8
+without the MTP head (`verdict production FP6: FAIL -- no block scales ...`) — reconvert without
+`--legacy-fp8`. The format has no version field or checksum yet; the design for both and for a
+loader that refuses mismatched files is the TODO at the end of `docs/TQF_FORMAT.md`.
 
 ## Serve (OpenAI API)
 

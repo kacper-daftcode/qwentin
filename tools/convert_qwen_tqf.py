@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Convert a Qwen3.5/Qwen3.6/Qwen3.8 text tower to the experimental TQF1 format.
+"""Convert a Qwen3.5/Qwen3.6/Qwen3.8 text tower to the .tqf format (docs/TQF_FORMAT.md).
 
-Official FP8 checkpoints (e.g. Qwen3.8-27B-FP8) are supported: tensors stored as
-block-scaled E4M3 (`<name>_scale_inv`) are dequantized to float before any
-re-quantization, and the `policy=source` passthrough preserves payload bytes.
-The vision tower is dropped; the MTP head is emitted with TQ_EMIT_MTP=1."""
+Two source kinds, two outputs:
+  * an exllamav3 EXL3 checkpoint (quantization_config.json, detected by --exl3 auto): the Linears are copied
+    verbatim as trellis records (flag 0x800); with --mtp-exl3 the checkpoint's own EXL3 MTP layer is appended
+    (flag 0x1000) -- the served format, tools/serve_batched.py --spec;
+  * a HF bf16 or FP8 checkpoint: the PRODUCTION FP6 recipe is the default since 2026-10 -- `--block-scaled always
+    --block-layout qmma-e2m3 --block-scale-policy pow2` with the MTP head section (flags 0x1|0x20|0x100|0x400), the
+    legacy single-stream format of tools/serve_openai.py. Before 2026-10 the defaults were `auto` / `rowmajor` /
+    `source` with no MTP section, which on a bf16 checkpoint silently produced plain global-scale FP8 without the
+    drafter; that behaviour is still available as --legacy-fp8.
+
+Official FP8 checkpoints (e.g. Qwen3.8-27B-FP8) are supported: tensors stored as block-scaled E4M3
+(`<name>_scale_inv`) are dequantized to float before any re-quantization, and the `policy=source` passthrough
+preserves payload bytes. The vision tower is dropped. The MTP head section is emitted by default (TQ_EMIT_MTP=0 or
+--no-mtp drops it; TQ_EMIT_MTP=1, the historical spelling, is a no-op). tools/inspect_tqf.py prints a PASS / FAIL
+verdict for both production formats."""
 
 from __future__ import annotations
 
@@ -839,13 +850,18 @@ def tensor_specs(config, names: set[str]) -> list[TensorSpec]:
     return specs
 
 
-def mtp_emit_enabled() -> bool:
-    """Whether to append the native MTP head section (env-gated, default off).
+MTP_EMIT_DEFAULT = True   # since 2026-10; --legacy-fp8 flips it to the pre-2026-10 default (off unless TQ_EMIT_MTP=1)
 
-    Default output stays byte-identical when this is off; the section and its
-    header flag bit are only added when TQ_EMIT_MTP is set.
-    """
-    return bool(os.environ.get("TQ_EMIT_MTP"))
+
+def mtp_emit_enabled() -> bool:
+    """Whether to append the MTP head section. Default ON (MTP_EMIT_DEFAULT): both production formats need it (the
+    FP6 single-stream spec decoder and, with --mtp-exl3, the batched server's drafter). TQ_EMIT_MTP=0 / --no-mtp turn
+    it off; TQ_EMIT_MTP=1 (the historical spelling) is a no-op. The section and its header flag bit are the only
+    difference between the two outputs."""
+    v = os.environ.get("TQ_EMIT_MTP")
+    if v is None:
+        return MTP_EMIT_DEFAULT
+    return v.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def mtp_tensor_specs(config) -> list[TensorSpec]:
@@ -1033,6 +1049,17 @@ def write_tqf(
             block_scaled = False
         else:
             raise ValueError(f"unsupported block_scaled_mode: {block_scaled_mode}")
+        if not exl3:
+            if block_scaled and block_layout == "qmma-e2m3":
+                print(f"  FP6 production format: E2M3 block-scaled weights, scale policy {block_scale_policy} "
+                      f"(flags 0x{FLAG_BLOCK_SCALED_QMMA | FLAG_BLOCK_SCALED_E2M3:x})")
+            elif block_scaled:
+                print(f"  WARNING: block-scaled FP8 (E4M3) weights, layout {block_layout} -- NOT the FP6 production format "
+                      f"(that is --block-layout qmma-e2m3); tools/serve_openai.py's documented numbers are FP6")
+            else:
+                print("  WARNING: plain global-scale FP8 weights (no block scales) -- NOT the FP6 production format; "
+                      "the file will be ~28 GB instead of ~22.6 GB for the 27B and tools/inspect_tqf.py will say "
+                      "'verdict production FP6: FAIL'. Drop --legacy-fp8 / --block-scaled never for the production recipe")
 
         # MTP head: bf16 projections. An EXL3 checkpoint quantizes them, so take the
         # section from --mtp-source (the original bf16 model directory) when given.
@@ -1050,7 +1077,13 @@ def write_tqf(
             emit_mtp = mtp_emit_enabled() and all(s.name in mtp_store.names() for s in mtp_specs)
             missing_mtp = [s.name for s in mtp_specs if s.name not in mtp_store.names()]
         if mtp_emit_enabled() and not emit_mtp:
-            print(f"  TQ_EMIT_MTP set but model lacks MTP tensors {missing_mtp}; MTP section NOT emitted")
+            if exl3 and not mtp_exl3 and not mtp_source:
+                print("  WARNING: MTP section NOT emitted: an EXL3 checkpoint quantizes its MTP layer, so pass --mtp-exl3 "
+                      "(the EXL3 MTP records the batched server's --spec drafter needs) or --mtp-source <bf16 dir> (a bf16 "
+                      "head for the single-stream MTP tools); without one serve_batched.py runs with speculative decoding OFF")
+            else:
+                print(f"  WARNING: MTP section NOT emitted: the source lacks the MTP tensors {missing_mtp[:3]}"
+                      f"{' ...' if len(missing_mtp) > 3 else ''} (no speculative decoding from this file)")
         if emit_mtp and mtp_exl3:
             print(f"  MTP projections as EXL3 records (flag 0x{FLAG_MTP_EXL3:x})")
 
@@ -1170,8 +1203,24 @@ def write_tqf(
     }
 
 
+PRODUCTION_FP6 = {"block_scaled": "always", "block_layout": "qmma-e2m3", "block_scale_policy": "pow2"}
+LEGACY_FP8 = {"block_scaled": "auto", "block_layout": "rowmajor", "block_scale_policy": "source"}
+
+
+def resolve_recipe(args) -> dict[str, str]:
+    """Fill the block-scaling options the user left unset: the production FP6 recipe by default, the pre-2026-10
+    defaults with --legacy-fp8. Explicit values always win. (EXL3 sources ignore all three.)"""
+    base = LEGACY_FP8 if args.legacy_fp8 else PRODUCTION_FP6
+    chosen = {k: getattr(args, k) if getattr(args, k) is not None else v for k, v in base.items()}
+    return chosen
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Convert Qwen3.5/Qwen3.6 text tower to TQF1")
+    parser = argparse.ArgumentParser(
+        description="Convert a Qwen3.5/3.6/3.8 text tower (HF bf16 / FP8, or an exllamav3 EXL3 checkpoint) to .tqf",
+        epilog="Defaults for a HF checkpoint = the production FP6 recipe (--block-scaled always --block-layout qmma-e2m3 "
+               "--block-scale-policy pow2, MTP section on). --legacy-fp8 restores the pre-2026-10 defaults (auto / rowmajor / "
+               "source, MTP only with TQ_EMIT_MTP=1). EXL3 sources: add --mtp-exl3 for the served -mtp4 file.")
     parser.add_argument("model", nargs="?", default=DEFAULT_MODEL, help="Local Qwen HF model directory")
     parser.add_argument("-o", "--output", required=True, help="Output .tqf path")
     parser.add_argument(
@@ -1183,28 +1232,42 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Validate and estimate without writing output")
     parser.add_argument(
         "--block-scaled",
-        default="auto",
+        default=None,
         choices=("auto", "always", "never"),
-        help="Store QMMA weights with 128x128 block scales. auto preserves source block-scaled FP8 checkpoints.",
+        help="Store QMMA weights with 128x128 block scales (default: always = the FP6 production recipe; --legacy-fp8: "
+             "auto = only when the source checkpoint carries block scales, i.e. plain FP8 from a bf16 checkpoint).",
     )
     parser.add_argument(
         "--block-scale-policy",
-        default="source",
+        default=None,
         choices=("source", "float", "pow2"),
         help=(
-            "For block-scaled weights: source preserves checkpoint scale_inv when present; "
-            "float recomputes exact absmax/448 scales; pow2 uses power-of-two scales for QMMA.SF/ue8m0."
+            "For block-scaled weights (default: pow2 = the FP6 production recipe; --legacy-fp8: source): source preserves "
+            "checkpoint scale_inv when present; float recomputes exact absmax/448 scales; pow2 uses power-of-two scales "
+            "for QMMA.SF/ue8m0."
         ),
     )
     parser.add_argument(
         "--block-layout",
-        default="rowmajor",
+        default=None,
         choices=("rowmajor", "qmma", "qmma-word", "qmma-e2m3"),
         help=(
-            "FP8 payload layout for block-scaled weights. qmma is the tensor-core fragment layout; "
-            "qmma-word stores each tile as word-major lanes for sector-efficiency experiments; "
-            "qmma-e2m3 packs weights as dense 6-bit E2M3 (0.75x bytes) for the mixed E2M3xE4M3 path."
+            "Payload layout for block-scaled weights (default: qmma-e2m3 = the FP6 production recipe; --legacy-fp8: rowmajor). "
+            "qmma is the tensor-core fragment layout; qmma-word stores each tile as word-major lanes for sector-efficiency "
+            "experiments; qmma-e2m3 packs weights as dense 6-bit E2M3 (0.75x bytes) for the mixed E2M3xE4M3 path."
         ),
+    )
+    parser.add_argument(
+        "--legacy-fp8",
+        action="store_true",
+        help="The pre-2026-10 defaults for a HF source: --block-scaled auto --block-layout rowmajor --block-scale-policy source "
+             "and no MTP section unless TQ_EMIT_MTP=1. On a bf16 checkpoint this writes plain global-scale FP8 without the "
+             "drafter (~28 GB for the 27B) -- not the format the README's FP6 numbers were measured with.",
+    )
+    parser.add_argument(
+        "--no-mtp",
+        action="store_true",
+        help="Do not append the MTP head section (= TQ_EMIT_MTP=0): no speculative decoding from this file.",
     )
     parser.add_argument(
         "--exl3",
@@ -1218,24 +1281,33 @@ def main() -> None:
     parser.add_argument(
         "--mtp-source",
         default=None,
-        help="Model directory to take the bf16 MTP head from (an EXL3 checkpoint quantizes it); with TQ_EMIT_MTP=1",
+        help="Model directory to take the bf16 MTP head from (an EXL3 checkpoint quantizes it): writes the -mtp.tqf for the single-stream MTP tools",
     )
     parser.add_argument(
         "--mtp-exl3",
         action="store_true",
-        help="With TQ_EMIT_MTP=1 on an EXL3 source: store the MTP projections as its EXL3 records (flag 0x1000) "
+        help="EXL3 source: store the MTP projections as its EXL3 records (flag 0x1000; the -mtp4.tqf of the README) "
              "instead of bf16 matrices (the batched server's paged drafter reads them; the single-stream MTP path cannot)",
     )
     args = parser.parse_args()
+    recipe = resolve_recipe(args)
+    global MTP_EMIT_DEFAULT
+    if args.no_mtp:
+        os.environ["TQ_EMIT_MTP"] = "0"
+    elif args.legacy_fp8:
+        MTP_EMIT_DEFAULT = False     # the old default: no MTP section unless TQ_EMIT_MTP=1
+    print(f"  recipe: --block-scaled {recipe['block_scaled']} --block-layout {recipe['block_layout']} "
+          f"--block-scale-policy {recipe['block_scale_policy']} ({'legacy FP8 defaults' if args.legacy_fp8 else 'production FP6 defaults'}"
+          f" for a HF source; ignored for an EXL3 source), MTP section {'on' if mtp_emit_enabled() else 'off'}")
 
     summary = write_tqf(
         args.model,
         args.output,
         args.non_quant_dtype,
         args.dry_run,
-        args.block_scaled,
-        args.block_scale_policy,
-        args.block_layout,
+        recipe["block_scaled"],
+        recipe["block_scale_policy"],
+        recipe["block_layout"],
         args.exl3,
         args.mtp_source,
         args.mtp_exl3,

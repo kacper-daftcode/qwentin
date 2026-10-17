@@ -112,8 +112,8 @@ fi
 # ---------------------------------------------------------------- 2. model check
 if [ $CHECK -eq 1 ]; then
   log "model check: tools/inspect_tqf.py $TQF"
-  run "$PYTHON" tools/inspect_tqf.py "$TQF" > "$WORK/inspect_tqf.log" 2>&1 || log "inspect_tqf exited non-zero (see $WORK/inspect_tqf.log)"
-  [ $DRY -eq 1 ] || grep -E "^(flags|has_mtp_section|mtp_exl3|exl3_weights|payload_match|PASS|FAIL)" "$WORK/inspect_tqf.log" || true
+  run "$PYTHON" tools/inspect_tqf.py "$TQF" --expect exl3-mtp > "$WORK/inspect_tqf.log" 2>&1 || log "inspect_tqf exited non-zero: the file is not the served EXL3 + MTP format or is inconsistent (see $WORK/inspect_tqf.log)"
+  [ $DRY -eq 1 ] || grep -E "^(flags|exl3_bitrates|payload_match|verdict)" "$WORK/inspect_tqf.log" || true
 fi
 
 # ---------------------------------------------------------------- 3. serve (THE SERVED STACK line of the README)
