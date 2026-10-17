@@ -30,5 +30,7 @@ bench/gptq_e2m1/
 # These dirs are never tracked by the public repo (recreated scratch stays ignored too).
 internal/
 probes/
-bench/
+bench/*
+!bench/reproduce.sh
+# bench/results-<date>-<commit>.json and bench/work-*/ are run outputs; add a result file with `git add -f` to publish it.
 
