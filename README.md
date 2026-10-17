@@ -634,7 +634,7 @@ keeps the prefix cache valid across turns). Since 2026-10 this server also binds
 default (it was `0.0.0.0`; pass `--host 0.0.0.0 --api-key KEY` to expose it) and takes the same
 `--api-key` / `--max-body-bytes` / `--max-tokens-cap` / `--socket-timeout` guards as the batched
 server ("Exposure" above). Note the cap applies to the Responses API's own 8192-token default
-budget too — raise `--max-tokens-cap` to 8192 or more for Codex-style clients that rely on it.
+budget too — the 16384 default leaves the Responses API's 8192 default untouched; lower it only for public endpoints.
 
 #### Reservoir Dogs: spec-round watchdog + fallback drafter (default ON)
 
