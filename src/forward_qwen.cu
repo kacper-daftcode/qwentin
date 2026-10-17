@@ -3954,7 +3954,8 @@ __global__ void k_tq_wide_attn_mma_merge(
 #define TQ_PA_LD     264                                // fp16 tile row stride in halfs (512 B + 16 B pad)
 #define TQ_PA_LDB    (TQ_PA_LD * 2)                     // ... in bytes (528)
 #define TQ_PA_TILE_B (TQ_PA_TK * TQ_PA_LDB)             // one K or V tile: 16 896 B
-#define TQ_PA_CODE_B (TQ_PA_TK * 128)                   // staged codes of one tile: 4 096 B
+#define TQ_PA_CROW   144                                // staged code row: 128 bytes + 16 pad (8 keys of a quarter-warp on 8 bank groups)
+#define TQ_PA_CODE_B (TQ_PA_TK * TQ_PA_CROW)            // staged codes of one tile: 4 608 B
 // dynamic smem layout (bytes): KT | VT | CK | CV | SK[32] | SV[32] | table | ksc[2][32] | vsc[2][32]
 // Single fp16 K and V tiles: phase A of tile i runs Q.K^T on KT = K_i while decoding V_i into VT, phase C runs the
 // softmax + P.V on VT while decoding K_(i+1) into KT (one __syncthreads per phase). The code buffers are single too:
@@ -3970,7 +3971,9 @@ __global__ void k_tq_wide_attn_mma_merge(
 #define TQ_PA_OFF_TAB  (TQ_PA_OFF_SV + TQ_PA_TK * 4)
 #define TQ_PA_OFF_KSC  (TQ_PA_OFF_TAB + 8192)
 #define TQ_PA_OFF_VSC  (TQ_PA_OFF_KSC + 2 * TQ_PA_TK * 4)
-#define TQ_PA_SMEM     (TQ_PA_OFF_VSC + 2 * TQ_PA_TK * 4)     // 50 688 B
+#define TQ_PA_OFF_QH   (TQ_PA_OFF_VSC + 2 * TQ_PA_TK * 4)     // QH: Q A-fragments of chunks 8..15, [8 warps][8][32][4]
+#define TQ_PA_SMEM0    TQ_PA_OFF_QH                            // 50 688 B (QH = 0)
+#define TQ_PA_SMEM1    (TQ_PA_OFF_QH + 8 * 8 * 32 * 16)        // 83 456 B (QH = 1)
 #define TQ_PA_ROWS     128
 #define TQ_PA_PART_F   (2 * TQ_PA_ROWS + TQ_PA_ROWS * 256)    // floats per (kv head, row block, split) partial
 
@@ -3989,6 +3992,30 @@ static __device__ __forceinline__ void tq_pa_mma_f16(float *c, const uint32_t *a
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+// fp16-accumulate variant (AQ / AP): C and D are two f16x2 registers, (row gr, cols 2 t4, 2 t4 + 1) and (row gr + 8, ...)
+static __device__ __forceinline__ void tq_pa_mma_f16acc(uint32_t *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1},{%2,%3,%4,%5},{%6,%7},{%8,%9};"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c[0]), "r"(c[1]));
+}
+// fold an f16x2 accumulator pair into the fp32 C fragment (c0 += lo(d0), c1 += hi(d0), c2 += lo(d1), c3 += hi(d1))
+// (asm volatile: nvcc otherwise sinks every fold of a phase below the phase's last HMMA, ~100 dependent ALU
+//  instructions during which the tensor pipe idles; the callers issue a group's fold one group late, behind the next
+//  group's HMMAs, so the fold never waits for an HMMA result)
+static __device__ __forceinline__ void tq_pa_fold16(float *c, const uint32_t *d) {
+    asm volatile("{\n .reg .b16 h0, h1, h2, h3;\n .reg .f32 f0, f1, f2, f3;\n"
+                 " mov.b32 {h0, h1}, %4;\n mov.b32 {h2, h3}, %5;\n"
+                 " cvt.f32.f16 f0, h0;\n cvt.f32.f16 f1, h1;\n cvt.f32.f16 f2, h2;\n cvt.f32.f16 f3, h3;\n"
+                 " add.f32 %0, %0, f0;\n add.f32 %1, %1, f1;\n add.f32 %2, %2, f2;\n add.f32 %3, %3, f3;\n}"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(d[0]), "r"(d[1]));
+}
+static __device__ __forceinline__ float tq_pa_ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
 }
 static __device__ __forceinline__ uint32_t tq_pa_pack_f16(float lo, float hi) {
     uint32_t d;
@@ -4013,7 +4040,14 @@ static __device__ __forceinline__ void tq_pa_dequant32(const uint4 cw, uint32_t 
     }
 }
 
-template <int G>                                        // q heads per kv head
+// G = q heads per kv head; QH = 1: the Q A-fragments of chunks 8..15 live in smem (32 KB, one LDS.128 per chunk and
+// tile) instead of registers (frees 32 registers); AQ = 1: Q.K^T accumulates in fp16 over TQ_PA_FOLD chunks and folds
+// into the fp32 scores; AP = 1: P.V accumulates the tile's 32 keys in fp16 per 8-n-tile group and folds into the
+// fp32 O. The fp16 accumulators run the tensor pipe at twice the fp32 rate (515 vs 258 TFLOPS on GB202).
+#ifndef TQ_PA_FOLD
+#define TQ_PA_FOLD 4
+#endif
+template <int G, int QH, int AQ, int AP>
 __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
     const float *q_proj_base, const uint16_t *q_norm_w,
     const uint8_t *k4, const uint8_t *v8,
@@ -4048,7 +4082,9 @@ __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
 
     // ---- Q prep (one warp per m-tile, warps 0-3 then 4-7 in the 33 KB tile area): norm, partial rope, FWHT,
     //      fp16 [16 rows][256] -> ldmatrix A-fragments (16 chunks x 4 registers)
-    uint32_t qa[16][4];
+    constexpr int NQR = QH ? 8 : 16;                    // resident Q chunks (the rest in smem, QH)
+    uint32_t qa[NQR][4];
+    uint32_t *qh = (uint32_t *)(pa_sm + TQ_PA_OFF_QH) + warp * (8 * 32 * 4);
     #pragma unroll 1
     for (int half = 0; half < 2; half++) {
         if ((warp >> 2) == half) {
@@ -4085,49 +4121,84 @@ __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
             __syncwarp();
             const uint32_t qbase = (uint32_t)__cvta_generic_to_shared(qs) + ((lane & 7) + 8 * ((lane >> 3) & 1)) * TQ_PA_LDB + (lane >> 4) * 16;
             #pragma unroll
-            for (int c = 0; c < 16; c++) tq_pa_ldsm_x4(qa[c], qbase + c * 32);
+            for (int c = 0; c < 16; c++) {
+                if (c < NQR) tq_pa_ldsm_x4(qa[c], qbase + c * 32);
+                else {
+                    uint32_t t[4];
+                    tq_pa_ldsm_x4(t, qbase + c * 32);
+                    *(uint4 *)(qh + ((c - 8) * 32 + lane) * 4) = make_uint4(t[0], t[1], t[2], t[3]);
+                }
+            }
         }
         __syncthreads();
     }
     tq_t4_load_table(t4p.table, tab, tid);              // after the Q prep (the table shares no bytes with it, but
                                                         // the loop's first use is after the next barrier anyway)
     // ---- per-thread staging / dequant assignment: key kk = tid >> 3 of the tile, 32-dim chunk g = tid & 7
-    const int kk = tid >> 3, g = tid & 7;
+    // (warp g decodes the 32-dim chunk g of all 32 keys: a quarter-warp's 8 keys then store 16 B each to 8 distinct
+    //  bank groups -- 528-byte rows -- and read their codes from 8 distinct groups -- 144-byte rows; the earlier
+    //  (key = tid >> 3, chunk = tid & 7) mapping put a quarter-warp's 8 stores on 2 bank groups: 16 wavefronts per STS.128)
+    const int kk = tid & 31, g = warp;
     const uint32_t sm_base = (uint32_t)__cvta_generic_to_shared(pa_sm);
     // copy the codes (this thread's 16 bytes) + side word (one per key) of tile `it`'s K or V into CK / CV
     auto stage = [&](int it, bool kpart) {
         const int t0 = it * TQ_PA_TK;
         const int phys = block_table[(size_t)slot * max_blocks + (t0 >> page_log)];
         const size_t row = (size_t)phys * page + (size_t)(t0 & (page - 1)) + kk;
-        tq_cp_async16(sm_base + (kpart ? TQ_PA_OFF_CK : TQ_PA_OFF_CV) + kk * 128 + g * 16, (kpart ? kcb : vcb) + row * cstride4 + g * 16);
+        tq_cp_async16(sm_base + (kpart ? TQ_PA_OFF_CK : TQ_PA_OFF_CV) + kk * TQ_PA_CROW + g * 16, (kpart ? kcb : vcb) + row * cstride4 + g * 16);
         if (g == 0) tq_cp_async4(sm_base + (kpart ? TQ_PA_OFF_SK : TQ_PA_OFF_SV) + kk * 4, (kpart ? t4p.kside : t4p.vside) + (row * nkv + kv_head) * 4);
         asm volatile("cp.async.commit_group;\n");
     };
-    // decode this thread's 32 K or V values of tile `it` from CK / CV into KT / VT (scale -> ksc / vsc [it & 1])
-    auto dequant = [&](int it, bool kpart) {
-        const int t0 = it * TQ_PA_TK;
-        const int pos = t0 + kk;
-        uint4 *dst = (uint4 *)(pa_sm + (kpart ? TQ_PA_OFF_KT : TQ_PA_OFF_VT) + kk * TQ_PA_LDB + g * 64);
-        float *scp = (kpart ? ksc : vsc) + (it & 1) * TQ_PA_TK + kk;
-        // the staged bytes exist for every key (the shuffle must see the whole warp); rows at or beyond the slot's
-        // encoded length are the wave's own columns and take the exact fp16 staging instead
-        const uint4 cw = *(const uint4 *)(pa_sm + (kpart ? TQ_PA_OFF_CK : TQ_PA_OFF_CV) + kk * 128 + g * 16);
-        const uint32_t sw = *(const uint32_t *)(pa_sm + (kpart ? TQ_PA_OFF_SK : TQ_PA_OFF_SV) + kk * 4);
-        uint32_t prevb = __shfl_up_sync(0xffffffffu, cw.w >> 24, 1);
+    // decode this thread's values 8 k .. 8 k + 7 of its 32-dim chunk (one code word) of tile `it`'s K or V from CK / CV
+    // into KT / VT (k = 0 also writes the row's scale to ksc / vsc [it & 1]). Inline-PTX shared-memory accesses keep
+    // the four pieces of a tile in program order relative to the HMMA stream (asm volatile), i.e. interleaved with
+    // the MMAs instead of hoisted into one burst at the phase start (nvcc did that with plain loads: the LSU then
+    // served ~100 lookups per warp before the first ldmatrix and the tensor pipe idled for the first ~1000 cycles).
+    const uint32_t tab_s = sm_base + TQ_PA_OFF_TAB;
+    auto piece = [&](int it, bool kpart, int k) {
+        const int pos = it * TQ_PA_TK + kk;
+        const uint32_t crow_s = sm_base + (kpart ? TQ_PA_OFF_CK : TQ_PA_OFF_CV) + kk * TQ_PA_CROW + g * 16;
+        const uint32_t dst_s = sm_base + (kpart ? TQ_PA_OFF_KT : TQ_PA_OFF_VT) + kk * TQ_PA_LDB + g * 64 + k * 16;
+        const uint32_t sc_s = sm_base + (kpart ? TQ_PA_OFF_KSC : TQ_PA_OFF_VSC) + ((it & 1) * TQ_PA_TK + kk) * 4;
+        uint32_t v[4];
         if (pos < encl) {
-            if (g == 0) { prevb = sw & 0xFFu; *scp = tq_t4_scale(sw); }
-            tq_pa_dequant32(cw, prevb, tab, dst);
-        } else {                                        // the wave's own column: exact fp16 from the slot's staging
-            const uint4 *src = (const uint4 *)(stg + (size_t)(pos & (page - 1)) * nkv * 512 + (kpart ? 0 : 256) + g * 32);
+            uint32_t w, lowb;
+            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(w) : "r"(crow_s + 4 * k));
+            if (k == 0) {
+                uint32_t sw;
+                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(sw) : "r"(sm_base + (kpart ? TQ_PA_OFF_SK : TQ_PA_OFF_SV) + kk * 4));
+                if (g == 0) {
+                    lowb = sw & 0xFFu;
+                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(sc_s), "f"(tq_t4_scale(sw)));
+                } else {
+                    asm volatile("ld.shared.u8 %0, [%1];" : "=r"(lowb) : "r"(crow_s - 1));
+                }
+            } else {
+                asm volatile("ld.shared.u8 %0, [%1];" : "=r"(lowb) : "r"(crow_s + 4 * k - 1));
+            }
+            const uint32_t x = (w << 8) | lowb, y = w >> 24;
             #pragma unroll
-            for (int k = 0; k < 4; k++) dst[k] = src[k];
-            if (g == 0) *scp = 1.0f;
+            for (int j = 0; j < 4; j++) {
+                const uint32_t pr = __funnelshift_r(x, y, 8 * j);
+                uint32_t lo16, hi16;
+                asm volatile("ld.shared.u16 %0, [%1];" : "=r"(lo16) : "r"(tab_s + 2 * (pr & 0xFFFu)));
+                asm volatile("ld.shared.u16 %0, [%1];" : "=r"(hi16) : "r"(tab_s + 2 * ((pr >> 4) & 0xFFFu)));
+                v[j] = lo16 | (hi16 << 16);
+            }
+        } else {                                        // the wave's own column: exact fp16 from the slot's staging
+            const uint4 t = *(const uint4 *)(stg + (size_t)(pos & (page - 1)) * nkv * 512 + (kpart ? 0 : 256) + g * 32 + k * 8);
+            v[0] = t.x; v[1] = t.y; v[2] = t.z; v[3] = t.w;
+            if (k == 0 && g == 0) asm volatile("st.shared.f32 [%0], %1;" :: "r"(sc_s), "f"(1.0f));
         }
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst_s), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3]));
     };
 
     float o[32][4];
     #pragma unroll
     for (int j = 0; j < 32; j++) { o[j][0] = 0.0f; o[j][1] = 0.0f; o[j][2] = 0.0f; o[j][3] = 0.0f; }
+    // the online softmax runs in log2 units: scores x (key scale x rsc x log2 e), ex2.approx for p and alpha; the
+    // partial's m is in log2 units too (k_tq_pattn_merge uses exp2f)
+    const float rsl = rsqrtf(256.0f) * 1.4426950408889634f;
     float m_lo = TQ_AMM_NINF, m_hi = TQ_AMM_NINF, l_lo = 0.0f, l_hi = 0.0f;
     // ldmatrix lane bases: K (non-trans) rows = keys 8 j + (lane & 7) + 8 (lane >> 4), dims + 8 ((lane >> 3) & 1);
     // V (trans) rows = keys (lane & 7) + 8 ((lane >> 3) & 1), dims + 8 (lane >> 4)
@@ -4138,7 +4209,8 @@ __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
         stage(lo, true);
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
-        dequant(lo, true);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) piece(lo, true, k);
         stage(lo, false);
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
@@ -4146,31 +4218,56 @@ __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
     for (int it = lo; it < hi; it++) {
         const int t0 = it * TQ_PA_TK;
         const bool have_next = it + 1 < hi;
-        // ---- phase A: Q.K^T on KT = K_it; V_it decoded into VT; K_(it+1)'s codes copied
+        // ---- phase A: Q.K^T on KT = K_it; V_it decoded into VT (4 pieces at chunks 1, 5, 9, 13); K_(it+1)'s codes copied
         if (have_next) stage(it + 1, true);
         float s[4][4];
         #pragma unroll
         for (int j = 0; j < 4; j++) { s[j][0] = 0.0f; s[j][1] = 0.0f; s[j][2] = 0.0f; s[j][3] = 0.0f; }
+        uint32_t s16[2][4][2];                          // AQ: ping-pong fp16 accumulators of consecutive fold groups
         #pragma unroll
         for (int c = 0; c < 16; c++) {
-            uint32_t kb0[4], kb1[4];
+            uint32_t kb0[4], kb1[4], aq[4];
             tq_pa_ldsm_x4(kb0, kt + c * 32);
             tq_pa_ldsm_x4(kb1, kt + c * 32 + 16 * TQ_PA_LDB);
-            tq_pa_mma_f16(s[0], qa[c], kb0[0], kb0[1]);
-            tq_pa_mma_f16(s[1], qa[c], kb0[2], kb0[3]);
-            tq_pa_mma_f16(s[2], qa[c], kb1[0], kb1[1]);
-            tq_pa_mma_f16(s[3], qa[c], kb1[2], kb1[3]);
-            if (c == 3) dequant(it, false);
+            if (c < NQR) { aq[0] = qa[c][0]; aq[1] = qa[c][1]; aq[2] = qa[c][2]; aq[3] = qa[c][3]; }
+            else { const uint4 t = *(const uint4 *)(qh + ((c - 8) * 32 + lane) * 4); aq[0] = t.x; aq[1] = t.y; aq[2] = t.z; aq[3] = t.w; }
+            if constexpr (AQ) {
+                constexpr int F = TQ_PA_FOLD;
+                uint32_t (*acc)[2] = s16[(c / F) & 1];
+                if ((c % F) == 0) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) { acc[j][0] = 0u; acc[j][1] = 0u; }
+                }
+                tq_pa_mma_f16acc(acc[0], aq, kb0[0], kb0[1]);
+                tq_pa_mma_f16acc(acc[1], aq, kb0[2], kb0[3]);
+                tq_pa_mma_f16acc(acc[2], aq, kb1[0], kb1[1]);
+                tq_pa_mma_f16acc(acc[3], aq, kb1[2], kb1[3]);
+                if ((c % F) == F - 1 && c >= F) {       // fold the PREVIOUS group (its HMMAs are long done)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) tq_pa_fold16(s[j], s16[((c / F) & 1) ^ 1][j]);
+                }
+                if (c == 15) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) tq_pa_fold16(s[j], acc[j]);
+                }
+            } else {
+                tq_pa_mma_f16(s[0], aq, kb0[0], kb0[1]);
+                tq_pa_mma_f16(s[1], aq, kb0[2], kb0[3]);
+                tq_pa_mma_f16(s[2], aq, kb1[0], kb1[1]);
+                tq_pa_mma_f16(s[3], aq, kb1[2], kb1[3]);
+            }
+            if ((c & 3) == 1) piece(it, false, c >> 2);
         }
         asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
-        // ---- phase C: online softmax, P.V on VT = V_it; K_(it+1) decoded into KT; V_(it+1)'s codes copied
+        // ---- phase C: online softmax, P.V on VT = V_it; K_(it+1) decoded into KT (4 pieces); V_(it+1)'s codes copied
         if (have_next) stage(it + 1, false);
         const float *ks = ksc + (it & 1) * TQ_PA_TK, *vs = vsc + (it & 1) * TQ_PA_TK;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             const float2 sc = *(const float2 *)(ks + 8 * j + 2 * t4);
-            s[j][0] *= sc.x * rsc; s[j][1] *= sc.y * rsc; s[j][2] *= sc.x * rsc; s[j][3] *= sc.y * rsc;
+            const float f0 = sc.x * rsl, f1 = sc.y * rsl;
+            s[j][0] *= f0; s[j][1] *= f1; s[j][2] *= f0; s[j][3] *= f1;
         }
         if (t0 + TQ_PA_TK - 1 > minpos) {               // causal staircase (block-uniform test)
             #pragma unroll
@@ -4191,13 +4288,13 @@ __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
         tm_lo = fmaxf(tm_lo, __shfl_xor_sync(0xffffffffu, tm_lo, 2));
         tm_hi = fmaxf(tm_hi, __shfl_xor_sync(0xffffffffu, tm_hi, 2));
         const float mn_lo = fmaxf(m_lo, tm_lo), mn_hi = fmaxf(m_hi, tm_hi);
-        const float a_lo = expf(m_lo - mn_lo), a_hi = expf(m_hi - mn_hi);
+        const float a_lo = tq_pa_ex2(m_lo - mn_lo), a_hi = tq_pa_ex2(m_hi - mn_hi);
         m_lo = mn_lo; m_hi = mn_hi;
         float ps_lo = 0.0f, ps_hi = 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            s[j][0] = expf(s[j][0] - mn_lo); s[j][1] = expf(s[j][1] - mn_lo);
-            s[j][2] = expf(s[j][2] - mn_hi); s[j][3] = expf(s[j][3] - mn_hi);
+            s[j][0] = tq_pa_ex2(s[j][0] - mn_lo); s[j][1] = tq_pa_ex2(s[j][1] - mn_lo);
+            s[j][2] = tq_pa_ex2(s[j][2] - mn_hi); s[j][3] = tq_pa_ex2(s[j][3] - mn_hi);
             ps_lo += s[j][0] + s[j][1]; ps_hi += s[j][2] + s[j][3];
         }
         l_lo = l_lo * a_lo + ps_lo; l_hi = l_hi * a_hi + ps_hi;
@@ -4216,15 +4313,44 @@ __global__ void __launch_bounds__(256, 1) k_tq_pattn_t4(
             pa[kc][2] = tq_pa_pack_f16(s[2 * kc + 1][0] * v1.x, s[2 * kc + 1][1] * v1.y);
             pa[kc][3] = tq_pa_pack_f16(s[2 * kc + 1][2] * v1.x, s[2 * kc + 1][3] * v1.y);
         }
-        #pragma unroll
-        for (int kc = 0; kc < 2; kc++) {
+        if constexpr (AP) {
+            uint32_t o16[2][4][2];                      // ping-pong fp16 accumulators of consecutive 4-n-tile groups
             #pragma unroll
-            for (int jp = 0; jp < 16; jp++) {
-                uint32_t vb[4];
-                tq_pa_ldsm_x4_trans(vb, vt + kc * (16 * TQ_PA_LDB) + jp * 32);
-                tq_pa_mma_f16(o[2 * jp], pa[kc], vb[0], vb[1]);
-                tq_pa_mma_f16(o[2 * jp + 1], pa[kc], vb[2], vb[3]);
-                if (kc == 0 && jp == 3 && have_next) dequant(it + 1, true);
+            for (int grp = 0; grp < 8; grp++) {         // n-tiles 4 grp .. 4 grp + 3: fp16 over the tile's 32 keys, then fold
+                uint32_t (*acc)[2] = o16[grp & 1];
+                #pragma unroll
+                for (int jj = 0; jj < 4; jj++) { acc[jj][0] = 0u; acc[jj][1] = 0u; }
+                #pragma unroll
+                for (int kc = 0; kc < 2; kc++) {
+                    #pragma unroll
+                    for (int jp = 0; jp < 2; jp++) {
+                        uint32_t vb[4];
+                        tq_pa_ldsm_x4_trans(vb, vt + kc * (16 * TQ_PA_LDB) + (2 * grp + jp) * 32);
+                        tq_pa_mma_f16acc(acc[2 * jp], pa[kc], vb[0], vb[1]);
+                        tq_pa_mma_f16acc(acc[2 * jp + 1], pa[kc], vb[2], vb[3]);
+                    }
+                }
+                if (grp >= 1) {                         // fold the previous group behind this group's HMMAs
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; jj++) tq_pa_fold16(o[4 * (grp - 1) + jj], o16[(grp & 1) ^ 1][jj]);
+                }
+                if (grp == 7) {
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; jj++) tq_pa_fold16(o[4 * grp + jj], acc[jj]);
+                }
+                if ((grp & 1) == 0 && have_next) piece(it + 1, true, grp >> 1);
+            }
+        } else {
+            #pragma unroll
+            for (int kc = 0; kc < 2; kc++) {
+                #pragma unroll
+                for (int jp = 0; jp < 16; jp++) {
+                    uint32_t vb[4];
+                    tq_pa_ldsm_x4_trans(vb, vt + kc * (16 * TQ_PA_LDB) + jp * 32);
+                    tq_pa_mma_f16(o[2 * jp], pa[kc], vb[0], vb[1]);
+                    tq_pa_mma_f16(o[2 * jp + 1], pa[kc], vb[2], vb[3]);
+                    if (kc == 0 && (jp & 3) == 3 && have_next) piece(it + 1, true, jp >> 2);
+                }
             }
         }
         asm volatile("cp.async.wait_group 0;\n");
@@ -4265,7 +4391,7 @@ __global__ void __launch_bounds__(256) k_tq_pattn_merge(
         float l = 0.0f, o = 0.0f;
         for (int c = 0; c < S; c++) {
             const float *ps = ps0 + (size_t)c * TQ_PA_PART_F;
-            const float wgt = expf(ps[r] - m_star);
+            const float wgt = exp2f(ps[r] - m_star);          // m is in log2 units (ex2 softmax)
             l += wgt * ps[TQ_PA_ROWS + r];
             o += wgt * ps[2 * TQ_PA_ROWS + (size_t)r * 256 + tid];
         }
@@ -4328,14 +4454,30 @@ static int launch_pattn_t4(float *out, const float *q_proj, const uint16_t *q_no
         if (cudaMalloc(&g_pattn_part, need * sizeof(float)) != cudaSuccess) return -2;
         g_pattn_part_f = need;
     }
+    // TQ_PATTN_GQA: 1 = fp32 accumulate, Q in registers; 2 = Q half in smem (QH); 3 = QH + fp16-accumulate Q.K^T (AQ);
+    // 4 = QH + AQ + fp16-accumulate P.V (AP); 5 = QH + AP only
+    const int mode = pattn_gqa_mode();
     static int attr_done = 0;
     if (!attr_done) {
-        if (cudaFuncSetAttribute(k_tq_pattn_t4<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM) != cudaSuccess) return -3;
+        if (cudaFuncSetAttribute(k_tq_pattn_t4<6, 0, 0, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM0) != cudaSuccess ||
+            cudaFuncSetAttribute(k_tq_pattn_t4<6, 1, 0, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM1) != cudaSuccess ||
+            cudaFuncSetAttribute(k_tq_pattn_t4<6, 1, 1, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM1) != cudaSuccess ||
+            cudaFuncSetAttribute(k_tq_pattn_t4<6, 1, 1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM1) != cudaSuccess ||
+            cudaFuncSetAttribute(k_tq_pattn_t4<6, 1, 0, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM1) != cudaSuccess) return -3;
         attr_done = 1;
     }
-    k_tq_pattn_t4<6><<<dim3(nkv, nblk, S), 256, TQ_PA_SMEM, st>>>(
-        q_proj, q_norm_w, k4_pool, v8_pool, positions, slot, block_table, max_blocks, page, page_log,
-        n, nkv, q_m, g_qwen.eps, g_qwen.rope_theta, g_pattn_part, S, t4p);
+#define TQ_PATTN_LAUNCH(QH, AQ, AP) \
+    k_tq_pattn_t4<6, QH, AQ, AP><<<dim3(nkv, nblk, S), 256, QH ? TQ_PA_SMEM1 : TQ_PA_SMEM0, st>>>( \
+        q_proj, q_norm_w, k4_pool, v8_pool, positions, slot, block_table, max_blocks, page, page_log, \
+        n, nkv, q_m, g_qwen.eps, g_qwen.rope_theta, g_pattn_part, S, t4p)
+    switch (mode) {
+        case 2:  TQ_PATTN_LAUNCH(1, 0, 0); break;
+        case 3:  TQ_PATTN_LAUNCH(1, 1, 0); break;
+        case 4:  TQ_PATTN_LAUNCH(1, 1, 1); break;
+        case 5:  TQ_PATTN_LAUNCH(1, 0, 1); break;
+        default: TQ_PATTN_LAUNCH(0, 0, 0); break;
+    }
+#undef TQ_PATTN_LAUNCH
     k_tq_pattn_merge<6><<<dim3(nkv * nblk * 8), 256, 0, st>>>(out, q_proj, n, nblk, S, q_m, attn_m, g_pattn_part);
     if (getenv("TQ_PATTN_DEBUG")) {                     // scan the partials of this launch for non-finite values
         static int shown = 0;
