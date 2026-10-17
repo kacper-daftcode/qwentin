@@ -72,3 +72,52 @@ moved out of this repository together with the steering maps it was measured for
   fp16-rounded engine logits (like-for-like with the exllamav3-side runs). The `tag ... dKL [CI] ... dtop1 pt [CI]`
   tables are `tools/e2e_frontier.py --vs`: paired differences with a 95 % block-bootstrap confidence interval
   (4096-token blocks, 2000 resamples).
+
+## Re-running each gate by hand
+
+`bench/reproduce.sh` (README "Verify") runs the served line's gates in one go. The individual commands behind each
+log line — moved here from the 2026-10-17 README's "Verify" section. Which tool reproduces which number (the HTTP tools take `--base`/`--base-url` of a running
+`serve_batched.py`, the engine tools the same `--tqf` / `--model-dir` / `--lib` as the server;
+GPU work, so prefix `CUDA_VISIBLE_DEVICES=x` and the served env):
+
+```bash
+# needle 6/6 at 32K / 128K (TTFT = the cold prefill): one needle at depths 0.95 / 0.5 / 0.05 with 3 look-alike
+# decoys per prompt, exact match of the returned string. --tokenizer = the HF dir for exact prompt sizing
+# (else an estimate); --corpus = any large code tree ($QWENTIN_CORPUS; default: this repo).
+python3 tools/code_needle.py --base-url http://127.0.0.1:8100 --model qwen3.8-27b \
+    --lengths 32768,131072 --depths 0.95,0.5,0.05 --decoys 3 --tokenizer /path/to/Qwen3.8-27B \
+    --chat-kwargs '{"enable_thinking": false}' --out needle.json
+
+# the per-stream tok/s table: N sessions prefill a ctx-token snapshot (slots parked), then all N decode 300 tokens
+# together from the cached prefix, spec on and off via /spec; p50 / min per stream, aggregate, tokens per round
+python3 tools/spec_speed.py --base http://127.0.0.1:8100 --ctx 32768 --n 1,2,4,8 --tokenizer /path/to/Qwen3.8-27B
+python3 tools/spec_speed.py --base http://127.0.0.1:8100 --ctx 131072 --n 1,2 --tokenizer /path/to/Qwen3.8-27B
+
+# spec A/B 10/10: the same prompts with speculative decoding on and off, greedy -> identical outputs expected
+python3 tools/spec_server_ab.py --base http://127.0.0.1:8100 --prompts 10 --tokenizer /path/to/Qwen3.8-27B
+
+# spec exactness ALL PASS (bare engine): every verify column's logits == the sequential decode steps', partial /
+# zero commits, wrong drafts, parking; --no-pin = the production split pickers (bitwise thanks to the per-column
+# key splits). The served env in front (the bare-engine tools default TQ_KV_T4_CODEBOOK to the shipped codebook;
+# the engine's own fallback is the research project's path); ~2 min for both lengths.
+TQ_KV_V4=1 TQ_KV_T4=1 python3 tools/spec_paged_check.py --lib build-qwen/libforward_qwen.so \
+    --tqf /path/to/qwen3_8-27b-exl3-opt5.75-mtp.tqf --model-dir /path/to/Qwen3.8-27B --ctx 4096 --n 1,3,8 --no-pin
+TQ_KV_V4=1 TQ_KV_T4=1 python3 tools/spec_paged_check.py ... --ctx 32768 --n 1,3,8 --distinct 3 --no-pin
+
+# "bitwise": raw paged-decode logits of a build on fixed random tokens (N slots, 401 steps, saved from step 376 =
+# across the key-split merge at N = 8); dump two builds (or one build with a lever on and off) and diff the tensors
+# -> max |d| must be 0. This is how every lever above was gated.
+TQ_KV_V4=1 TQ_KV_T4=1 python3 tools/paged_logit_ab.py build-qwen/libforward_qwen.so a.pt --tqf /path/to/...-opt5.75-mtp.tqf --n 8
+TQ_KV_V4=1 TQ_KV_T4=1 TQ_GRAPH=0 TQ_GEMM_FORK=0 python3 tools/paged_logit_ab.py build-qwen/libforward_qwen.so b.pt --tqf ... --n 8
+python3 -c "import torch; a=torch.load('a.pt'); b=torch.load('b.pt'); print(max((a[p]-b[p]).abs().max().item() for p in a))"
+```
+
+The quality yardstick (KL / top-1 vs the bf16 original on the 197K held-out tokens, the FP8
+reference row, the engine-side runner, the paired block-bootstrap CI and the EvalPlus T1 driver)
+is in this repo — `tools/qwentin_e2e.py`, `tools/exl3_diff.py`, `tools/e2e_frontier.py`,
+`tools/dequant_fp8_to_bf16.py`, `tools/evalplus.sh` — with the protocol, the held-out corpus (a
+pinned vLLM commit, `--corpus`), the gate rule and the reference rows in
+[`docs/QUALITY.md`](../QUALITY.md); it needs the bf16 27B and exllamav3 on the box. The
+8-session load generator and the parking / prefix-cache probes (`eval/loadgen.py`,
+`eval/park_probe.py`, `eval/prefix_cache_probe.py`) stay in the research repository
+`kacper-daftcode/qwentin-internal`.

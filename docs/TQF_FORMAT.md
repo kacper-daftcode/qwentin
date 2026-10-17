@@ -139,7 +139,7 @@ when `src/forward_qwen.cu` is next touched (the engine is out of scope for this 
    the cost is one hash pass on the host).
 3. **Loader refusal.** Today `qwn_init` accepts any file with the magic and the right dimensions; a `-mtp.tqf` on
    `--spec` is caught by the server (warning, spec off), while a plain-FP8 file loads and runs on the FP8 kernels — a
-   larger, slower format than the FP6 the README documents — without any notice. Proposal: `qwn_init` returns a distinct error code and prints the reason
+   larger, slower format than the FP6 `docs/legacy-fp6.md` documents — without any notice. Proposal: `qwn_init` returns a distinct error code and prints the reason
    when (a) `format_version` is newer than supported, (b) `payload_bytes` ≠ the file size minus the header, (c) a
    required flag combination for the requested path is absent (`TQ_KV_T4`/`--spec` with no `0x1000`; the FP6 single-
    stream path with no `0x100`), (d) unknown flag bits are set in a version-2 file. The server surfaces the code in
