@@ -64,11 +64,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mtp_spec_smoke import load_lib, Eng, prefill, ck  # noqa: E402
+from serve_common import (BodyError, add_hardening_args, apply_socket_timeout, auth_ok, clamp_fields,  # noqa: E402
+                          clamp_max_tokens, read_json_body, unauthorized_body)
 from transformers import AutoTokenizer  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8000)
-ap.add_argument("--host", default="0.0.0.0")
+add_hardening_args(ap)   # --host (127.0.0.1; was 0.0.0.0 before 2026-10) --api-key --max-body-bytes --max-tokens-cap --socket-timeout
 ap.add_argument("--tqf", default=os.environ.get("TQ_MODEL_TQF",
                 "/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf"))
 ap.add_argument("--model-dir", default="/workspace/models/Qwen3.6-27B")
@@ -1090,13 +1092,23 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, extra_headers=()):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in extra_headers:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def _authorized(self):
+        """--api-key: every path but /health needs `Authorization: Bearer <key>`; answers 401 itself
+        (do_OPTIONS stays open: browsers send CORS preflights without credentials)."""
+        if auth_ok(self.headers, args.api_key, self.path):
+            return True
+        self._json(401, unauthorized_body(), extra_headers=[("WWW-Authenticate", "Bearer")])
+        return False
 
     def _do_responses(self, req):
         """POST /v1/responses: Codex-CLI-grade subset (message/function_call items,
@@ -1153,7 +1165,7 @@ class H(BaseHTTPRequestHandler):
         # does) get a budget that fits the thinking+answer pair; 4096 died
         # inside long research thinks (2026-08-18 marker incident). The
         # think-cap previously masked this by force-closing the think early.
-        max_new = int(req.get("max_output_tokens") or req.get("max_tokens") or 8192)
+        max_new, clamped_from = clamp_max_tokens(req.get("max_output_tokens") or req.get("max_tokens"), args.max_tokens_cap, 8192)
         stops = req.get("stop") or []
         if isinstance(stops, str):
             stops = [stops]
@@ -1312,6 +1324,7 @@ class H(BaseHTTPRequestHandler):
                                            thinking_primed=thinking_primed)
         except BrokenPipeError:
             return
+        stats.update(clamp_fields(clamped_from, args.max_tokens_cap))
         full = "".join(text_parts)
         for st in stops:
             if st and st in full:
@@ -1400,17 +1413,21 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._json(200, {"status": "ok"})
+        if not self._authorized():
+            return
         if self.path == "/v1/models":
             return self._json(200, {"object": "list", "data": [
                 {"id": args.model_name, "object": "model", "owned_by": "qwentin"}]})
         return self._json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
+        if not self._authorized():
+            return
         try:
-            n = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(n) or b"{}")
-        except Exception as e:
-            return self._json(400, {"error": {"message": f"bad json: {e}"}})
+            req = read_json_body(self, args.max_body_bytes)          # 411 / 413 / 400 before the body is read
+        except BodyError as e:
+            self.close_connection = True                             # the unread body is not drained
+            return self._json(e.status, e.body)
         chat = self.path.rstrip("/").endswith("/chat/completions")
         comp = self.path.rstrip("/").endswith("/completions") and not chat
         if self.path.rstrip("/").endswith("/responses"):
@@ -1426,7 +1443,7 @@ class H(BaseHTTPRequestHandler):
             warn = f"top_p={top_p} unsupported, clamped to 1.0"
         temp = float(req.get("temperature", 1.0 if chat else 1.0))
         seed = int(req.get("seed", int.from_bytes(os.urandom(4), "little")))
-        max_new = int(req.get("max_tokens") or req.get("max_completion_tokens") or 256)
+        max_new, clamped_from = clamp_max_tokens(req.get("max_tokens") or req.get("max_completion_tokens"), args.max_tokens_cap, 256)
         stops = req.get("stop") or []
         if isinstance(stops, str):
             stops = [stops]
@@ -1557,6 +1574,7 @@ class H(BaseHTTPRequestHandler):
                                            no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
                                            think_cap=_req_think_cap(req, thinking_primed),
                                            thinking_primed=thinking_primed)
+            stats.update(clamp_fields(clamped_from, args.max_tokens_cap))
             if stop_hit.is_set():
                 finish = "stop"
             final_delta = {}
@@ -1587,6 +1605,7 @@ class H(BaseHTTPRequestHandler):
                                        no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
                                            think_cap=_req_think_cap(req, thinking_primed),
                                            thinking_primed=thinking_primed)
+        stats.update(clamp_fields(clamped_from, args.max_tokens_cap))
         text = "".join(text_parts)
         for st in stops:
             if st and st in text:
@@ -1618,4 +1637,8 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    apply_socket_timeout(H, args.socket_timeout)
+    print(f"[serve] listening on {args.host}:{args.port} (model={args.model_name}; api key "
+          f"{'required on /v1/*' if args.api_key else 'none'}, max body {args.max_body_bytes} B, max_tokens cap "
+          f"{args.max_tokens_cap}, socket timeout {args.socket_timeout:.0f} s)", flush=True)
     ThreadingHTTPServer((args.host, args.port), H).serve_forever()

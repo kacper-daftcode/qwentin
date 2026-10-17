@@ -41,6 +41,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WAVE_MAX = 128   # prefill wave column cap = the fast activation quantizer's smem limit
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from serve_common import (BodyError, add_hardening_args, apply_socket_timeout, auth_ok, clamp_fields,  # noqa: E402
+                          clamp_max_tokens, read_json_body, unauthorized_body)
+
 
 def load_lib(path):
     L = ctypes.CDLL(path)
@@ -1000,15 +1004,26 @@ def make_handler(eng, tok, args):
         def log_message(self, *a):
             pass
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, extra_headers=()):
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in extra_headers:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorized(self):
+            """--api-key: every path but /health needs `Authorization: Bearer <key>`; answers 401 itself."""
+            if auth_ok(self.headers, args.api_key, self.path):
+                return True
+            self._json(401, unauthorized_body(), extra_headers=[("WWW-Authenticate", "Bearer")])
+            return False
+
         def do_GET(self):
+            if not self._authorized():
+                return
             if self.path.startswith("/v1/models"):
                 self._json(200, {"object": "list", "data": [{"id": args.model_name, "object": "model"}]})
             elif self.path.startswith("/health"):
@@ -1054,7 +1069,7 @@ def make_handler(eng, tok, args):
             else:
                 self._json(404, {"error": "not found"})
 
-        def _stream_tokens(self, req, cid, max_new, include_usage):
+        def _stream_tokens(self, req, cid, max_new, include_usage, clamped_from=None):
             # True token streaming: the engine thread pushes every generated id into req.tokens
             # (None = finished); text is re-decoded from the full id list and only the new suffix
             # is emitted, held back while it ends in an incomplete UTF-8 sequence.
@@ -1104,7 +1119,8 @@ def make_handler(eng, tok, args):
                 finish = "length" if gen >= max_new else "stop"
                 _sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                       "x_qwentin": {"prefix_cached_tokens": req.start, "slot": req.slot,
-                                    "server_ttft_s": round(req.t_first - req.t_submit, 3)}})
+                                    "server_ttft_s": round(req.t_first - req.t_submit, 3),
+                                    **clamp_fields(clamped_from, args.max_tokens_cap)}})
                 if include_usage:
                     _sse({**base, "choices": [],
                           "usage": {"prompt_tokens": req.n_prompt, "completion_tokens": gen,
@@ -1113,11 +1129,16 @@ def make_handler(eng, tok, args):
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
 
         def do_POST(self):
+            if not self._authorized():
+                return
             if not self.path.startswith("/v1/chat/completions") and not self.path.startswith("/v1/completions"):
                 self._json(404, {"error": "not found"}); return
-            n = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(n) or b"{}")
-            max_new = int(body.get("max_tokens", 128))
+            try:
+                body = read_json_body(self, args.max_body_bytes)      # 411 / 413 / 400 before the body is read
+            except BodyError as e:
+                self.close_connection = True                         # the unread body is not drained
+                self._json(e.status, e.body); return
+            max_new, clamped_from = clamp_max_tokens(body.get("max_tokens"), args.max_tokens_cap, 128)
             stream = bool(body.get("stream", False))
             is_chat = self.path.startswith("/v1/chat")
             tools = body.get("tools") or None
@@ -1150,7 +1171,7 @@ def make_handler(eng, tok, args):
                       f"stream {int(stream)} queued {len(eng.q)} active {len(eng.active)}", flush=True)
             include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
             if stream and is_chat and not tools:
-                self._stream_tokens(req, cid, max_new, include_usage); return
+                self._stream_tokens(req, cid, max_new, include_usage, clamped_from); return
             if not req.done.wait(timeout=args.timeout):
                 eng.cancel_queued(req)
                 self._json(504, {"error": "generation timeout"}); return
@@ -1197,10 +1218,12 @@ def make_handler(eng, tok, args):
                           "total_tokens": req.n_prompt + gen,
                           "prompt_tokens_details": {"cached_tokens": req.start}},
                 "x_qwentin": {"prefix_cached_tokens": req.start, "slot": req.slot,
-                              "server_ttft_s": round(req.t_first - req.t_submit, 3)},
+                              "server_ttft_s": round(req.t_first - req.t_submit, 3),
+                              **clamp_fields(clamped_from, args.max_tokens_cap)},
             }
             self._json(200, resp)
 
+    apply_socket_timeout(H, args.socket_timeout)
     return H
 
 
@@ -1220,7 +1243,8 @@ def serve(args):
           f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}; "
           f"decode steps per mixed wave {args.decode_steps_per_wave}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
-    print(f"listening on {args.host}:{args.port}  (model={args.model_name})", flush=True)
+    print(f"listening on {args.host}:{args.port}  (model={args.model_name}; api key {'required on /v1/*' if args.api_key else 'none'}, "
+          f"max body {args.max_body_bytes} B, max_tokens cap {args.max_tokens_cap}, socket timeout {args.socket_timeout:.0f} s)", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -1284,9 +1308,11 @@ def main():
     ap.add_argument("--page", type=int, default=128)
     ap.add_argument("--max-slots", type=int, default=12)
     ap.add_argument("--num-blocks", type=int, default=1024)
-    ap.add_argument("--host", default="127.0.0.1")
+    add_hardening_args(ap)        # --host (127.0.0.1) --api-key --max-body-bytes --max-tokens-cap --socket-timeout
     ap.add_argument("--port", type=int, default=8100)
-    ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--timeout", type=float, default=300.0,
+                    help="admission wait in seconds when all slots are busy (504 / a timeout event after it); the "
+                         "client socket's read/write timeout is --socket-timeout")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--bench-ns", default="1,2,4,8,16,32")

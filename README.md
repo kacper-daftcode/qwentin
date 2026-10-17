@@ -586,6 +586,16 @@ per request (`TQ_SERVE_LOG_ADMITS=0` silences the former). `--timeout` is the ad
 all slots are busy; `--park-ram-gb` the host-RAM budget for parked sessions (16.5 KiB/token + 80
 MiB of DeltaNet state each; a 117K-token session restores in well under a second at 37–45 GB/s).
 
+**Exposure.** Both servers bind `127.0.0.1` by default and carry the same request-side guards
+(`tools/serve_common.py`, unit-tested without a GPU in `tests/test_serve_common.py`): `--api-key KEY`
+makes every path except `/health` require `Authorization: Bearer KEY` (401 otherwise; `/spec` and
+`/v1/*` included), `--max-body-bytes` (32 MiB) refuses larger bodies with 413 before reading them,
+`--max-tokens-cap` (4096) clamps a request's `max_tokens` and reports the clamp in
+`x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (the response's `finish_reason` is then
+`length`), and `--socket-timeout` (600 s) closes client connections that stop sending a request or
+stop reading a stream. Serving on `--host 0.0.0.0` should always come with `--api-key` (and a reverse
+proxy for TLS — the servers speak plain HTTP). The engine itself is unchanged by any of these.
+
 ### Legacy single-user path: FP6 + MTP spec-decode (`serve_openai.py`)
 
 ```bash
@@ -605,7 +615,11 @@ CUDA_VISIBLE_DEVICES=0 TQ_CTX=262144 TQ_KV_Q4=1 TQ_EMBED_FP8=2 \
 
 Per-request stats are returned under `x_qwentin` (prefill seconds, accept-length, gen tok/s,
 prefix-cache hit). `--no-thinking` defaults `enable_thinking=false` (recommended for agents — it
-keeps the prefix cache valid across turns).
+keeps the prefix cache valid across turns). Since 2026-10 this server also binds `127.0.0.1` by
+default (it was `0.0.0.0`; pass `--host 0.0.0.0 --api-key KEY` to expose it) and takes the same
+`--api-key` / `--max-body-bytes` / `--max-tokens-cap` / `--socket-timeout` guards as the batched
+server ("Exposure" above). Note the cap applies to the Responses API's own 8192-token default
+budget too — raise `--max-tokens-cap` to 8192 or more for Codex-style clients that rely on it.
 
 #### Reservoir Dogs: spec-round watchdog + fallback drafter (default ON)
 
@@ -674,7 +688,8 @@ Server arguments (`tools/serve_batched.py --help` has the full text):
 | `--embed-host` / `--no-embed-host`, `--mtp` | on, off | `TQ_EMBED_HOST`; `--mtp` loads the MTP head without `--spec` |
 | `--pdl` / `--no-pdl` | on | `TQ_PDL=1` |
 | `--wide-attn-mma` / `--no-wide-attn-mma` | on | tensor-core ragged prefill attention for the waves (`TQ_WIDE_ATTN_MMA`; needs `--page >= 128`); without it the waves use the scalar decode kernel per column (~6× slower prefill) |
-| `--timeout s`, `--model-name`, `--host`, `--port` | 300, qwentin-qwen3.6-27b-batched, 127.0.0.1, 8100 | admission wait, the `model` name clients send, bind address |
+| `--timeout s`, `--model-name`, `--host`, `--port` | 300, qwentin-qwen3.6-27b-batched, 127.0.0.1, 8100 | admission wait when all slots are busy, the `model` name clients send, bind address (loopback by default), port |
+| `--api-key KEY`, `--max-body-bytes N`, `--max-tokens-cap N`, `--socket-timeout s` | unset, 32 MiB, 4096, 600 | request-side hardening, shared with `serve_openai.py` (`tools/serve_common.py`): with a key every path but `/health` needs `Authorization: Bearer KEY` (401 otherwise); bodies above the limit get 413 before being read (411 without `Content-Length`); a request's `max_tokens` above the cap is clamped and the clamp reported as `x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (finish_reason `length`); a client socket that stops sending or stops reading is closed after the timeout |
 | `--selftest`, `--bench ...` | — | staggered join/leave correctness vs single-stream; steady-state paged decode bench (`--bench-p` prompt tokens, `--bench-ns` slot counts) — both run with spec off |
 
 <sub>Provenance: `tools/serve_batched.py` at this commit (`--help` is authoritative); the defaults are the ones served on 2026-10-17 with engine `2cf671c` / library md5 `e454a29c3caf` (CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0) and gated in `docs/evidence/cand7-all.log`.</sub>
