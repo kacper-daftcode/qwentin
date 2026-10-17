@@ -1,0 +1,62 @@
+[final-e2e] start 01:44:18  lib c9d5269c2963 = 11f5879 serve_batched: --dstate {fp32,bf16,fp16,bf
+== 4K: prefill mode (48 x 4096) and decode mode (8 rows)   01:44:18
+== qw-final-def_4k_prefill on GPU 0 01:44:18
+   KL 0.00235  top1 0.9898  ppl x1.0013  kl16 0.00235
+   exit 0 01:46:12
+== qw-final-def_4k_dec8 on GPU 0 01:46:12
+   KL 0.00406  top1 0.9858  ppl x1.0025  kl16 0.00406
+   exit 0 01:47:42
+[e2e] qw-final-def_4k_prefill: per-token KL bitwise vs qw-dstate-f32_4k_prefill: True  top1 identical: True  (n 196560 / 196560)
+[e2e] qw-final-def_4k_dec8: per-token KL bitwise vs qw-dstate-f32_4k_dec8: True  top1 identical: True  (n 32760 / 32760)
+== qw-final-all_4k_prefill on GPU 0 01:47:44
+   KL 0.00236  top1 0.9896  ppl x1.0012  kl16 0.00236
+   exit 0 01:49:36
+== qw-final-all_4k_dec8 on GPU 0 01:49:36
+   KL 0.00404  top1 0.9858  ppl x1.0021  kl16 0.00404
+   exit 0 01:51:12
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_4k_prefill          4096  0.00235                                  98.98                                            
+qw-final-all_4k_prefill          4096  0.00236   +0.00001 [-0.00002,+0.00005]   98.96      -0.02 [-0.05,+0.01]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_4k_dec8             4096  0.00406                                  98.58                                            
+qw-final-all_4k_dec8             4096  0.00404   -0.00002 [-0.00018,+0.00017]   98.58      +0.00 [-0.09,+0.10]                   
+== 32K: prefill mode (6 x 32768) and decode mode (6 rows)   01:51:14
+== qw-final-def_32k_prefill on GPU 0 01:51:14
+   KL 0.00220  top1 0.9908  ppl x1.0010  kl16 0.00220
+   exit 0 01:53:20
+== qw-final-def_32k_dec6 on GPU 0 01:53:20
+   KL 0.00269  top1 0.9896  ppl x1.0015  kl16 0.00269
+   exit 0 02:04:51
+[e2e] qw-final-def_32k_prefill: per-token KL bitwise vs qw-dstate-f32_32k_prefill: True  top1 identical: True  (n 196602 / 196602)
+[e2e] qw-final-def_32k_dec6: per-token KL bitwise vs qw-dstate-f32_32k_dec6: True  top1 identical: True  (n 196602 / 196602)
+== qw-final-all_32k_prefill on GPU 0 02:04:53
+   KL 0.00219  top1 0.9906  ppl x1.0011  kl16 0.00219
+   exit 0 02:07:00
+== qw-final-all_32k_dec6 on GPU 0 02:07:00
+   KL 0.00266  top1 0.9895  ppl x1.0015  kl16 0.00266
+   exit 0 02:18:07
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_prefill        32768  0.00220                                  99.08                                            
+qw-final-all_32k_prefill        32768  0.00219   -0.00001 [-0.00005,+0.00003]   99.06      -0.01 [-0.04,+0.02]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_dec6           32768  0.00269                                  98.96                                            
+qw-final-all_32k_dec6           32768  0.00266   -0.00003 [-0.00008,+0.00002]   98.95      -0.01 [-0.05,+0.02]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_prefill        32768  0.00209                                  99.09                                            
+qw-final-all_32k_prefill        32768  0.00208   -0.00001 [-0.00006,+0.00003]   99.07      -0.02 [-0.05,+0.01]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_dec6           32768  0.00255                                  98.97                                            
+qw-final-all_32k_dec6           32768  0.00253   -0.00002 [-0.00007,+0.00004]   98.96      -0.01 [-0.05,+0.03]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_prefill        32768  0.00215                                  99.08                                            
+qw-final-all_32k_prefill        32768  0.00215   +0.00001 [-0.00003,+0.00005]   99.07      -0.01 [-0.05,+0.04]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_dec6           32768  0.00267                                  98.96                                            
+qw-final-all_32k_dec6           32768  0.00261   -0.00006 [-0.00013,+0.00001]   98.96      +0.00 [-0.05,+0.06]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_prefill        32768  0.00196                                  99.15                                            
+qw-final-all_32k_prefill        32768  0.00199   +0.00003 [-0.00001,+0.00008]   99.15      -0.01 [-0.05,+0.04]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_32k_dec6           32768  0.00236                                  99.06                                            
+qw-final-all_32k_dec6           32768  0.00236   -0.00000 [-0.00008,+0.00006]   99.04      -0.02 [-0.09,+0.06]                   
+[final-e2e] done 02:18:14

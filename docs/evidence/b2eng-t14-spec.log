@@ -1,0 +1,27 @@
+== p24 + spec: opt-5.75 -mtp4 + trellis, 1 slot, 2000 blocks 01:18:05
+   server up after 10s
+   process 23452 MiB at start
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 161.3 (min 161.3, max 161.3), aggregate 161.3; 300 tokens in 1.9s; rounds 82 steps 82 tokens/round 3.65; ttf
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 62.2 (min 62.2, max 62.2), aggregate 62.2; 300 tokens in 4.9s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=240000 N=1 spec=on: per-stream tok/s p50 112.8 (min 112.8, max 112.8), aggregate 112.8; 300 tokens in 3.1s; rounds 89 steps 89 tokens/round 3.36; tt
+[speed] ctx=240000 N=1 spec=off: per-stream tok/s p50 48.0 (min 48.0, max 48.0), aggregate 48.0; 300 tokens in 6.6s; rounds 0 steps 299 tokens/round None; ttft 
+   needle exit 0 01:39:00
+ 240000    1/1    1/1    1/1  3/3
+wall 742.7s, 6 probes
+wrote runs/needle-b2eng-t14-p24s.json
+   process 23664 MiB after
+3, 2 MiB
+== p16 + spec: t45-s425 -mtp4 + trellis, 1 slot, 500 blocks 01:39:08
+   server up after 10s
+   process 15838 MiB at start
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 171.7 (min 171.7, max 171.7), aggregate 171.7; 300 tokens in 1.8s; rounds 86 steps 86 tokens/round 3.48; ttf
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 73.2 (min 73.2, max 73.2), aggregate 73.2; 300 tokens in 4.2s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=60000 N=1 spec=on: per-stream tok/s p50 164.8 (min 164.8, max 164.8), aggregate 164.8; 300 tokens in 1.9s; rounds 86 steps 86 tokens/round 3.48; ttf
+[speed] ctx=60000 N=1 spec=off: per-stream tok/s p50 70.1 (min 70.1, max 70.1), aggregate 70.1; 300 tokens in 4.4s; rounds 0 steps 299 tokens/round None; ttft p
+   needle exit 0 01:44:05
+  60000    1/1    1/1    1/1  3/3
+wall 164.2s, 6 probes
+wrote runs/needle-b2eng-t14-p16s.json
+   process 16038 MiB after
+3, 2 MiB
+[t14s] done 01:44:13

@@ -1,0 +1,111 @@
+{
+ "ref": "/mnt/nvme/models/Qwen3.8-27B",
+ "model": "/mnt/nvme/models/qwen3_8-27b-exl3-opt5.75-mtp.tqf",
+ "sim_kv": null,
+ "sim_w": null,
+ "sim_embed": null,
+ "sim_kv_layer": [],
+ "engine": {
+  "lib": "/mnt/nvme/qwen256k/qwentin-dstate/build-qwen-dstate/libforward_qwen.so",
+  "tqf": "/mnt/nvme/models/qwen3_8-27b-exl3-opt5.75-mtp.tqf",
+  "env": {
+   "TQ_KV_T4_CODEBOOK": "/mnt/nvme/qwen256k/analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32",
+   "TQ_EMBED_HOST": "0",
+   "TQ_DSTATE_BF16": "0",
+   "TQ_PDL": "1",
+   "TQ_EMBED_FP8": "1",
+   "TQ_KV_V4": "1",
+   "TQ_KV_T4": "1",
+   "TQ_CTX": "262144",
+   "TQ_KV_Q4": "1",
+   "TQ_PAGED_ATTN_MMA": "1",
+   "TQ_WIDE_ATTN_MMA": "1",
+   "TQ_NO_MTP": "1"
+  },
+  "decode_from": 4096,
+  "batch": 1,
+  "head_cols": 8,
+  "page": 128,
+  "wave_max": 128,
+  "seed_argmax_mismatch": 0
+ },
+ "tokens": 196608,
+ "seq": 4096,
+ "seed": 12345,
+ "rows": 48,
+ "ref_nll": 0.58277630147466,
+ "ref_ppl": 1.7910039015116381,
+ "ref_label_top1": 0.8596357346357346,
+ "q_nll": 0.5840728782967478,
+ "q_ppl": 1.793327581748045,
+ "q_label_top1": 0.8594729344729345,
+ "ppl_ratio": 1.0012974177412153,
+ "top1_agree": 0.989784300327301,
+ "topk_agree": {
+  "1": 0.9897842897842898,
+  "2": 0.9082824582824582,
+  "3": 0.7934116809116809,
+  "4": 0.6662698412698412,
+  "5": 0.5402421652421653
+ },
+ "kl_mean": 0.0023525846442667767,
+ "kl_rev_mean": 0.002401444114738551,
+ "kl_median": 6.114770076237619e-05,
+ "kl_p90": 0.004649380687624216,
+ "kl_p99": 0.034569256007671356,
+ "kl16_mean": 0.0023545351051942826,
+ "top1_agree16": 0.9897639155387878,
+ "ref_logits_dtype": "torch.float16",
+ "by_mode": {
+  "prefill": {
+   "n": 196560,
+   "kl_mean": 0.0023525846442667767,
+   "top1_agree": 0.989784300327301
+  }
+ },
+ "by_position": {
+  "[0,512)": {
+   "n": 24576,
+   "kl_mean": 0.0026791777927428484,
+   "top1_agree": 0.9874674677848816
+  },
+  "[512,2048)": {
+   "n": 73728,
+   "kl_mean": 0.002548381220549345,
+   "top1_agree": 0.9891628623008728
+  },
+  "[2048,4096)": {
+   "n": 98256,
+   "kl_mean": 0.0021239775232970715,
+   "top1_agree": 0.9908300638198853
+  }
+ },
+ "by_ref_confidence": {
+  "[0.00,0.25)": {
+   "frac_tokens": 0.029075091575091576,
+   "kl_mean": 0.008836849592626095,
+   "top1_agree": 0.8799650073051453
+  },
+  "[0.25,0.50)": {
+   "frac_tokens": 0.07071632071632071,
+   "kl_mean": 0.009711089543998241,
+   "top1_agree": 0.9284172654151917
+  },
+  "[0.50,0.75)": {
+   "frac_tokens": 0.0966066341066341,
+   "kl_mean": 0.007823577150702477,
+   "top1_agree": 0.9835167527198792
+  },
+  "[0.75,0.95)": {
+   "frac_tokens": 0.12696377696377698,
+   "kl_mean": 0.003971574828028679,
+   "top1_agree": 0.9994790554046631
+  },
+  "[0.95,1.00)": {
+   "frac_tokens": 0.6766381766381766,
+   "kl_mean": 0.0002200057206209749,
+   "top1_agree": 0.9999924898147583
+  }
+ },
+ "seconds": 116.76624822616577
+}

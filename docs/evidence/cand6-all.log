@@ -1,0 +1,46 @@
+[cand6-all] start 01:00:57; cand c9d5269c2963 = 11f5879 serve_batched: --dstate {fp32,bf16,fp16,bf16+8,fp16s; base (cand-1018) e388864ae443
+== gate 1: trellis pool, dstate off, paged_logit_ab N=3/8 -- candidate bitwise == cand-1018   01:00:57
+[plab] N=3: 25 steps, candidate (dstate off) bitwise identical to cand-1018: True (max |d| 0)
+[plab] N=8: 25 steps, candidate (dstate off) bitwise identical to cand-1018: True (max |d| 0)
+[gate1] PASS
+== gate 2: TQ_DSTATE_BF16=4 (fp16 + SR), TQ_KV_T4=1 -- spec exactness (verify == decode, --no-pin), 4K + 32K   01:01:55
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: the served line + --dstate fp16sr --num-blocks 4500: needle 32K + 128K, spec A/B 10, speed N=1/8   01:03:37
+   server up after 10 s, pid 1274123, 29894 MiB
+batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/s
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=16.162s e2e=16.207s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=16.222s e2e=16.266s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=16.133s e2e=16.198s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=87.814s e2e=87.866s ans='HE-215844-MW' exp=['HE-215844-MW'] 
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=87.881s e2e=87.932s ans='AB-416549-JJ' exp=['AB-416549-JJ'] 
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=87.874s e2e=87.929s ans='ND-297860-GH' exp=['ND-297860-GH'] 
+wall 312.8s, 6 probes
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2587 tokens in 22.0s = 117.5 tok/s (concurrency 1); per-request mean 117.4 tok/s; rounds 767, tokens/round 3.36
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2587 tokens in 45.4s = 57.0 tok/s (concurrency 1); per-request mean 56.5 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 168.6 (min 168.6, max 168.6), aggregate 168.6; 300 tokens in 1.9s; rounds 81 steps 81 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 69.9 (min 67.3, max 76.0), aggregate 562.4; 2400 tokens in 5.4s; rounds 143 steps 143 tokens/round
+   (served line: 163.4 / 72.1 tok/s per stream at N=1/8; the dstate thread measured -0.38 ms per step at N=8 with fp16sr)
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1; speed rc 0
+[gate3] PASS
+== gate 3b: the served line, pure defaults on this binary + tools (dstate off): needle 32K, speed N=1   01:12:45
+   server up after 10 s, pid 1279738, 29930 MiB
+batched server: pool blocks=4100 page=128 max_slots=12 free=4100; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 524800 pooled tokens; DeltaNet state fp32 152 MiB/sl
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=16.091s e2e=16.138s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=16.034s e2e=16.077s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=16.008s e2e=16.073s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+wall 48.4s, 3 probes
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 168.6 (min 168.6, max 168.6), aggregate 168.6; 300 tokens in 1.9s; rounds 82 steps 82 tokens/round
+   server log error lines: 0; needle PASS 3 FAIL 0; speed rc 0
+[gate3b] PASS
+== ALL PASS; waiting for cand-1018 to land (logs/cand5-all.log)   01:14:04
+== landing cand-1019 on main 14be568   01:14:04
+patches/0058-TQ_DSTATE_BF16-the-paged-DeltaNet-recurrent-state-st.patch
+patches/0059-TQ_DSTATE_BF16-3-bf16-8-extra-mantissa-bits-24-bit-3.patch
+patches/0060-serve_batched-dstate-fp32-bf16-fp16-bf16-8-fp16sr-TQ.patch
+[cand6-all] LANDED 01:14:04: build-qwen/libforward_qwen.so = c9d5269c2963 (old .14be568); main = 11f5879 serve_batched: --dstate {fp32,bf16,fp16,bf16+8,fp16s; --dstate default fp32 (decision (c): fp16sr)
+[cand6-all] rollback: cp /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.14be568 /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && git -C /mnt/nvme/qwen256k/qwentin reset --hard 14be568

@@ -1,0 +1,57 @@
+[cand5-all] start 00:16:07; cand e388864ae443 = 14be568 EXL3 wide GEMM: TQ_EXL3_WIDE_NG16 default 1 (128-tok; served 2bb8e6d81d9e = 0f74130 TQ_T4_ATTN_F16 default 0 on main pending t
+== gate 1 / 1b: trellis pool, paged_logit_ab N=3/8 -- candidate (defaults) and candidate (graph+fork) bitwise == served   00:16:07
+[plab] N=3 cand  : 25 steps, bitwise identical to the served library: True (max |d| 0)
+[plab] N=3 candgf: 25 steps, bitwise identical to the served library: True (max |d| 0)
+[plab] N=8 cand  : 25 steps, bitwise identical to the served library: True (max |d| 0)
+[plab] N=8 candgf: 25 steps, bitwise identical to the served library: True (max |d| 0)
+[gate1] PASS
+== gate 2: TQ_T4_ATTN_F16=1 TQ_GRAPH=1 TQ_GEMM_FORK=1 -- spec exactness (verify == decode, --no-pin), trellis pool, 4K + 32K   00:17:31
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE, pure defaults (what lands): needle 32K + 128K, speed N=1/8   00:19:17
+   server up after 10 s, pid 1227889, 29930 MiB
+batched server: pool blocks=4100 page=128 max_slots=12 free=4100; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 524800 pooled tokens; speculativ
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=16.021s e2e=16.073s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=16.022s e2e=16.065s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=16.0s e2e=16.066s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=87.541s e2e=87.592s ans='HE-215844-MW' exp=['HE-215844-MW'] 
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=87.366s e2e=87.418s ans='AB-416549-JJ' exp=['AB-416549-JJ'] 
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=87.384s e2e=87.435s ans='ND-297860-GH' exp=['ND-297860-GH'] 
+wall 311.2s, 6 probes
+   (cand3 10-16: 32K TTFT 18.1 s, 128K 97.6-98.2 s; cand4: 32K 17.1 s -- the prefill levers should show here)
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 168.7 (min 168.7, max 168.7), aggregate 168.7; 300 tokens in 1.9s; rounds 82 steps 82 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 71.2 (min 66.2, max 80.8), aggregate 573.2; 2400 tokens in 5.2s; rounds 140 steps 140 tokens/round
+   (served line 10-16: 163.4 / 72.1 tok/s per stream at N=1/8)
+   server log error lines: 0; needle PASS 6 FAIL 0; speed rc 0
+[gate3] PASS
+== gate 4: the served line + TQ_T4_ATTN_F16=1 TQ_GRAPH=1 TQ_GEMM_FORK=1: needle 32K, spec A/B 10, speed N=1/8   00:27:14
+   server up after 10 s, pid 1233055, 29930 MiB
+batched server: pool blocks=4100 page=128 max_slots=12 free=4100; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 524800 pooled tokens; speculativ
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=16.032s e2e=16.075s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=16.007s e2e=16.05s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=16.01s e2e=16.073s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+wall 48.3s, 3 probes
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2586 tokens in 21.4s = 120.7 tok/s (concurrency 1); per-request mean 121.3 tok/s; rounds 789, tokens/round 3.26
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2586 tokens in 43.7s = 59.1 tok/s (concurrency 1); per-request mean 58.5 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 166.3 (min 166.3, max 166.3), aggregate 166.3; 300 tokens in 1.9s; rounds 84 steps 84 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 75.9 (min 69.8, max 90.0), aggregate 615.4; 2400 tokens in 4.9s; rounds 143 steps 143 tokens/round
+   (cand4 with TQ_T4_ATTN_F16=1 alone: 165.5 / 77.8; graph thread's pair alone @32K N=1: 169.5)
+   server log error lines: 0 (graph lines 0); needle PASS 3 FAIL 0; A/B identical 10/10: 1; speed rc 0
+[gate4] PASS
+== ALL PASS -> landing cand-1018 on main   00:31:54
+patches/0048-paged-decode-step-as-a-CUDA-graph-TQ_GRAPH-1-default.patch
+patches/0049-TQ_GRAPH-the-verify-wave-and-the-MTP-draft-as-graphs.patch
+patches/0050-TQ_GEMM_FORK-1-default-off-the-2nd-3rd-Linear-of-an-.patch
+patches/0051-graph_capture-a-buffer-grown-inside-the-capture-drop.patch
+patches/0052-TQ_GRAPH-levels-1-the-paged-decode-step-as-a-graph-2.patch
+patches/0053-EXL3-wide-GEMM-128-token-units-NG-16-at-one-block-pe.patch
+patches/0054-qwn_paged_prefill_batch-TQ_WAVE_MAX-256-EXL3-only-li.patch
+patches/0055-EXL3-wide-GEMM-paired-codeword-decode-for-the-wide-u.patch
+patches/0056-bf16-in_proj_b-a-at-prefill-N-4-rows-per-block-in-wa.patch
+patches/0057-EXL3-wide-GEMM-TQ_EXL3_WIDE_NG16-default-1-128-token.patch
+[cand5-all] LANDED 00:31:54: build-qwen/libforward_qwen.so = e388864ae443 (old .0f74130); main = 14be568 EXL3 wide GEMM: TQ_EXL3_WIDE_NG16 default 1 (128-tok
+[cand5-all] rollback: cp /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.0f74130 /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && git -C /mnt/nvme/qwen256k/qwentin reset --hard 0f74130

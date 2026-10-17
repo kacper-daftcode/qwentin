@@ -1,0 +1,17 @@
+[p16b] start 01:17:46
+== t45-s425 -mtp4 + trellis + spec, 2 slots, 400 blocks = 51200 tokens 01:17:46
+   server up after 10s
+   process 15746 MiB at start
+   park_probe exit 0 (3/3 PASS)
+   process 16000 MiB after the park probe (ring allocated)
+   needle 49152 exit 0 01:19:38:  48k 1/1 1/1 1/1 3/3;
+[   48k depth=0.95 rep=0] PASS prompt=48975 ttft=25.524s e2e=25.562s ans='CR-581935-BB' exp=['CR-581935-BB'] 
+[   48k depth=0.50 rep=0] PASS prompt=48982 ttft=25.53s e2e=25.568s ans='RD-844167-UB' exp=['RD-844167-UB'] 
+[   48k depth=0.05 rep=0] PASS prompt=48972 ttft=25.53s e2e=25.569s ans='VC-825886-FF' exp=['VC-825886-FF'] 
+   process 16006 MiB after the needle at 49152
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 184.1 (min 184.1, max 184.1), aggregate 184.1; 300 tokens in 1.7s; rounds 86 steps 86 tokens/round 3.48; ttf
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 75.9 (min 75.9, max 75.9), aggregate 75.9; 300 tokens in 4.0s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=49152 N=1 spec=on: per-stream tok/s p50 172.8 (min 172.8, max 172.8), aggregate 172.8; 300 tokens in 1.8s; rounds 89 steps 89 tokens/round 3.36; ttf
+[speed] ctx=49152 N=1 spec=off: per-stream tok/s p50 73.7 (min 73.7, max 73.7), aggregate 73.7; 300 tokens in 4.2s; rounds 0 steps 299 tokens/round None; ttft p
+   process 16006 MiB after spec_speed
+[p16b] done 01:21:24

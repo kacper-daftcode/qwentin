@@ -20,6 +20,8 @@ memory was found:
 | Speculative drafter | 0.85 GB bf16 MTP head | **0.25 GB** | the model's own multi-token-prediction head, EXL3-quantized at 4 bpw; the verified output is bit for bit the plain decode's |
 | **Total** | | **29.9 GB for 12 sessions, each up to 256K** | |
 
+<sub>Provenance: engine `2cf671c` (`src/forward_qwen.cu`; later commits are docs / tools), library `build-qwen/libforward_qwen.so` md5 `e454a29c3caf`, CUDA 13.1 (nvcc `cuda_13.1.r13.1/compiler.37061995_0`), driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0, measured 2026-10-17 — `docs/evidence/cand7-all.log` gate 3 (29 894 MiB; the startup line's 16.50 KiB/token and 80 MiB/slot); the bf16 / stock column: `docs/evidence/baselines-vllm-20261017.md`; the parking GB/s and the drafter's 0.25 GB: `ASSUMPTIONS.md` of the research repo. Cell-by-cell map: `docs/evidence/README.md`.</sub>
+
 The speed side came from the same toolbox: speculative decoding through the paged batched server
 (2.6× per stream), fp16 staged trellis attention, the decode step as one CUDA graph with concurrent
 GEMM groups, 128-token prefill GEMM units — **167 tok/s per stream at 32K, 133 at 128K, 12 sessions
@@ -58,7 +60,11 @@ quality vs the bf16 original           →  KL 0.0022–0.0027, top-1 99.0–99.
 Sources for every number: the gate log of the exact served line (`logs/cand7-all.log`), the
 speed table (`logs/final-speed.log`), the quality yardstick (`logs/final-e2e.log`), the mixed
 prefill/decode load (`logs/final-t5.log`) and the 16 GB check (`logs/p16-check.log`) in the
-research repository (`kacper-daftcode/qwentin-internal`, `ASSUMPTIONS.md` and `notes/`).
+research repository (`kacper-daftcode/qwentin-internal`, `ASSUMPTIONS.md` and `notes/`) — copied
+verbatim into [`docs/evidence/`](docs/evidence/README.md) of this repo together with the scripts
+that produced them, the vLLM baseline note and a cell-by-cell map from each README number to its
+log line. Every table below carries a one-line provenance footer (engine commit, library md5,
+toolchain, date, log).
 
 ## Why it's interesting
 
@@ -90,6 +96,8 @@ and caveats in `notes/baselines-vllm-20261017.md` of the research repo):
 | Needle-in-a-repository (3 depths, 3 decoys) | 6/6 at 32K and 128K | 6/6 | 6/6 | 4/4 @239k |
 | Decode under a concurrent long prefill (8-session mix) | 40 / 25 / 43 tok/s per client (32K / 96K / 160K classes) | — | — | — |
 
+<sub>Provenance: qwentin column — engine `2cf671c`, library md5 `e454a29c3caf` (`docs/evidence/cand7-all.log`) and `c9d5269c2963` run with the `2cf671c` defaults as flags (`docs/evidence/final-speed.log` (R), `final-t5.log` g1, `final-e2e.log`; bitwise the same path, cand7 gate 1), CUDA 13.1 (nvcc `cuda_13.1.r13.1/compiler.37061995_0`), driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0, 2026-10-17; vLLM columns — `docs/evidence/baselines-vllm-20261017.md` (vLLM `0.32.0rc1.dev281`, image `nightly-49cb2bbf…`, same cards, same day); quality cells — `docs/evidence/e2e/*.json` via `tools/e2e_frontier.py`; the 2026-08 column — the 2026-08 README (no 2026-10 log).</sub>
+
 Reading the table honestly: on one card qwentin holds **2–3.9× the context** of stock vLLM at
 **FP8 quality instead of NVFP4**, decodes **2.2× faster per stream** with speculative decoding
 (equal without it: the trellis GEMV is as memory-bound as the FP4 one), and is the only one of
@@ -114,6 +122,8 @@ in `ASSUMPTIONS.md` "16 GiB variant, exact"):
 | Needle | 3/3 at 48K; 3/3 at 53K / 48K / 43K on the 10-16 binary | — |
 | Quality vs the bf16 original | weights 0.0110 / 97.9 %; with FP4 K+V 0.0130 / 97.7 % (trellis KV end to end: *to be measured*; it costs less than FP4 K+V) — better than the FP6 build's 0.0139 / 97.4 % on the same yardstick | — |
 | Weights on the device | ~14 GB (the `-mtp4.tqf` is 16.7 GB) | — |
+
+<sub>Provenance: `docs/evidence/p16-check.log` + `docs/evidence/scripts/p16-check.sh` (2026-10-17 01:17 UTC; library md5 `c9d5269c2963` = commit `11f5879` with that binary's own defaults — fp32 DeltaNet state, `TQ_T4_ATTN_F16` / `TQ_GRAPH` / `TQ_GEMM_FORK` unset; see the note in `docs/evidence/README.md`), CUDA 13.1 (nvcc `cuda_13.1.r13.1/compiler.37061995_0`), driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0; the quality cells: the exllamav3-simulation rows of `ASSUMPTIONS.md` (research repo); the vLLM cell: `docs/evidence/baselines-vllm-20261017.md`.</sub>
 
 **One 24 GB card** holds a **full 256K single session at FP8 quality** (opt-5.75 + trellis KV,
 1 slot, `--num-blocks 2000`): 23 452–23 664 MiB process, 161 tok/s @32K and 113 tok/s @240K with
@@ -270,6 +280,8 @@ through the HTTP server with the exact line in "Serve" (`tools/spec_speed.py`;
 | 32K, spec off | 65 | 62 | 56 | 47 | 377 tok/s |
 | 128K, spec on | **133** | **111** | | | |
 
+<sub>Provenance: engine `2cf671c`, library md5 `e454a29c3caf` (`docs/evidence/cand7-all.log` gate 3: 166.9 / 80.6 tok/s @32K N = 1 / 8, 132.8 @128K — the N = 1, N = 8 and 128K N = 1 cells) and `c9d5269c2963` with the `2cf671c` defaults as flags (`docs/evidence/final-speed.log` block (R): every other cell, 165.3 / 143.0 / 109.0 / 78.8 on, 65.0 / 61.8 / 56.0 / 47.0 off, 131.7 / 111.4 @128K), CUDA 13.1 (nvcc `cuda_13.1.r13.1/compiler.37061995_0`), driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0, 2026-10-17.</sub>
+
 ~3.4 accepted tokens per speculative round at K = 4 (10 prompts × 300 tokens: 121 vs 59 tok/s
 per request, outputs 10/10 identical with spec off). Cold prefill = time to first token through
 the server: **15.9 s at 32K** (32 596 tokens) and **86.6 s at 128K** (130 905 tokens), needle
@@ -317,6 +329,8 @@ is the second turn on the same conversation (prefix cache hit, only the suffix p
 |   128k  | 25.1 | 122.7 / **113.6-140.1*** | 1399 (116 s) | 0.35 s |
 |   243k  | ~26-28 | 111.8 / ~105.6 | 826 (294 s) | 0.87 s |
 
+<sub>Provenance: the 2026-08 FP6 build as published in the 2026-08 README (CUDA 13.3, driver 595, RTX 5090 at stock power, `tools/bench_coding.py`); that build's commit, library md5 and gate logs are not in `docs/evidence/` (the 2026-10 pack covers the batched server only) — the row is historical, not re-measured on engine `2cf671c`.</sub>
+
 \* 128k+ follow-up decode is 113.6 at depth 6 and **140.1 tok/s at `--depth 8`**; for
 cold 128k keep depth 6.
 
@@ -341,6 +355,8 @@ prefills only the new suffix in **0.20 s** (32k conversation).
 |   128k  | 25.5 | 115 |
 |   200k  | 27.9 | 108 |
 |   245k  | 28.0 | ~108 |
+
+<sub>Provenance: the 2026-08 FP6 build on an RTX PRO 6000 Blackwell, as published in the 2026-08 README (CUDA 13.3, driver 595); no log in `docs/evidence/`, not re-measured on engine `2cf671c`.</sub>
 
 Short-context rows and cold prefill are within a few percent of the 5090 (same
 silicon class). These rows predate the one-wave grid sizing (measured at the old
@@ -396,6 +412,8 @@ and scores refusal compliance + long-form loop stability):
 | 0.40-0.44 | 2/6 | clean |
 | **0.47** | **0/6** | clean |
 | 0.50-0.65 | 0/6 | clean |
+
+<sub>Provenance: `tools/bark_autotune.py` on the 2026-08 FP6 build (CUDA 13.3, driver 595), 2026-08-16, as published in the 2026-08 README; no log in `docs/evidence/`, not re-measured on engine `2cf671c` (the batched server does not install the hook).</sub>
 
 0.47 is the measured floor on Qwen3.8-27B/FP6 (2026-08-16) and the ship default. The Dogs
 keep watching the drafter through it all: if an aggressive scale hurts accept-length,
@@ -632,6 +650,8 @@ from its arguments unless they are already in the environment):
 | `TQ_ATTN_MMA=1`, `TQ_ATTN_MMA_PAIR=0`, `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN`, `TQ_ATTN_MMA_GROUP2=0`, `TQ_WIDE_CONV=0` | legacy | the single-stream path's attention / conv variants of the 2026-08 README (all default on; the =0 forms are bit-identical fallbacks) |
 | `TQ_PAGED_TOPK_PAGES` | 0 | Quest-style page top-k for the decode attention (built, measured to fail the FP8 gate below ~75 % of the pages; keep 0; not ported to the trellis pool) |
 
+<sub>Provenance: flag names and defaults are those of `src/forward_qwen.cu` at engine `2cf671c` (library md5 `e454a29c3caf`, CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04); the measured effects quoted per row come from the landing gates `docs/evidence/cand4-all.log` … `cand7-all.log` and `ASSUMPTIONS.md` (research repo), 2026-10-16/17, torch 2.14.0+cu130, transformers 5.17.0.</sub>
+
 Server arguments (`tools/serve_batched.py --help` has the full text):
 
 | Argument | Default | Meaning |
@@ -651,6 +671,8 @@ Server arguments (`tools/serve_batched.py --help` has the full text):
 | `--wide-attn-mma` / `--no-wide-attn-mma` | on | tensor-core ragged prefill attention for the waves (`TQ_WIDE_ATTN_MMA`; needs `--page >= 128`); without it the waves use the scalar decode kernel per column (~6× slower prefill) |
 | `--timeout s`, `--model-name`, `--host`, `--port` | 300, qwentin-qwen3.6-27b-batched, 127.0.0.1, 8100 | admission wait, the `model` name clients send, bind address |
 | `--selftest`, `--bench ...` | — | staggered join/leave correctness vs single-stream; steady-state paged decode bench (`--bench-p` prompt tokens, `--bench-ns` slot counts) — both run with spec off |
+
+<sub>Provenance: `tools/serve_batched.py` at this commit (`--help` is authoritative); the defaults are the ones served on 2026-10-17 with engine `2cf671c` / library md5 `e454a29c3caf` (CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0) and gated in `docs/evidence/cand7-all.log`.</sub>
 
 ## Verify
 

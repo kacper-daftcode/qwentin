@@ -1,0 +1,27 @@
+[final-speed] start 02:17:42  lib c9d5269c2963
+== (D) pure defaults, 4100 blocks   02:17:42
+   server up, pid 1339260, 29930 MiB
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 168.2 (min 168.2, max 168.2), aggregate 168.2; 300 tokens in 1.9s; rounds 82 s
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 145.2 (min 112.8, max 145.2), aggregate 258.0; 600 tokens in 2.8s; rounds 111 
+[speed] ctx=32768 N=4 spec=on: per-stream tok/s p50 104.4 (min 92.3, max 112.6), aggregate 410.0; 1200 tokens in 3.4s; rounds 119 
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 75.3 (min 69.7, max 81.8), aggregate 596.7; 2400 tokens in 5.1s; rounds 139 st
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 62.9 (min 62.9, max 62.9), aggregate 62.9; 300 tokens in 4.8s; rounds 0 steps
+[speed] ctx=32768 N=2 spec=off: per-stream tok/s p50 59.3 (min 58.6, max 59.3), aggregate 117.9; 600 tokens in 5.2s; rounds 0 step
+[speed] ctx=32768 N=4 spec=off: per-stream tok/s p50 53.9 (min 52.9, max 53.9), aggregate 213.6; 1200 tokens in 5.8s; rounds 0 ste
+[speed] ctx=32768 N=8 spec=off: per-stream tok/s p50 43.7 (min 42.5, max 45.9), aggregate 350.7; 2400 tokens in 7.7s; rounds 0 ste
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 109.9 (min 109.9, max 109.9), aggregate 109.9; 300 tokens in 2.9s; rounds 108
+[speed] ctx=131072 N=2 spec=on: per-stream tok/s p50 87.3 (min 79.5, max 87.3), aggregate 166.8; 600 tokens in 4.1s; rounds 124 st
+== (R) TQ_T4_ATTN_F16=1 TQ_GRAPH=1 TQ_GEMM_FORK=1 + --dstate fp16sr --num-blocks 4500   02:31:11
+   server up, pid 1362321, 29894 MiB
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 165.3 (min 165.3, max 165.3), aggregate 165.3; 300 tokens in 1.9s; rounds 84 s
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 143.0 (min 125.0, max 143.0), aggregate 268.0; 600 tokens in 2.5s; rounds 101 
+[speed] ctx=32768 N=4 spec=on: per-stream tok/s p50 109.0 (min 99.4, max 112.0), aggregate 423.1; 1200 tokens in 3.2s; rounds 114 
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 78.8 (min 69.3, max 85.3), aggregate 619.4; 2400 tokens in 4.8s; rounds 138 st
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 65.0 (min 65.0, max 65.0), aggregate 65.0; 300 tokens in 4.7s; rounds 0 steps
+[speed] ctx=32768 N=2 spec=off: per-stream tok/s p50 61.8 (min 61.1, max 61.8), aggregate 123.0; 600 tokens in 5.0s; rounds 0 step
+[speed] ctx=32768 N=4 spec=off: per-stream tok/s p50 56.0 (min 55.1, max 56.7), aggregate 223.8; 1200 tokens in 5.6s; rounds 0 ste
+[speed] ctx=32768 N=8 spec=off: per-stream tok/s p50 47.0 (min 45.7, max 49.3), aggregate 377.0; 2400 tokens in 7.2s; rounds 0 ste
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 131.7 (min 131.7, max 131.7), aggregate 131.7; 300 tokens in 2.5s; rounds 91 
+[speed] ctx=131072 N=2 spec=on: per-stream tok/s p50 111.4 (min 85.6, max 111.4), aggregate 196.9; 600 tokens in 3.7s; rounds 121 
+   error lines: D 0, R 0
+[final-speed] done 02:44:38

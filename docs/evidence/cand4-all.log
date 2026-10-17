@@ -1,0 +1,30 @@
+[cand4-all] start 23:29:30; cand 2bb8e6d81d9e = 0f74130 TQ_T4_ATTN_F16 default 0 on main pending the owner's; served 3ff196fece3f = 9da2d3b serve_batched: --kv-t4 and --spec on by de
+0, 2 MiB, 0 %
+== gate 1: trellis pool, TQ_T4_ATTN_F16 unset (= the served line's path): candidate bitwise == served library   23:29:30
+[plab] N=3 trellis pool, flag off: 25 steps, candidate bitwise identical to the served library: True (max |d| 0)
+[plab] N=8 trellis pool, flag off: 25 steps, candidate bitwise identical to the served library: True (max |d| 0)
+[gate1] PASS
+== gate 2: TQ_T4_ATTN_F16=1 -- spec exactness (verify == decode, --no-pin, parking inside), trellis pool, 4K + 32K   23:30:25
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: the served line (defaults --kv-t4 --spec, 12 slots, 4100 blocks) + TQ_T4_ATTN_F16=1   23:32:11
+   server up after 10 s, pid 1145894, 29930 MiB
+batched server: pool blocks=4100 page=128 max_slots=12 free=4100; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 524800 pooled tokens; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4 today: the trellis pool runs its own GQA kernels)
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=17.101s e2e=17.146s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=17.089s e2e=17.132s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=17.071s e2e=17.135s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+wall 51.5s, 3 probes
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 165.5 (min 165.5, max 165.5), aggregate 165.5; 300 tokens in 1.9s; rounds 84 steps 84 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 77.8 (min 69.3, max 79.8), aggregate 606.9; 2400 tokens in 5.0s; rounds 142 steps 142 tokens/round
+   (the served line today, cand3: N=1 163.4, N=8 72.1 tok/s per stream)
+   server log error lines: 0; needle PASS 3 FAIL 0; spec_speed rc 0
+[gate3] PASS
+== ALL PASS -> landing cand-1017 on main   23:35:57
+patches/0045-TQ_T4_ATTN_F16-default-OFF-the-attention-third-pass-.patch
+patches/0046-TQ_KV_T4-attention-cp.async-staged-V-codes-side-word.patch
+patches/0047-TQ_T4_ATTN_F16-default-0-on-main-pending-the-owner-s.patch
+-- reproducibility rebuild of build-qwen/ from the merged main (the gated binary is kept whatever the md5 says)
+   rebuild md5 8f0e72ba542c vs gated 2bb8e6d81d9e
+[cand4-all] LANDED 23:36:58: build-qwen/libforward_qwen.so = 2bb8e6d81d9e (old .9da2d3b); main = 0f74130 TQ_T4_ATTN_F16 default 0 on main pending the owner's
+[cand4-all] rollback: cp /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.9da2d3b /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && git -C /mnt/nvme/qwen256k/qwentin reset --hard 9da2d3b

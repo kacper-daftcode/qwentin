@@ -1,0 +1,34 @@
+[cand7-all] start 07:01:14; cand e454a29c3caf = 2cf671c Owner's decisions (a)(b)(c)(g), 10-17 08:5; served c9d5269c2963 = 11f5879 serve_batched: --dstate {fp32,bf
+== gate 1: the flip is only a flip (plab trellis pool N=3/8)   07:01:14
+[plab] N=3: new defaults == old+flags: True (max |d| 0, 25 steps); new+off-switches == old defaults: True (max |d| 0); (new defaults vs old defaults differ as expected: True, max |d| 0.196)
+[plab] N=8: new defaults == old+flags: True (max |d| 0, 25 steps); new+off-switches == old defaults: True (max |d| 0); (new defaults vs old defaults differ as expected: True, max |d| 0.196)
+[gate1] PASS
+== gate 2: spec exactness on the bare new defaults (verify == decode, --no-pin), 4K + 32K   07:02:59
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE NEW SERVED LINE, pure defaults: --max-slots 12 --num-blocks 4500   07:04:34
+   server up after 10 s, pid 1449418, 29894 MiB
+   batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/slot; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=15.953s e2e=15.997s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=15.938s e2e=15.981s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=15.953s e2e=16.017s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=86.575s e2e=86.626s ans='HE-215844-MW' exp=['HE-215844-MW'] 
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=86.648s e2e=86.698s ans='AB-416549-JJ' exp=['AB-416549-JJ'] 
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=86.632s e2e=86.682s ans='ND-297860-GH' exp=['ND-297860-GH'] 
+wall 308.4s, 6 probes
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2594 tokens in 21.4s = 121.2 tok/s (concurrency 1); per-request mean 121.0 tok/s; rounds 762, tokens/round 3.39
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2594 tokens in 43.8s = 59.2 tok/s (concurrency 1); per-request mean 58.7 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 166.9 (min 166.9, max 166.9), aggregate 166.9; 300 tokens in 1.9s; rounds 84 s
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 80.6 (min 72.0, max 82.9), aggregate 631.9; 2400 tokens in 4.8s; rounds 138 st
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 132.8 (min 132.8, max 132.8), aggregate 132.8; 300 tokens in 2.5s; rounds 91 
+   (final-speed on the same binary with the flags: 165.3 / 78.8 @32K N=1/8, 131.7 @128K N=1)
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1; speed rc 0 / 0
+[gate3] PASS
+== ALL PASS -> landing cand-1020 on main   07:15:02
+patches/0061-Owner-s-decisions-a-b-c-g-10-17-08-56-CEST-served-de.patch
+[cand7-all] LANDED 07:15:02: build-qwen/libforward_qwen.so = e454a29c3caf (old .11f5879); main = 2cf671c Owner's decisions (a)(b)(c)(g), 10-17 08:56 CEST: se
+[cand7-all] rollback: cp /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.11f5879 /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && git -C /mnt/nvme/qwen256k/qwentin reset --hard 11f5879

@@ -4,6 +4,7 @@ build-*/
 *.so
 *.dylib
 *.log
+!docs/evidence/**/*.log
 __pycache__/
 
 bench/calib/

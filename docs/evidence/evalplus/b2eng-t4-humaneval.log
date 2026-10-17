@@ -1,0 +1,178 @@
+Greedy decoding ON (--greedy): setting bs=1, n_samples=1, temperature=0
+Initializing a decoder model: qwen3.8-27b ...
+Sanitized code outputs will be saved to /mnt/nvme/qwen256k/runs/evalplus-b2eng-t4/humaneval/qwen3.8-27b_openai_temp_0.0.jsonl
+Raw outputs will be saved to /mnt/nvme/qwen256k/runs/evalplus-b2eng-t4/humaneval/qwen3.8-27b_openai_temp_0.0.raw.jsonl
+Codegen: HumanEval/0 @ qwen3.8-27b
+Codegen: HumanEval/1 @ qwen3.8-27b
+Codegen: HumanEval/2 @ qwen3.8-27b
+Codegen: HumanEval/3 @ qwen3.8-27b
+Codegen: HumanEval/4 @ qwen3.8-27b
+Codegen: HumanEval/5 @ qwen3.8-27b
+Codegen: HumanEval/6 @ qwen3.8-27b
+Codegen: HumanEval/7 @ qwen3.8-27b
+Codegen: HumanEval/8 @ qwen3.8-27b
+Codegen: HumanEval/9 @ qwen3.8-27b
+Codegen: HumanEval/10 @ qwen3.8-27b
+Codegen: HumanEval/11 @ qwen3.8-27b
+Codegen: HumanEval/12 @ qwen3.8-27b
+Codegen: HumanEval/13 @ qwen3.8-27b
+Codegen: HumanEval/14 @ qwen3.8-27b
+Codegen: HumanEval/15 @ qwen3.8-27b
+Codegen: HumanEval/16 @ qwen3.8-27b
+Codegen: HumanEval/17 @ qwen3.8-27b
+Codegen: HumanEval/18 @ qwen3.8-27b
+Codegen: HumanEval/19 @ qwen3.8-27b
+Codegen: HumanEval/20 @ qwen3.8-27b
+Codegen: HumanEval/21 @ qwen3.8-27b
+Codegen: HumanEval/22 @ qwen3.8-27b
+Codegen: HumanEval/23 @ qwen3.8-27b
+Codegen: HumanEval/24 @ qwen3.8-27b
+Codegen: HumanEval/25 @ qwen3.8-27b
+Codegen: HumanEval/26 @ qwen3.8-27b
+Codegen: HumanEval/27 @ qwen3.8-27b
+Codegen: HumanEval/28 @ qwen3.8-27b
+Codegen: HumanEval/29 @ qwen3.8-27b
+Codegen: HumanEval/30 @ qwen3.8-27b
+Codegen: HumanEval/31 @ qwen3.8-27b
+Codegen: HumanEval/32 @ qwen3.8-27b
+Codegen: HumanEval/33 @ qwen3.8-27b
+Codegen: HumanEval/34 @ qwen3.8-27b
+Codegen: HumanEval/35 @ qwen3.8-27b
+Codegen: HumanEval/36 @ qwen3.8-27b
+Codegen: HumanEval/37 @ qwen3.8-27b
+Codegen: HumanEval/38 @ qwen3.8-27b
+Codegen: HumanEval/39 @ qwen3.8-27b
+Codegen: HumanEval/40 @ qwen3.8-27b
+Codegen: HumanEval/41 @ qwen3.8-27b
+Codegen: HumanEval/42 @ qwen3.8-27b
+Codegen: HumanEval/43 @ qwen3.8-27b
+Codegen: HumanEval/44 @ qwen3.8-27b
+Codegen: HumanEval/45 @ qwen3.8-27b
+Codegen: HumanEval/46 @ qwen3.8-27b
+Codegen: HumanEval/47 @ qwen3.8-27b
+Codegen: HumanEval/48 @ qwen3.8-27b
+Codegen: HumanEval/49 @ qwen3.8-27b
+Codegen: HumanEval/50 @ qwen3.8-27b
+Codegen: HumanEval/51 @ qwen3.8-27b
+Codegen: HumanEval/52 @ qwen3.8-27b
+Codegen: HumanEval/53 @ qwen3.8-27b
+Codegen: HumanEval/54 @ qwen3.8-27b
+Codegen: HumanEval/55 @ qwen3.8-27b
+Codegen: HumanEval/56 @ qwen3.8-27b
+Codegen: HumanEval/57 @ qwen3.8-27b
+Codegen: HumanEval/58 @ qwen3.8-27b
+Codegen: HumanEval/59 @ qwen3.8-27b
+Codegen: HumanEval/60 @ qwen3.8-27b
+Codegen: HumanEval/61 @ qwen3.8-27b
+Codegen: HumanEval/62 @ qwen3.8-27b
+Codegen: HumanEval/63 @ qwen3.8-27b
+Codegen: HumanEval/64 @ qwen3.8-27b
+Codegen: HumanEval/65 @ qwen3.8-27b
+Codegen: HumanEval/66 @ qwen3.8-27b
+Codegen: HumanEval/67 @ qwen3.8-27b
+Codegen: HumanEval/68 @ qwen3.8-27b
+Codegen: HumanEval/69 @ qwen3.8-27b
+Codegen: HumanEval/70 @ qwen3.8-27b
+Codegen: HumanEval/71 @ qwen3.8-27b
+Codegen: HumanEval/72 @ qwen3.8-27b
+Codegen: HumanEval/73 @ qwen3.8-27b
+Codegen: HumanEval/74 @ qwen3.8-27b
+Codegen: HumanEval/75 @ qwen3.8-27b
+Codegen: HumanEval/76 @ qwen3.8-27b
+Codegen: HumanEval/77 @ qwen3.8-27b
+Codegen: HumanEval/78 @ qwen3.8-27b
+Codegen: HumanEval/79 @ qwen3.8-27b
+Codegen: HumanEval/80 @ qwen3.8-27b
+Codegen: HumanEval/81 @ qwen3.8-27b
+Codegen: HumanEval/82 @ qwen3.8-27b
+Codegen: HumanEval/83 @ qwen3.8-27b
+Codegen: HumanEval/84 @ qwen3.8-27b
+Codegen: HumanEval/85 @ qwen3.8-27b
+Codegen: HumanEval/86 @ qwen3.8-27b
+Codegen: HumanEval/87 @ qwen3.8-27b
+Codegen: HumanEval/88 @ qwen3.8-27b
+Codegen: HumanEval/89 @ qwen3.8-27b
+Codegen: HumanEval/90 @ qwen3.8-27b
+Codegen: HumanEval/91 @ qwen3.8-27b
+Codegen: HumanEval/92 @ qwen3.8-27b
+Codegen: HumanEval/93 @ qwen3.8-27b
+Codegen: HumanEval/94 @ qwen3.8-27b
+Codegen: HumanEval/95 @ qwen3.8-27b
+Codegen: HumanEval/96 @ qwen3.8-27b
+Codegen: HumanEval/97 @ qwen3.8-27b
+Codegen: HumanEval/98 @ qwen3.8-27b
+Codegen: HumanEval/99 @ qwen3.8-27b
+Codegen: HumanEval/100 @ qwen3.8-27b
+Codegen: HumanEval/101 @ qwen3.8-27b
+Codegen: HumanEval/102 @ qwen3.8-27b
+Codegen: HumanEval/103 @ qwen3.8-27b
+Codegen: HumanEval/104 @ qwen3.8-27b
+Codegen: HumanEval/105 @ qwen3.8-27b
+Codegen: HumanEval/106 @ qwen3.8-27b
+Codegen: HumanEval/107 @ qwen3.8-27b
+Codegen: HumanEval/108 @ qwen3.8-27b
+Codegen: HumanEval/109 @ qwen3.8-27b
+Codegen: HumanEval/110 @ qwen3.8-27b
+Codegen: HumanEval/111 @ qwen3.8-27b
+Codegen: HumanEval/112 @ qwen3.8-27b
+Codegen: HumanEval/113 @ qwen3.8-27b
+Codegen: HumanEval/114 @ qwen3.8-27b
+Codegen: HumanEval/115 @ qwen3.8-27b
+Codegen: HumanEval/116 @ qwen3.8-27b
+Codegen: HumanEval/117 @ qwen3.8-27b
+Codegen: HumanEval/118 @ qwen3.8-27b
+Codegen: HumanEval/119 @ qwen3.8-27b
+Codegen: HumanEval/120 @ qwen3.8-27b
+Codegen: HumanEval/121 @ qwen3.8-27b
+Codegen: HumanEval/122 @ qwen3.8-27b
+Codegen: HumanEval/123 @ qwen3.8-27b
+Codegen: HumanEval/124 @ qwen3.8-27b
+Codegen: HumanEval/125 @ qwen3.8-27b
+Codegen: HumanEval/126 @ qwen3.8-27b
+Codegen: HumanEval/127 @ qwen3.8-27b
+Codegen: HumanEval/128 @ qwen3.8-27b
+Codegen: HumanEval/129 @ qwen3.8-27b
+Codegen: HumanEval/130 @ qwen3.8-27b
+Codegen: HumanEval/131 @ qwen3.8-27b
+Codegen: HumanEval/132 @ qwen3.8-27b
+Codegen: HumanEval/133 @ qwen3.8-27b
+Codegen: HumanEval/134 @ qwen3.8-27b
+Codegen: HumanEval/135 @ qwen3.8-27b
+Codegen: HumanEval/136 @ qwen3.8-27b
+Codegen: HumanEval/137 @ qwen3.8-27b
+Codegen: HumanEval/138 @ qwen3.8-27b
+Codegen: HumanEval/139 @ qwen3.8-27b
+Codegen: HumanEval/140 @ qwen3.8-27b
+Codegen: HumanEval/141 @ qwen3.8-27b
+Codegen: HumanEval/142 @ qwen3.8-27b
+Codegen: HumanEval/143 @ qwen3.8-27b
+Codegen: HumanEval/144 @ qwen3.8-27b
+Codegen: HumanEval/145 @ qwen3.8-27b
+Codegen: HumanEval/146 @ qwen3.8-27b
+Codegen: HumanEval/147 @ qwen3.8-27b
+Codegen: HumanEval/148 @ qwen3.8-27b
+Codegen: HumanEval/149 @ qwen3.8-27b
+Codegen: HumanEval/150 @ qwen3.8-27b
+Codegen: HumanEval/151 @ qwen3.8-27b
+Codegen: HumanEval/152 @ qwen3.8-27b
+Codegen: HumanEval/153 @ qwen3.8-27b
+Codegen: HumanEval/154 @ qwen3.8-27b
+Codegen: HumanEval/155 @ qwen3.8-27b
+Codegen: HumanEval/156 @ qwen3.8-27b
+Codegen: HumanEval/157 @ qwen3.8-27b
+Codegen: HumanEval/158 @ qwen3.8-27b
+Codegen: HumanEval/159 @ qwen3.8-27b
+Codegen: HumanEval/160 @ qwen3.8-27b
+Codegen: HumanEval/161 @ qwen3.8-27b
+Codegen: HumanEval/162 @ qwen3.8-27b
+Codegen: HumanEval/163 @ qwen3.8-27b
+humaneval •100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 164/164 • 0:11:31
+
+Load from ground-truth from /root/.cache/evalplus/fe585eb4df8c88d844eeb463ea4d0302.pkl
+Reading samples...
+0it [00:00, ?it/s]1it [00:00,  2.52it/s]16it [00:00, 32.48it/s]164it [00:00, 244.28it/s]
+  0%|          | 0/164 [00:00<?, ?it/s]  1%|          | 1/164 [00:00<01:15,  2.15it/s] 17%|█▋        | 28/164 [00:00<00:02, 64.42it/s] 54%|█████▎    | 88/164 [00:00<00:00, 197.34it/s] 76%|███████▌  | 124/164 [00:00<00:00, 227.53it/s] 97%|█████████▋| 159/164 [00:01<00:00, 153.14it/s]100%|██████████| 164/164 [00:03<00:00, 53.36it/s] 
+humaneval (base tests)
+pass@1:	0.939
+humaneval+ (base + extra tests)
+pass@1:	0.915
