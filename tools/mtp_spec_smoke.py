@@ -139,7 +139,7 @@ def prefill(e, ids, p, build_trunk=True, start=0, anchor=0):
     # the (scalar) wide-attn loses to the baseline tensor-core attention, so we fall through to
     # the baseline chunked path (best-of-both, no long-ctx regression).
     #
-    # TRUNK BRIDGE (D-finish 2026-06-14): the wide path now builds the MTP draft trunk too
+    # TRUNK BRIDGE: the wide path builds the MTP draft trunk too
     # (qwn_wide_advance_trunk gathers the per-token hidden from g_wide_h), so spec-decode
     # (qwn_spec_round / snapshot_root) runs after a wide prefill -- it is usable from the
     # OpenAI server, not just the smoke harness. snapshot_root already works (qwn_prefill_wide

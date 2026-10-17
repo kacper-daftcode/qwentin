@@ -1,6 +1,6 @@
 # qwentin
 
-**Qwen3.8-27B on a single RTX 5090 (32 GB): 576K pooled context tokens across 12 concurrent sessions at FP8 quality — EXL3 trellis-quantized weights (5.75 bpw) + a 4-bit trellis-coded KV cache (16.5 KiB/token) + speculative decoding, 167 / 109 / 81 tok/s per stream at 1 / 4 / 8 streams @32K, 133 tok/s @128K, TTFT 15.9 s @32K / 86.6 s @128K (2026-10-17, CUDA 13.1, measured on the 5090 itself).** A 16 GB variant (4.25 bpw, 51K tokens, 184 tok/s) and a 24 GB variant (a full 256K single session at FP8 quality) are measured as well. Qwen3.6-27B shares the text-tower layout and runs identically on the FP6
+**Qwen3.8-27B on a single RTX 5090 (32 GB): 576K pooled context tokens across 12 concurrent sessions at FP8 quality — EXL3 trellis-quantized weights (5.75 bpw, quantized with turboderp's [exllamav3](https://github.com/turboderp-org/exllamav3), whose EXL3 quantizer the headline quality numbers stand on) + a 4-bit trellis-coded KV cache (16.5 KiB/token) + speculative decoding, 167 / 109 / 81 tok/s per stream at 1 / 4 / 8 streams @32K, 133 tok/s @128K, TTFT 15.9 s @32K / 86.6 s @128K (2026-10-17, CUDA 13.1, measured on the 5090 itself).** A 16 GB variant (4.25 bpw, 51K tokens, 184 tok/s) and a 24 GB variant (a full 256K single session at FP8 quality) are measured as well. Qwen3.6-27B shares the text-tower layout and runs identically on the FP6
 path (the EXL3 path was measured on Qwen3.8 only).
 
 ## TL;DR — what is new in the 2026-10 build, and where the memory went
@@ -782,7 +782,7 @@ tools/serve_batched.py       THE SERVED SERVER: multi-client OpenAI API, paged K
                              prefix cache, host-RAM parking (/health, /spec)
 tools/serve_openai.py        legacy single-stream OpenAI server (FP6 + MTP tree, prefix cache, tools, reasoning split, bark, Dogs)
 tools/convert_qwen_tqf.py    HuggingFace / EXL3 checkpoint -> .tqf (--exl3, --mtp-exl3, the FP6 block-scaled formats)
-tools/inspect_tqf.py         inspect a .tqf model file (flags, sections)
+tools/inspect_tqf.py         inspect a .tqf model file (flags, payload walk incl. EXL3 records, production FP6 / EXL3 + MTP verdicts)
 tools/codebooks/lloyd_kv12a.f32   the trellis-KV codebook (4096 fp32, Lloyd-trained; the server's default)
 tools/recipes/*.yaml         the exllamav3 per-tensor bitrate recipes of the served models (opt-5.75, t45-s425)
 tools/code_needle.py         needle-in-a-repository retrieval matrix through the OpenAI API
@@ -790,7 +790,14 @@ tools/spec_speed.py          per-stream decode tok/s at N streams x context, spe
 tools/spec_server_ab.py      spec on vs off on the same prompts: identical-output count
 tools/spec_paged_check.py    exactness of the paged verify / commit path vs plain decode (bare engine)
 tools/paged_logit_ab.py      raw paged-decode logits of a build for bitwise A/B between builds
-tools/harness_common.py      shared helpers of the HTTP tools (tokenizer, code-corpus snapshots, streaming client)
+tools/harness_common.py      shared helpers of the HTTP tools (tokenizer, code-corpus snapshots, streaming client) and the
+                             quality yardstick's held-out sampler (calibration_ids)
+tools/serve_common.py        request-side guards of both servers (--api-key, body limit, max_tokens cap, socket timeout)
+tools/qwentin_e2e.py         the quality yardstick on the engine: KL / top-1 vs the bf16 original (docs/QUALITY.md)
+tools/exl3_diff.py           the same for a checkpoint through exllamav3 (the FP8 reference row, the EXL3 ladder)
+tools/e2e_frontier.py        the gate table: paired dKL / dtop-1 with the 95 % block-bootstrap CI
+tools/dequant_fp8_to_bf16.py FP8 checkpoint -> bf16 containers (the FP8 reference row's input)
+tools/evalplus.sh            T1: EvalPlus HumanEval+ / MBPP+ against any OpenAI endpoint
 tools/paged_smoke.py         batched/paged decode parity + throughput harness (legacy)
 tools/mtp_spec_smoke.py      single-stream spec-decode harness (also exports prefill() used by serve_openai)
 tools/bench_rounds.py        single-stream decode-only spec-round benchmark (ms/round, net tok/s; nsys hook)
@@ -801,6 +808,10 @@ tools/needle_check.py        single-stream long-context retrieval gate
 tools/bark_autotune.py, tools/ot_hook_check.py   --bark-all-day scale sweep and kernel-vs-numpy parity
 tools/mtp_*.py               MTP draft-head training / accept-length eval / dump (single-stream)
 tools/convert.py, tools/sparse_pack.py           older converter pieces
+bench/reproduce.sh           build -> model check -> served line -> needle / spec A-B / speed -> results-<date>-<commit>.json
+tests/                       CPU pytest: the .tqf header parser / payload walk, the servers' request guards
+docs/QUALITY.md, docs/TQF_FORMAT.md, docs/evidence/   the quality protocol, the file format, the gate logs behind the numbers
+.github/workflows/           CI (compile check, ruff, pytest) and the disabled nightly 5090 gate
 ```
 
 ## License
