@@ -546,6 +546,38 @@ static __device__ __forceinline__ uint16_t tq_f16_sr(float v, uint32_t r) {   //
     float p = (v - flo) / (fhi - flo);                         // in [0, 1)
     return __half_as_ushort(((float)r * (1.0f / 4294967296.0f) < p) ? hi : lo);
 }
+// The same decision without the two directed F2F, the two F2F back and the fp32 divide (session 11, gdn-prefill): the fp16
+// neighbours of |v| are the fp32 bit pattern with the sub-grid mantissa bits cleared (grid = 2^13 mantissa units in the
+// normal range, 2^(-1-e) in the subnormal range, |v| itself below 2^-24), the fractional distance p = m / grid is exact, and
+// for v < 0 the distance from the lower neighbour is 1 - p (exact too). Bit-identical to tq_f16_sr on every fp32 input and
+// every r (400 M random cases incl. NaN / inf / subnormals / the clamp, /tmp/gdn_sr_test.cu). Returns the fp16 bits and
+// writes the rounded value as fp32 (= __half2float of the bits).
+static __device__ __forceinline__ uint16_t tq_f16_sr_fast(float v, uint32_t r, float *rounded) {
+    v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+    uint32_t u = __float_as_uint(v);
+    uint32_t a = u & 0x7FFFFFFFu, sign = u & 0x80000000u;
+    uint32_t lo_a, hi_a; float p;
+    if (a >= 0x38800000u) {                                    // |v| >= 2^-14: fp16 normal range
+        uint32_t m = a & 0x1FFFu;
+        lo_a = a - m; hi_a = lo_a + 0x2000u;
+        p = (__uint_as_float(0x4B000000u | m) - 8388608.0f) * (1.0f / 8192.0f);   // (float)m exactly, no I2F
+    } else if (a >= 0x33800000u) {                             // [2^-24, 2^-14): the fp16 subnormal grid 2^-24
+        int sh = -1 - ((int)(a >> 23) - 127);                  // 14..23 dropped mantissa bits
+        uint32_t m = a & ((1u << sh) - 1u);
+        lo_a = a - m; hi_a = lo_a + (1u << sh);
+        p = (__uint_as_float(0x4B000000u | m) - 8388608.0f) * __uint_as_float((uint32_t)(127 - sh) << 23);
+    } else {                                                   // |v| < 2^-24: neighbours 0 and 2^-24
+        lo_a = 0u; hi_a = 0x33800000u;
+        p = __uint_as_float(a) * 16777216.0f;
+    }
+    if (a == lo_a) { *rounded = v; return __half_as_ushort(__float2half_rn(v)); }   // representable (incl. +-0)
+    float pp = sign ? (1.0f - p) : p;
+    bool up = (float)r * (1.0f / 4294967296.0f) < pp;
+    uint32_t pick = sign ? (up ? lo_a : hi_a) : (up ? hi_a : lo_a);
+    float f = __uint_as_float(pick | sign);
+    *rounded = f;
+    return __half_as_ushort(__float2half_rn(f));
+}
 // The state slice of one head of one slot in format DS: ld(i) / st(i, v) with i the element index inside the head
 // (kk * dim + tid); pos is the token position (DS = 4's rounding seed; set per column by the kernels).
 template <int DS> struct tq_ds_acc {
@@ -577,6 +609,11 @@ template <int DS> struct tq_ds_acc {
         else if constexpr (DS == 3) { uint32_t u = __float_as_uint(v); return __uint_as_float(((u + 0x7Fu + ((u >> 8) & 1u)) >> 8) << 8); }
         else if constexpr (DS == 4) return __half2float(__ushort_as_half(tq_f16_sr(v, tq_ds_hash(gbase + (uint32_t)i, pos))));
         else return v;
+    }
+    // rnd() with the fast fp16-SR (the register-resident prefill kernel rounds 16x per element per wave).
+    __device__ __forceinline__ float rnd_fast(size_t i, float v) const {
+        if constexpr (DS == 4) { float f; tq_f16_sr_fast(v, tq_ds_hash(gbase + (uint32_t)i, pos), &f); return f; }
+        else return rnd(i, v);
     }
 };
 // The accessor of (slot, head) inside a per-layer state buffer: slot stride recur_stride elements, head offset head_off.
@@ -18147,6 +18184,429 @@ static int launch_deltanet_chunk_hs_ds(int ds, float *core_out, void *recurrent_
     return 0;
 }
 
+// =================== Session 11 (gdn-prefill): hoisted prep + register-resident chunkwise DeltaNet ===================
+// TQ_GDN_PREFILL=1 replaces, for the paged prefill waves only, k_tq_linear_conv_chunk + k_tq_deltanet_chunk_hs<8,128,2,8,DS>
+// by two kernels that compute bit for bit the same core_raw, recurrent state (in every DS format, same SR seeds and
+// decisions) and conv window, then the unchanged k_tq_deltanet_norm:
+//  * k_tq_gdn_prep (per segment): everything that does not depend on the recurrent state, once instead of per sub-chunk
+//    and per stripe -- the causal conv + SiLU (same window / same FMA chain as k_tq_linear_conv_chunk), the per-token
+//    q/k L2 factors (the same sequential sum of squares) and the normalised qn / kn written "lane-permuted"
+//    ([key head][token][klane 0..7][16], element (klane, i) = dim klane + 8 i, so a warp's chain reads are 16-byte
+//    broadcasts), the conv'd v, the 8x8 decayed inner products (dkk, dqk) of every sub-chunk (the same d-sequential
+//    chains), and the gates beta / cumulative log-decay la / e^la / e^(la_last - la) of every (head, token).
+//  * k_tq_gdn_chunk<KT, DS>: grid = value_heads x 4 stripes of 32 value columns, block = 8/KT warps (128 threads at
+//    KT = 2). Warp w's lanes are the 32 columns; the warp owns the head-dim chains k = w + (8/KT) h (h < KT) of the
+//    chunk kernel's 8-lane split and keeps those 16 KT state values per column in registers for the whole segment
+//    (read once, written once; between sub-chunks the register is rounded exactly as a store + load would round it,
+//    tq_ds_acc::rnd_fast with the same (element index, position) seed). The 16 sub-chunks run without any
+//    recomputation: per sub-chunk the read-outs S0^T kn_j / S0^T qn_j are the same per-chain FMA chains, the 8-lane
+//    shuffle tree ((l0+l4)+(l2+l6))+((l1+l5)+(l3+l7)) is reproduced as in-thread adds (chains w, w+4) + one shared-memory
+//    exchange between the warps, every warp then solves the 8x8 forward substitution and the core redundantly (warp 0
+//    stores core_raw) and applies the state carry to its own chains. kn / qn / v / gates of 16 tokens are staged in
+//    shared memory per stage (35 KB -> 2 blocks per SM).
+// Also the conv window of the slot is advanced (first blocks of the chunk kernel, after the prep consumed the old one).
+// Everything below is additive; TQ_GDN_PREFILL=0 (default) runs the kernels above unchanged.
+
+static __device__ __forceinline__ float tq_gdn_conv_silu(const float *__restrict__ x, const float *__restrict__ cs,
+                                                         const uint16_t *__restrict__ w, int c, int t, int conv_dim, int KS) {
+    // k_tq_linear_conv_chunk's window at token t: [e(t-KS+1) .. e(t)], e(u) = x[u] for u >= 0, else the slot window
+    // cs[c*KS + KS + u]; the same shift-and-accumulate order (sum = 0; += win[j] * w[j] for j < KS-1; += win[KS-1] * w[KS-1]).
+    const uint16_t *wt = w + (size_t)c * KS;
+    const float *s = cs + (size_t)c * KS;
+    float win[8];
+    for (int j = 0; j < KS; j++) { int u = t - (KS - 1) + j; win[j] = (u >= 0) ? x[(size_t)u * conv_dim + c] : s[KS + u]; }
+    float sum = 0.0f;
+    for (int j = 0; j < KS - 1; j++) sum = __fmaf_rn(win[j], tq_bf16_to_float(wt[j]), sum);
+    sum = __fmaf_rn(win[KS - 1], tq_bf16_to_float(wt[KS - 1]), sum);
+    return sum / (1.0f + expf(-sum));
+}
+
+// grid = key_heads * nsub (role a: 8-token sub-chunk x key head) + T * value_dim / 256 (role b: v conv) + ceil(value_heads *
+// nsub / 256) (role c: gates); block = 256.
+template <int D>
+__global__ void __launch_bounds__(256) k_tq_gdn_prep(
+        const float *__restrict__ x, const float *__restrict__ conv_state, const uint16_t *__restrict__ conv_w,
+        const float *__restrict__ b_proj, const float *__restrict__ a_proj,
+        const float *__restrict__ A_log, const uint16_t *__restrict__ dt_bias,
+        float *__restrict__ qn_out, float *__restrict__ kn_out,       // [key_heads][T][D] lane-permuted
+        float2 *__restrict__ dd_out,                                   // [key_heads][nsub][8][8] (dkk, dqk)
+        float *__restrict__ v_out,                                     // [T][value_dim]
+        float4 *__restrict__ gates,                                    // [value_heads][T] {beta, la, e^la, e^(la_last - la)}
+        int T, int value_heads, int key_heads, int KS) {
+    const int key_dim = key_heads * D, value_dim = value_heads * D, conv_dim = 2 * key_dim + value_dim;
+    const int nsub = (T + 7) / 8;
+    const int nqk = key_heads * nsub, nvb = T * (value_dim / 256);
+    int blk = blockIdx.x, tid = threadIdx.x;
+    if (blk < nqk) {
+        __shared__ float qk[2][8][D + 1];          // normalised q / k of the sub-chunk's 8 tokens (post conv + SiLU)
+        __shared__ float fac[2][8];
+        int kh = blk / nsub, sc = blk % nsub, s = sc * 8, L = min(8, T - s);
+        // 8 tokens x 256 channels, 8 per thread: thread -> (channel tid, token j)
+        int c = (tid < D) ? kh * D + tid : key_dim + kh * D + (tid - D);
+        int d = tid & (D - 1), which = tid >> 7;
+        for (int j = 0; j < L; j++) qk[which][j][d] = tq_gdn_conv_silu(x, conv_state, conv_w, c, s + j, conv_dim, KS);
+        __syncthreads();
+        if (tid < 16) {                              // the sequential sum of squares of token tid/2 (q: even, k: odd)
+            int j = tid >> 1, wq = tid & 1;
+            if (j < L) {
+                const float *q = qk[wq][j];
+                float ss = 0.0f;
+                for (int dd = 0; dd < D; dd++) { float a = q[dd]; ss = __fmaf_rn(a, a, ss); }
+                fac[wq][j] = (wq == 0) ? rsqrtf(ss + 1.0e-6f) * rsqrtf((float)D) : rsqrtf(ss + 1.0e-6f);
+            }
+        }
+        __syncthreads();
+        for (int j = 0; j < L; j++) qk[which][j][d] = qk[which][j][d] * fac[which][j];
+        __syncthreads();
+        int perm = (d & 7) * (D / 8) + (d >> 3);
+        float *out = which ? kn_out : qn_out;
+        for (int j = 0; j < L; j++) out[((size_t)kh * T + s + j) * D + perm] = qk[which][j][d];
+        if (tid < 64) {                              // the 8x8 decayed inner products' dot parts (d-sequential chains)
+            int j = tid >> 3, m = tid & 7;
+            if (j < L && m < L) {
+                float dkk = 0.0f, dqk = 0.0f;
+                #pragma unroll 4
+                for (int dd = 0; dd < D; dd++) {
+                    float knm = qk[1][m][dd];
+                    dkk = __fmaf_rn(qk[1][j][dd], knm, dkk);
+                    dqk = __fmaf_rn(qk[0][j][dd], knm, dqk);
+                }
+                dd_out[((size_t)kh * nsub + sc) * 64 + tid] = make_float2(dkk, dqk);
+            }
+        }
+        return;
+    }
+    blk -= nqk;
+    if (blk < nvb) {
+        int nb = value_dim / 256, t = blk / nb, c0 = (blk % nb) * 256;
+        v_out[(size_t)t * value_dim + c0 + tid] = tq_gdn_conv_silu(x, conv_state, conv_w, 2 * key_dim + c0 + tid, t, conv_dim, KS);
+        return;
+    }
+    blk -= nvb;
+    int g = blk * 256 + tid;
+    if (g >= value_heads * nsub) return;
+    int head = g / nsub, sc = g % nsub, s = sc * 8, L = min(8, T - s);
+    float Alog = A_log[head];
+    float dtb  = tq_bf16_to_float(dt_bias[head]);
+    float beta[8], la[8];
+    float cum = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        if (j < L) {
+            int t = s + j;
+            float bb = b_proj[(size_t)t * value_heads + head];
+            float sp_arg = a_proj[(size_t)t * value_heads + head] + dtb;
+            float sp = log1pf(expf(-fabsf(sp_arg))) + fmaxf(sp_arg, 0.0f);
+            cum = __fmaf_rn(-expf(Alog), sp, cum);
+            beta[j] = 1.0f / (1.0f + expf(-bb));
+            la[j] = cum;
+        } else { beta[j] = 0.0f; la[j] = cum; }
+    }
+    float la_last = la[L - 1];
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
+        if (j < L) gates[(size_t)head * T + s + j] = make_float4(beta[j], la[j], expf(la[j]), expf(la_last - la[j]));
+}
+
+// One sub-chunk of the register-resident chunk kernel (FULL: L == 8, no guards). S[h][i] = state[k][col], k = kk(h) + 8 i.
+template <int KT, int DS, bool FULL>
+static __device__ __forceinline__ void tq_gdn_subchunk(
+        float (&S)[KT][16], const float (*kn_s)[128], const float (*qn_s)[128], const float (*v_s)[32],
+        const float (*Lm)[8], const float (*Am)[8], const float4 *g_s, float *part /* [NW][16][32] */,
+        float *__restrict__ core_raw, int Lrt, int w, int lane, int value_dim, int head_col_base, int t_base,
+        const tq_ds_acc<DS> &acc, int col) {
+    constexpr int NW = 8 / KT, D = 128;
+    const int L = FULL ? 8 : Lrt;
+    // 3. read-outs: per chain h the k-sequential FMA chains kS0_h[j] / qS0_h[j] (k = kk + 8 i), then the in-thread levels
+    //    of the shuffle tree (chains kk, kk + NW, ... pair at distance 4, then 2, ...).
+    float accK[KT][8], accQ[KT][8];
+    #pragma unroll
+    for (int h = 0; h < KT; h++) {
+        const int kk = w + NW * h;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float ak = 0.0f, aq = 0.0f;
+            if (FULL || j < L) {
+                const float4 *kp = (const float4 *)(kn_s[j] + kk * 16);
+                const float4 *qp = (const float4 *)(qn_s[j] + kk * 16);
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    float4 kv = kp[q], qv = qp[q];
+                    ak = __fmaf_rn(kv.x, S[h][4 * q + 0], ak); aq = __fmaf_rn(qv.x, S[h][4 * q + 0], aq);
+                    ak = __fmaf_rn(kv.y, S[h][4 * q + 1], ak); aq = __fmaf_rn(qv.y, S[h][4 * q + 1], aq);
+                    ak = __fmaf_rn(kv.z, S[h][4 * q + 2], ak); aq = __fmaf_rn(qv.z, S[h][4 * q + 2], aq);
+                    ak = __fmaf_rn(kv.w, S[h][4 * q + 3], ak); aq = __fmaf_rn(qv.w, S[h][4 * q + 3], aq);
+                }
+            }
+            accK[h][j] = ak; accQ[h][j] = aq;
+        }
+    }
+    #pragma unroll
+    for (int off = KT / 2; off > 0; off >>= 1)
+        #pragma unroll
+        for (int h = 0; h < off; h++)
+            #pragma unroll
+            for (int j = 0; j < 8; j++) { accK[h][j] += accK[h + off][j]; accQ[h][j] += accQ[h + off][j]; }
+    // exchange the warps' partials: part[w][kq * 8 + j][lane]
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        part[(w * 16 + j) * 32 + lane] = accK[0][j];
+        part[(w * 16 + 8 + j) * 32 + lane] = accQ[0][j];
+    }
+    __syncthreads();
+    float kS0[8], qS0[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        float pk[NW], pq[NW];
+        #pragma unroll
+        for (int ww = 0; ww < NW; ww++) { pk[ww] = part[(ww * 16 + j) * 32 + lane]; pq[ww] = part[(ww * 16 + 8 + j) * 32 + lane]; }
+        #pragma unroll
+        for (int off = NW / 2; off > 0; off >>= 1)
+            #pragma unroll
+            for (int ww = 0; ww < off; ww++) { pk[ww] += pk[ww + off]; pq[ww] += pq[ww + off]; }
+        kS0[j] = pk[0]; qS0[j] = pq[0];
+    }
+    if constexpr (KT == 1) __syncthreads();   // single-buffered partials at 8 warps (static smem limit)
+    // 4-6. RHS, forward substitution, core (every warp redundantly; warp 0 stores). Explicit __fmul_rn / __fmaf_rn: the
+    // original kernel's loops (runtime bounds) materialise the products gamma * qS0 and gamma_last * S as FMULs before the
+    // FFMA chains; fully unrolled, nvcc would otherwise be free to fuse the other product of "a*b + c*d" (not bitwise).
+    float Dl[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        if (FULL || j < L) {
+            float vv = v_s[j][lane];
+            Dl[j] = __fmul_rn(g_s[j].x, __fmaf_rn(-g_s[j].z, kS0[j], vv));
+        } else Dl[j] = 0.0f;
+    }
+    #pragma unroll
+    for (int j = 1; j < 8; j++) {
+        if (FULL || j < L) {
+            float a = Dl[j];
+            #pragma unroll
+            for (int m = 0; m < j; m++) a = __fmaf_rn(-Lm[j][m], Dl[m], a);
+            Dl[j] = a;
+        }
+    }
+    if (w == 0) {
+        // the original's SASS: core_j = fma(gamma_j, qS0_j, A[j][0] * Dl[0]) then += A[j][i] * Dl[i] for i = 1..j
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (FULL || j < L) {
+                float a = __fmaf_rn(g_s[j].z, qS0[j], __fmul_rn(Am[j][0], Dl[0]));
+                #pragma unroll
+                for (int i = 1; i <= j; i++) a = __fmaf_rn(Am[j][i], Dl[i], a);
+                core_raw[(size_t)(t_base + j) * value_dim + head_col_base + col] = a;
+            }
+        }
+    }
+    // 8. state carry on the warp's chains: S = gamma_last * S; += dec[i] * kn_i[k] in token order; then the storage rounding.
+    const float gamma_last = g_s[L - 1].z;
+    float dec[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) dec[i] = (FULL || i < L) ? __fmul_rn(g_s[i].w, Dl[i]) : 0.0f;
+    // The original's SASS differs per format: the half / 24-bit instantiations (a conversion precedes the multiply) do
+    // S = gamma_last * S (FMUL) then the FFMA chain; the fp32 instantiation fuses the scaling into the first term:
+    // S = fma(gamma_last, S, dec[0] * kn_0) then the chain from i = 1.
+    if constexpr (DS != 0) {
+        #pragma unroll
+        for (int h = 0; h < KT; h++)
+            #pragma unroll
+            for (int i = 0; i < 16; i++) S[h][i] = __fmul_rn(gamma_last, S[h][i]);
+    } else {
+        #pragma unroll
+        for (int h = 0; h < KT; h++) {
+            const int kk = w + NW * h;
+            const float4 *kp = (const float4 *)(kn_s[0] + kk * 16);
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                float4 kv = kp[q];
+                S[h][4 * q + 0] = __fmaf_rn(gamma_last, S[h][4 * q + 0], __fmul_rn(dec[0], kv.x));
+                S[h][4 * q + 1] = __fmaf_rn(gamma_last, S[h][4 * q + 1], __fmul_rn(dec[0], kv.y));
+                S[h][4 * q + 2] = __fmaf_rn(gamma_last, S[h][4 * q + 2], __fmul_rn(dec[0], kv.z));
+                S[h][4 * q + 3] = __fmaf_rn(gamma_last, S[h][4 * q + 3], __fmul_rn(dec[0], kv.w));
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = (DS != 0) ? 0 : 1; i < 8; i++) {
+        if (FULL || i < L) {
+            #pragma unroll
+            for (int h = 0; h < KT; h++) {
+                const int kk = w + NW * h;
+                const float4 *kp = (const float4 *)(kn_s[i] + kk * 16);
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    float4 kv = kp[q];
+                    S[h][4 * q + 0] = __fmaf_rn(dec[i], kv.x, S[h][4 * q + 0]);
+                    S[h][4 * q + 1] = __fmaf_rn(dec[i], kv.y, S[h][4 * q + 1]);
+                    S[h][4 * q + 2] = __fmaf_rn(dec[i], kv.z, S[h][4 * q + 2]);
+                    S[h][4 * q + 3] = __fmaf_rn(dec[i], kv.w, S[h][4 * q + 3]);
+                }
+            }
+        }
+    }
+    if constexpr (DS != 0) {
+        #pragma unroll
+        for (int h = 0; h < KT; h++) {
+            const int kk = w + NW * h;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) S[h][i] = acc.rnd_fast((size_t)(kk + 8 * i) * D + col, S[h][i]);
+        }
+    }
+}
+
+template <int KT, int DS>
+__global__ void __launch_bounds__(256 / KT) k_tq_gdn_chunk(
+        float *__restrict__ core_raw, void *recurrent_state,
+        const float *__restrict__ qn, const float *__restrict__ kn, const float2 *__restrict__ dd,
+        const float *__restrict__ vconv, const float4 *__restrict__ gates, const int *__restrict__ tok_pos,
+        float *__restrict__ conv_state, const float *__restrict__ x,
+        int T, int value_heads, int key_heads, int conv_dim, int KS) {
+    constexpr int D = 128, CK = 8, NW = 8 / KT, TS = 16, NSUB = TS / CK, BS = 32 * NW;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int head = blockIdx.x >> 2, stripe = blockIdx.x & 3;
+    const int group = value_heads / key_heads, key_head = head / group;
+    const int value_dim = value_heads * D, nsub = (T + 7) / 8;
+    const int col = stripe * 32 + lane;
+
+    // the slot's conv window: win[j] = x[T - KS + j] (or the old window shifted by T if T < KS); after k_tq_gdn_prep.
+    if (blockIdx.x * BS < conv_dim) {
+        int c = blockIdx.x * BS + tid;
+        if (c < conv_dim) {
+            float *s = conv_state + (size_t)c * KS;
+            float old[8];
+            for (int j = 0; j < KS; j++) old[j] = s[j];
+            for (int j = 0; j < KS; j++) { int u = j + T - KS; s[j] = (u >= 0) ? x[(size_t)u * conv_dim + c] : old[j + T]; }
+        }
+    }
+
+    __shared__ __align__(16) float kn_s[TS][D];
+    __shared__ __align__(16) float qn_s[TS][D];
+    __shared__ float v_s[TS][32];
+    __shared__ float Lm[NSUB][8][8], Am[NSUB][8][8];
+    __shared__ float4 g_s[TS];
+    __shared__ float part[KT == 1 ? 1 : 2][NW * 16 * 32];   // the warps' partial read-outs (double-buffered: 1 barrier per sub-chunk)
+
+    tq_ds_acc<DS> acc = tq_ds_make<DS>(recurrent_state, 0, (size_t)value_heads * D * D, (size_t)head * D * D);
+    float S[KT][16];
+    #pragma unroll
+    for (int h = 0; h < KT; h++) {
+        const int kk = w + NW * h;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) S[h][i] = acc.ld((size_t)(kk + 8 * i) * D + col);
+    }
+    const float *kn_src = kn + (size_t)key_head * T * D, *qn_src = qn + (size_t)key_head * T * D;
+    int sub = 0;                                              // global sub-chunk counter (partials double-buffer)
+    for (int t0 = 0; t0 < T; t0 += TS) {
+        const int nt = min(TS, T - t0);
+        __syncthreads();                                      // the previous stage's smem consumers are done
+        {
+            const float4 *sk = (const float4 *)(kn_src + (size_t)t0 * D), *sq = (const float4 *)(qn_src + (size_t)t0 * D);
+            float4 *dk = (float4 *)&kn_s[0][0], *dq = (float4 *)&qn_s[0][0];
+            for (int i = tid; i < nt * (D / 4); i += BS) { dk[i] = sk[i]; dq[i] = sq[i]; }
+            for (int i = tid; i < nt * 32; i += BS)
+                v_s[i >> 5][i & 31] = vconv[(size_t)(t0 + (i >> 5)) * value_dim + head * D + stripe * 32 + (i & 31)];
+            if (tid < nt) g_s[tid] = gates[(size_t)head * T + t0 + tid];
+        }
+        __syncthreads();
+        for (int p = tid; p < NSUB * 64; p += BS) {           // L / A of the stage's sub-chunks from (dkk, dqk) + gates
+            int c = p >> 6, jm = p & 63, j = jm >> 3, m = jm & 7;
+            int sc = (t0 >> 3) + c, L = min(8, T - sc * 8);
+            if (sc < nsub && j < L && m < L) {
+                float2 d2 = dd[((size_t)key_head * nsub + sc) * 64 + jm];
+                float laj = g_s[c * 8 + j].y, lam = g_s[c * 8 + m].y, betaj = g_s[c * 8 + j].x;
+                float decay = (m <= j) ? expf(laj - lam) : 0.0f;
+                Lm[c][j][m] = (m < j)  ? betaj * decay * d2.x : 0.0f;
+                Am[c][j][m] = (m <= j) ? decay * d2.y : 0.0f;
+            }
+        }
+        __syncthreads();
+        for (int c = 0; c < NSUB && t0 + c * CK < T; c++, sub++) {
+            const int s = t0 + c * CK, L = min(CK, T - s);
+            if constexpr (DS == 4) acc.pos = (uint32_t)tok_pos[s + L - 1];
+            if (L == CK)
+                tq_gdn_subchunk<KT, DS, true>(S, kn_s + c * CK, qn_s + c * CK, v_s + c * CK, Lm[c], Am[c], g_s + c * CK,
+                                              part[KT == 1 ? 0 : (sub & 1)], core_raw, L, w, lane, value_dim, head * D, s, acc, col);
+            else
+                tq_gdn_subchunk<KT, DS, false>(S, kn_s + c * CK, qn_s + c * CK, v_s + c * CK, Lm[c], Am[c], g_s + c * CK,
+                                               part[KT == 1 ? 0 : (sub & 1)], core_raw, L, w, lane, value_dim, head * D, s, acc, col);
+        }
+    }
+    #pragma unroll
+    for (int h = 0; h < KT; h++) {
+        const int kk = w + NW * h;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) acc.st((size_t)(kk + 8 * i) * D + col, S[h][i]);   // a no-op rounding: S is representable
+    }
+}
+
+// Scratch of the gdn prefill path, sized by the wave's T (per layer the buffers are reused).
+static float  *g_gdn_qn = NULL, *g_gdn_kn = NULL, *g_gdn_v = NULL;
+static float2 *g_gdn_dd = NULL;
+static float4 *g_gdn_gates = NULL;
+static int     g_gdn_cap = 0;
+static int ensure_gdn_buffers(int T) {
+    if (g_gdn_cap >= T) return 0;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, D = g_qwen.linear_value_head_dim;
+    int nsub = (T + 7) / 8;
+    if (g_gdn_qn) cudaFree(g_gdn_qn); if (g_gdn_kn) cudaFree(g_gdn_kn); if (g_gdn_v) cudaFree(g_gdn_v);
+    if (g_gdn_dd) cudaFree(g_gdn_dd); if (g_gdn_gates) cudaFree(g_gdn_gates);
+    g_gdn_qn = g_gdn_kn = g_gdn_v = NULL; g_gdn_dd = NULL; g_gdn_gates = NULL; g_gdn_cap = 0;
+    if (cudaMalloc(&g_gdn_qn, (size_t)lkh * T * D * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_gdn_kn, (size_t)lkh * T * D * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_gdn_v, (size_t)T * lvh * D * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_gdn_dd, (size_t)lkh * nsub * 64 * sizeof(float2)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_gdn_gates, (size_t)lvh * T * sizeof(float4)) != cudaSuccess) return -1;
+    g_gdn_cap = T;
+    return 0;
+}
+
+// TQ_GDN_PREFILL: 0 = the kernels above (default); 1 = the gdn path with KT = 2 (4 warps per block); 2 = KT = 1 (8 warps);
+// 3 = KT = 4 (2 warps). Read once.
+static int tq_gdn_prefill_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("TQ_GDN_PREFILL");
+        mode = (e && *e) ? atoi(e) : 0;
+        if (mode < 0 || mode > 3) mode = 0;
+    }
+    return mode;
+}
+
+// The gdn path for one segment of n tokens (conv + chunkwise DeltaNet + norm): x_qkv = the segment's pre-conv qkv (NOT
+// written: the conv output stays in the scratch), conv_slot = the slot's conv window (advanced), recur_slot = the slot's
+// recurrent state in format ds (advanced), core_out = the normed core [n][value_dim], tok_pos = the n positions.
+static int launch_gdn_prefill(int mode, int ds, float *core_out, void *recur_slot, float *conv_slot, const float *x_qkv,
+                              const float *z, const float *b_proj, const float *a_proj, const float *A_log,
+                              const uint16_t *dt_bias, const uint16_t *conv_w, const float *norm_weight,
+                              int n, int value_heads, int key_heads, int dim, int KS, float eps, cudaStream_t st,
+                              const int *tok_pos) {
+    if (dim != 128 || KS > 8 || (value_heads * dim) % 256 != 0 || value_heads % key_heads != 0) return -100;
+    if (ensure_gdn_buffers(n) != 0) return -90;
+    int key_dim = key_heads * dim, value_dim = value_heads * dim, conv_dim = 2 * key_dim + value_dim;
+    int nsub = (n + 7) / 8;
+    int grid_p = key_heads * nsub + n * (value_dim / 256) + (value_heads * nsub + 255) / 256;
+    k_tq_gdn_prep<128><<<grid_p, 256, 0, st>>>(x_qkv, conv_slot, conv_w, b_proj, a_proj, A_log, dt_bias,
+                                                g_gdn_qn, g_gdn_kn, g_gdn_dd, g_gdn_v, g_gdn_gates, n, value_heads, key_heads, KS);
+    int kt = (mode == 2) ? 1 : (mode == 3) ? 4 : 2;
+    int grid_c = value_heads * 4;
+    if (grid_c * (256 / kt) < conv_dim) return -103;          // the window update rides on the first blocks
+    #define TQ_GDN_LAUNCH(KTV, DSV) k_tq_gdn_chunk<KTV, DSV><<<grid_c, 256 / KTV, 0, st>>>(                           \
+        core_out, recur_slot, g_gdn_qn, g_gdn_kn, g_gdn_dd, g_gdn_v, g_gdn_gates, tok_pos, conv_slot, x_qkv,            \
+        n, value_heads, key_heads, conv_dim, KS)
+    #define TQ_GDN_LAUNCH_DS(KTV)                                                                                      \
+        switch (ds) {                                                                                                  \
+            case 0: TQ_GDN_LAUNCH(KTV, 0); break; case 1: TQ_GDN_LAUNCH(KTV, 1); break;                                \
+            case 2: TQ_GDN_LAUNCH(KTV, 2); break; case 3: TQ_GDN_LAUNCH(KTV, 3); break;                                \
+            case 4: TQ_GDN_LAUNCH(KTV, 4); break; default: return -102;                                                \
+        }
+    if (kt == 1) { TQ_GDN_LAUNCH_DS(1) } else if (kt == 4) { TQ_GDN_LAUNCH_DS(4) } else { TQ_GDN_LAUNCH_DS(2) }
+    #undef TQ_GDN_LAUNCH_DS
+    #undef TQ_GDN_LAUNCH
+    k_tq_deltanet_norm<<<value_heads * n, dim, 0, st>>>(core_out, core_out, z, norm_weight, value_heads, dim, eps);
+    return 0;
+}
+
 // Deterministic synthetic fill for the check/bench harness (same values feed the
 // reference per-token loop and the chunk kernel, so any diff is purely the two
 // kernels' numerics). Bounded ~O(1) q/k/v so the L2 norm + gating are exercised.
@@ -27539,6 +27999,109 @@ __global__ void k_tq_linear_conv_chunk(float *out, float *state, const float *x,
     for (int j = 0; j < kernel_size; j++) s[j] = win[j];
 }
 
+// Session 11 test ABI (analysis/gdn_ab.py): the paged prefill's DeltaNet path as served (k_tq_linear_conv_chunk +
+// k_tq_deltanet_chunk_hs<8,128,2,8,DS> + k_tq_deltanet_norm) vs the gdn path (k_tq_gdn_prep + k_tq_gdn_chunk<KT,DS> +
+// norm, TQ_GDN_PREFILL = mode) from identical synthetic inputs (pre-conv qkv, z, b, a, the slot's conv window, the
+// recurrent state in format ds, positions pos0..pos0+N-1): bitwise comparison of core_out, of the recurrent state's
+// bytes and of the conv window, then `iters` timed runs of each. mism[3] = differing elements (core, state bytes, conv
+// window), ms[2] = ms per segment (old, new). Returns 0 on success.
+extern "C" int qwn_gdn_prefill_ab(int layer, int N, int ds, int mode, int iters, int pos0, int *mism, float *ms) {
+    if (!g_qwen.initialized) return -1;
+    if (layer < 0 || layer >= g_qwen.L) return -2;
+    if (g_qwen.layer_types[layer] != TQ_LAYER_LINEAR_ATTENTION) return -3;
+    if (N <= 0 || N > 256 || ds < 0 || ds > 4 || mode < 1 || mode > 3) return -4;
+    tq_layer_t *l = &g_qwen.layers[layer];
+    int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads, D = g_qwen.linear_value_head_dim;
+    int KS = g_qwen.linear_conv_kernel_dim;
+    if (D != 128) return -5;
+    int key_dim = key_heads * D, value_dim = heads * D, conv_dim = 2 * key_dim + value_dim;
+    size_t state_f = (size_t)heads * D * D, conv_f = (size_t)conv_dim * KS;
+    size_t es = tq_ds_elem_bytes(ds), state_b = state_f * es;
+    cudaStream_t st = g_qwen.stream;
+    size_t nx = (size_t)N * conv_dim, nz = (size_t)N * value_dim, nba = (size_t)N * heads;
+    float *d_xa = 0, *d_xb = 0, *d_z = 0, *d_b = 0, *d_a = 0, *d_s32 = 0, *d_ca = 0, *d_cb = 0, *d_coa = 0, *d_cob = 0;
+    void *d_sa = 0, *d_sb = 0; int *d_pos = 0;
+    int rc = 0;
+    if (cudaMalloc(&d_xa, nx * 4) || cudaMalloc(&d_xb, nx * 4) || cudaMalloc(&d_z, nz * 4) || cudaMalloc(&d_b, nba * 4) ||
+        cudaMalloc(&d_a, nba * 4) || cudaMalloc(&d_s32, state_f * 4) || cudaMalloc(&d_ca, conv_f * 4) || cudaMalloc(&d_cb, conv_f * 4) ||
+        cudaMalloc(&d_coa, nz * 4) || cudaMalloc(&d_cob, nz * 4) || cudaMalloc(&d_sa, state_b) || cudaMalloc(&d_sb, state_b) ||
+        cudaMalloc(&d_pos, (size_t)N * 4)) rc = -6;
+    size_t hmax = nx > state_f ? nx : state_f;
+    float *h = (float *)malloc(hmax * 4);
+    int *hp = (int *)malloc((size_t)N * 4);
+    unsigned char *ha = (unsigned char *)malloc(state_b), *hb = (unsigned char *)malloc(state_b);
+    float *hca = (float *)malloc(conv_f * 4), *hcb = (float *)malloc(conv_f * 4);
+    float *hoa = (float *)malloc(nz * 4), *hob = (float *)malloc(nz * 4);
+    if (rc == 0) {
+        deltanet_synth_fill(h, nx, 0); cudaMemcpyAsync(d_xa, h, nx * 4, cudaMemcpyHostToDevice, st); cudaMemcpyAsync(d_xb, h, nx * 4, cudaMemcpyHostToDevice, st);
+        cudaStreamSynchronize(st);
+        deltanet_synth_fill(h, nz, 1); cudaMemcpyAsync(d_z, h, nz * 4, cudaMemcpyHostToDevice, st); cudaStreamSynchronize(st);
+        deltanet_synth_fill(h, nba, 2); cudaMemcpyAsync(d_b, h, nba * 4, cudaMemcpyHostToDevice, st); cudaStreamSynchronize(st);
+        deltanet_synth_fill(h, nba, 3); cudaMemcpyAsync(d_a, h, nba * 4, cudaMemcpyHostToDevice, st); cudaStreamSynchronize(st);
+        // a recurrent state of a realistic magnitude (|S| up to ~2, the layers' p99.99 is ~1): 100x the harness fill
+        deltanet_synth_fill(h, state_f, 4); for (size_t i = 0; i < state_f; i++) h[i] *= 100.0f;
+        cudaMemcpyAsync(d_s32, h, state_f * 4, cudaMemcpyHostToDevice, st); cudaStreamSynchronize(st);
+        deltanet_synth_fill(h, conv_f, 0); cudaMemcpyAsync(d_ca, h, conv_f * 4, cudaMemcpyHostToDevice, st); cudaMemcpyAsync(d_cb, h, conv_f * 4, cudaMemcpyHostToDevice, st);
+        for (int t = 0; t < N; t++) hp[t] = pos0 + t;
+        cudaMemcpyAsync(d_pos, hp, (size_t)N * 4, cudaMemcpyHostToDevice, st);
+        unsigned g = (unsigned)((state_f + 255) / 256);
+        switch (ds) {
+            case 1: k_tq_ds_from_f32<1><<<g, 256, 0, st>>>(d_sa, d_s32, state_f); break;
+            case 2: k_tq_ds_from_f32<2><<<g, 256, 0, st>>>(d_sa, d_s32, state_f); break;
+            case 3: k_tq_ds_from_f32<3><<<g, 256, 0, st>>>(d_sa, d_s32, state_f); break;
+            case 4: k_tq_ds_from_f32<4><<<g, 256, 0, st>>>(d_sa, d_s32, state_f); break;
+            default: cudaMemcpyAsync(d_sa, d_s32, state_f * 4, cudaMemcpyDeviceToDevice, st); break;
+        }
+        cudaMemcpyAsync(d_sb, d_sa, state_b, cudaMemcpyDeviceToDevice, st);
+        cudaStreamSynchronize(st);
+        // old path
+        k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, st>>>(d_xa, d_ca, d_xa, l->d_linear_conv1d, conv_dim, KS, N);
+        rc = launch_deltanet_chunk_hs_ds(ds, d_coa, d_sa, d_xa, d_z, d_b, d_a, l->d_linear_A_log, l->d_linear_dt_bias,
+                                         l->d_linear_norm, N, heads, key_heads, D, g_qwen.eps, st, d_pos);
+        // gdn path
+        if (rc == 0)
+            rc = launch_gdn_prefill(mode, ds, d_cob, d_sb, d_cb, d_xb, d_z, d_b, d_a, l->d_linear_A_log, l->d_linear_dt_bias,
+                                    l->d_linear_conv1d, l->d_linear_norm, N, heads, key_heads, D, KS, g_qwen.eps, st, d_pos);
+        if (cudaStreamSynchronize(st) != cudaSuccess || cudaGetLastError() != cudaSuccess) rc = rc ? rc : -7;
+    }
+    if (rc == 0) {
+        cudaMemcpy(hoa, d_coa, nz * 4, cudaMemcpyDeviceToHost); cudaMemcpy(hob, d_cob, nz * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(ha, d_sa, state_b, cudaMemcpyDeviceToHost); cudaMemcpy(hb, d_sb, state_b, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hca, d_ca, conv_f * 4, cudaMemcpyDeviceToHost); cudaMemcpy(hcb, d_cb, conv_f * 4, cudaMemcpyDeviceToHost);
+        int m0 = 0, m1 = 0, m2 = 0;
+        for (size_t i = 0; i < nz; i++) m0 += memcmp(&hoa[i], &hob[i], 4) != 0;
+        for (size_t i = 0; i < state_b; i++) m1 += ha[i] != hb[i];
+        for (size_t i = 0; i < conv_f; i++) m2 += memcmp(&hca[i], &hcb[i], 4) != 0;
+        if (m0 || m1) {   // first differing core element, for the log
+            for (size_t i = 0; i < nz; i++) if (memcmp(&hoa[i], &hob[i], 4) != 0) {
+                fprintf(stderr, "[gdn_ab] first core diff at tok %zu col %zu: old %.9g new %.9g\n", i / value_dim, i % value_dim, hoa[i], hob[i]); break; }
+        }
+        mism[0] = m0; mism[1] = m1; mism[2] = m2;
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventRecord(e0, st);
+        for (int it = 0; it < iters; it++) {
+            k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, st>>>(d_xa, d_ca, d_xa, l->d_linear_conv1d, conv_dim, KS, N);
+            launch_deltanet_chunk_hs_ds(ds, d_coa, d_sa, d_xa, d_z, d_b, d_a, l->d_linear_A_log, l->d_linear_dt_bias,
+                                        l->d_linear_norm, N, heads, key_heads, D, g_qwen.eps, st, d_pos);
+        }
+        cudaEventRecord(e1, st); cudaEventSynchronize(e1);
+        float ms_a = 0; cudaEventElapsedTime(&ms_a, e0, e1);
+        cudaEventRecord(e0, st);
+        for (int it = 0; it < iters; it++)
+            launch_gdn_prefill(mode, ds, d_cob, d_sb, d_cb, d_xb, d_z, d_b, d_a, l->d_linear_A_log, l->d_linear_dt_bias,
+                               l->d_linear_conv1d, l->d_linear_norm, N, heads, key_heads, D, KS, g_qwen.eps, st, d_pos);
+        cudaEventRecord(e1, st); cudaEventSynchronize(e1);
+        float ms_b = 0; cudaEventElapsedTime(&ms_b, e0, e1);
+        ms[0] = iters > 0 ? ms_a / iters : 0.0f; ms[1] = iters > 0 ? ms_b / iters : 0.0f;
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        if (cudaGetLastError() != cudaSuccess) rc = -8;
+    }
+    free(h); free(hp); free(ha); free(hb); free(hca); free(hcb); free(hoa); free(hob);
+    cudaFree(d_xa); cudaFree(d_xb); cudaFree(d_z); cudaFree(d_b); cudaFree(d_a); cudaFree(d_s32); cudaFree(d_ca); cudaFree(d_cb);
+    cudaFree(d_coa); cudaFree(d_cob); cudaFree(d_sa); cudaFree(d_sb); cudaFree(d_pos);
+    return rc;
+}
+
 static int ensure_pf_colslot(int T) {
     if (g_pf_colslot_cap >= T) return 0;
     graph_invalidate();
@@ -27614,6 +28177,14 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_proj_pair(&l->linear_in_b, g_wide_b, &l->linear_in_a, g_wide_a, T)) != 0) return -98;
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
+                if (tq_gdn_prefill_mode() != 0) {   // session 11: hoisted prep + register-resident chunk kernel (bitwise)
+                    if (launch_gdn_prefill(tq_gdn_prefill_mode(), g_pg_dstate, g_wide_lcore + (size_t)off * value_dim,
+                            pg_recur_slot(L, slot), g_pg_conv[L] + (size_t)slot * conv_f, g_wide_qkv + (size_t)off * conv_dim,
+                            g_wide_z + (size_t)off * value_dim, g_wide_b + (size_t)off * lvh, g_wide_a + (size_t)off * lvh,
+                            l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_conv1d, l->d_linear_norm, n, lvh, lkh, ld,
+                            g_qwen.linear_conv_kernel_dim, g_qwen.eps, g_qwen.stream, g_wide_pos + off) != 0) return -99;
+                    continue;
+                }
                 k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
                     g_wide_qkv + (size_t)off * conv_dim, g_pg_conv[L] + (size_t)slot * conv_f,
                     g_wide_qkv + (size_t)off * conv_dim, l->d_linear_conv1d, conv_dim, g_qwen.linear_conv_kernel_dim, n);
