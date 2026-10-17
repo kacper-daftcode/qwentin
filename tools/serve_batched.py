@@ -28,8 +28,11 @@ Run (GPU7, prod Q4):
 
 Defaults since 10-16 (owner, HANDOFF Decisions 16): --kv-v4 --kv-t4 (trellis-4 K+V, 16.5 KiB/token), --spec (the paged
 MTP drafter; needs the --mtp-exl3 tqf, e.g. qwen3_8-27b-exl3-opt5.75-mtp4.tqf, else it warns and runs plain decode) and
-the engine's TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4). The served line: 12 slots, --num-blocks 4100 (525K pooled
-tokens; 4600 = 589K with --no-spec). --no-kv-t4 / --no-spec / TQ_PAGED_ATTN_ST=1 revert to the 10-13 stack.
+the engine's TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4). Since 10-17 also --dstate fp16sr (DeltaNet state in fp16 with
+deterministic stochastic rounding, 80 MiB/slot) and --decode-steps-per-wave 1, with the engine defaults TQ_T4_ATTN_F16=1
+TQ_GRAPH=1 TQ_GEMM_FORK=1. The served line on one 32 GB RTX 5090: 12 slots, --num-blocks 4500 (576K pooled tokens;
+~5000 = 640K with --no-spec). --no-kv-t4 / --no-spec / TQ_PAGED_ATTN_ST=1 revert to the 10-13 stack; TQ_T4_ATTN_F16=0
+TQ_GRAPH=0 TQ_GEMM_FORK=0 --dstate fp32 --decode-steps-per-wave 0 --num-blocks 4100 restore the 10-16 line bit for bit.
 """
 from __future__ import annotations
 import argparse, ctypes, json, os, sys, threading, time, queue, uuid
@@ -103,10 +106,15 @@ def tqf_has_exl3_mtp(path):
 
 
 def default_t4_codebook():
-    """analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this checkout (<repo>/tools/..): the
-    project dir that holds the qwentin checkout (../../analysis) or the repo itself (../analysis); else the project path."""
-    rel = os.path.join("analysis", "kv_trellis_cuda", "codebooks", "lloyd_kv12a.f32")
+    """The trellis-KV codebook for --kv-t4: 4096 raw little-endian fp32 entries (the Lloyd-trained 12-bit-state codebook
+    `lloyd_kv12a`, 16 KB). Looked up, in order: the copy shipped with the repo (tools/codebooks/lloyd_kv12a.f32, next to
+    this file), then the research project's analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this
+    checkout (<repo>/../analysis or <repo>/analysis), else that project's absolute path (the historical default)."""
     here = os.path.dirname(os.path.abspath(__file__))
+    shipped = os.path.join(here, "codebooks", "lloyd_kv12a.f32")
+    if os.path.exists(shipped):
+        return shipped
+    rel = os.path.join("analysis", "kv_trellis_cuda", "codebooks", "lloyd_kv12a.f32")
     for base in (os.path.join(here, ".."), os.path.join(here, "..", "..")):
         p = os.path.normpath(os.path.join(base, rel))
         if os.path.exists(p):
@@ -1351,7 +1359,8 @@ def main():
                          "--no-kv-t4 reverts to FP4 K+V (size with analysis/pool_size.py).")
     ap.add_argument("--no-kv-t4", dest="kv_t4", action="store_false")
     ap.add_argument("--kv-t4-codebook", default=default_t4_codebook(),
-                    help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK); default: "
+                    help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK); default: the shipped "
+                         "tools/codebooks/lloyd_kv12a.f32 (the Lloyd-trained 12-bit-state codebook), else "
                          "analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this checkout")
     ap.add_argument("--pdl", dest="pdl", action="store_true", default=True,
                     help="programmatic dependent launch in the decode step (TQ_PDL=1, default): each EXL3 GEMM and "
@@ -1415,7 +1424,7 @@ def main():
             sys.exit("--kv-t4 needs --kv-v4 (the open page is staged as int4 K + V)")
         if not os.path.exists(os.environ["TQ_KV_T4_CODEBOOK"]):
             sys.exit(f"--kv-t4: codebook {os.environ['TQ_KV_T4_CODEBOOK']} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
-                     f"analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 of the qwen256k project)")
+                     f"the repo ships it as tools/codebooks/lloyd_kv12a.f32)")
     os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
     os.environ.setdefault("TQ_DSTATE_BF16", str(args.dstate))
     if args.bench:
