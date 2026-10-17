@@ -20,19 +20,21 @@ text is injected into the prompt; URL-free lookup turns (gated by an intent
 regex) go to DuckDuckGo and the top results are injected. A web_search_call
 item is emitted either way.
 
-Reservoir Dogs -- the LLobotomy connection, in two halves:
-1) Bark (opt-in): --bark-all-day ports LLobotomy's Optimal-Transport refusal
-   intervention into the engine itself. The rank-2 OT map from a save_maps JSON
-   is applied on-device right after the hooked decoder layers in every forward
-   path (wide prefill, per-node spec verify, dense decode) -- the served tower
-   is the lobotomized tower, at spec-decode speed. See README ("--bark-all-day")
-   for scale tuning; kernel parity is gated by tools/ot_hook_check.py.
-2) Watchdog + fallback-drafter ladder (default ON): every spec round is
-   supervised. accept_len-EMA collapse walks the drafter down a (depth, k)
-   ladder (6/3 -> 4/2 -> 2/1); a hard round error moves the rest of the request
-   to dense qwn_decode; a round exceeding --dogs-hang-s triggers a
-   persistent-kernel scratch dump. All rungs are lossless w.r.t. the target
-   distribution -- the ladder only gives up speed.
+Residual-stream steering hook (opt-in): --residual-map PATH arms one affine map
+per hooked decoder layer, x += scale * (shift + P (A - I)^T P^T (x - mu)),
+applied on-device right after that layer in every forward path (wide prefill,
+per-node spec verify, dense decode). The maps file carries the layers and the
+scale (tools/residual_map.py documents the format); --residual-map-decay /
+--residual-map-sched-api schedule the scale over a request. Kernel-vs-numpy
+parity: tools/residual_map_check.py. The 2026-08 flags (--bark-all-day, --ot-*,
+--bark-*) are deprecated aliases for one release.
+
+Reservoir Dogs -- watchdog + fallback-drafter ladder (default ON): every spec
+round is supervised. accept_len-EMA collapse walks the drafter down a (depth, k)
+ladder (6/3 -> 4/2 -> 2/1); a hard round error moves the rest of the request
+to dense qwn_decode; a round exceeding --dogs-hang-s triggers a
+persistent-kernel scratch dump. All rungs are lossless w.r.t. the target
+distribution -- the ladder only gives up speed.
 
 Prefix/KV cache between requests (--prefix-cache, default ON): every prefill
 drops a DeltaNet snapshot (slot 0) at the last 16-aligned chunk boundary
@@ -66,6 +68,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mtp_spec_smoke import load_lib, Eng, prefill, ck  # noqa: E402
 from serve_common import (BodyError, add_hardening_args, apply_socket_timeout, auth_ok, clamp_fields,  # noqa: E402
                           clamp_max_tokens, read_json_body, unauthorized_body)
+from residual_map import (add_residual_map_args, resolve_residual_map_args, load_residual_map,  # noqa: E402
+                          arm_residual_map, parse_decay, request_decay)
 from transformers import AutoTokenizer  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -92,39 +96,14 @@ ap.add_argument("--dogs-hang-s", type=float, default=10.0,
                 help="log + persistent-kernel scratch dump when a single spec round exceeds this")
 ap.add_argument("--dogs-exit-on-hang", action="store_true", default=False,
                 help="os._exit(3) after a hung-round dump (pair with a supervisor that restarts)")
-ap.add_argument("--bark-all-day", action="store_true", default=False,
-                help="arm the LLobotomy OT intervention inside the engine: residual-stream"
-                     " hooks from --ot-maps applied after --ot-layers in every forward"
-                     " path (wide prefill / spec verify / dense decode) -- the served"
-                     " tower is the lobotomized tower, at spec-decode speed")
-ap.add_argument("--ot-maps", default=os.environ.get("TQ_OT_MAPS", ""),
-                help="LLobotomy save_maps JSON (default $TQ_OT_MAPS)")
-ap.add_argument("--ot-layers", default="37,38",
-                help="comma-separated hooked decoder layers (auto-tuned for Qwen3.8-27B: 37,38)")
-ap.add_argument("--ot-scale", type=float, default=0.47,
-                help="OT intervention scale, from tools/bark_autotune.py on the FP6 tower"
-                     " (2026-08-16): refusal leaks 5/6 @0.21, 2/6 @0.40-0.44, clean 0/6 from"
-                     " 0.47 up; below that the bf16-HF lab value (0.21) does not transfer."
-                     " Re-tune per tower/quantization: probe through the live API")
-ap.add_argument("--bark-decay-default", default=os.environ.get("TQ_BARK_DECAY", ""),
-                help="default bark schedule for every request: END,LEN[,reset] "
-                     "e.g. 0.35,400,reset -- scale decays --ot-scale->END over LEN "
-                     "generated tokens, restarting after </think>. Empty = fixed scale. "
-                     "Env: TQ_BARK_DECAY")
+add_residual_map_args(ap)   # --residual-map PATH, -layers, -scale, -decay, -sched-api (+ hidden deprecated aliases)
 ap.add_argument("--think-cap", type=int, default=int(os.environ.get("TQ_THINK_CAP", 0) or 0),
                 help="max generated thinking tokens before a synthetic close: when a"
                      " thinking request fails to emit </think> within CAP tokens (+8 slack),"
                      " generation pauses, the close tag is emitted synthetically, and the"
                      " answer continues in a second phase that live-reuses the engine state"
-                     " (~1 prefill token). Breaks unbounded barked-tower deliberation"
-                     " (loop or not) without losing the answer. 0 disables. Env: TQ_THINK_CAP")
-ap.add_argument("--bark-sched-api", action="store_true", default=False,
-                help="allow per-request bark schedules via the bark_decay request field "
-                     "(keys: end, len, reset_think): the OT scale decays linearly from "
-                     "--ot-scale to end over len generated tokens -- refusal is front-loaded, "
-                     "so dose the opening hard and spare the tail (loop accumulation is "
-                     "exposure-time). reset_think restarts the decay when </think> commits. "
-                     "Requests without bark_decay run the fixed scale. Test knob.")
+                     " (~1 prefill token). Breaks unbounded deliberation (loop or not)"
+                     " without losing the answer. 0 disables. Env: TQ_THINK_CAP")
 ap.add_argument("--prefix-cache", dest="prefix_cache", action="store_true", default=True,
                 help="reuse engine state across requests sharing a token prefix (default ON)")
 ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
@@ -146,11 +125,16 @@ ap.add_argument("--wide-prefill", dest="wide_prefill", action="store_true", defa
                      "unless those env vars are set explicitly (env always wins).")
 ap.add_argument("--no-wide-prefill", dest="wide_prefill", action="store_false")
 args = ap.parse_args()
+try:
+    for _note in resolve_residual_map_args(args):      # the 2026-08 flag spelling, one notice each
+        print(_note, file=sys.stderr, flush=True)
+except ValueError as _e:
+    sys.exit(str(_e))
 
 # ----------------------------- Reservoir Dogs -----------------------------
-# The crew that keeps the spec-decode heist on schedule when the tower came
-# through LLobotomy (refusal direction cut) and its decode distribution can
-# drift away from what the MTP drafter was calibrated on:
+# The crew that keeps the spec-decode heist on schedule when the tower's decode
+# distribution drifts away from what the MTP drafter was calibrated on (a
+# steering map on the residual stream, an unusual prompt regime, a bad round):
 #
 #   Mr. Blonde  shoots first  : full --depth/--k drafting (the ship config).
 #   Mr. Orange  bleeds        : accept_len EMA collapses (draft/verify drift)
@@ -319,57 +303,42 @@ if args.prefix_cache_live and EOS_IDS:
 if args.dogs:
     LIB.qwn_spec_persist_dump.restype = ctypes.c_int
     LIB.qwn_spec_persist_dump.argtypes = [ctypes.POINTER(ctypes.c_int)]
-BARK = None
+# Residual-stream steering hook: one affine map per hooked layer, armed once at
+# startup through the engine's hook ABI (symbols still named qwn_ot_*; rename
+# deferred). RMAP is None when the server runs the plain tower.
+RMAP = None
 DEF_SCHED = None
-if args.bark_all_day:
-    if not args.ot_maps:
-        sys.exit("--bark-all-day needs --ot-maps PATH (or TQ_OT_MAPS)")
-    import numpy as _np
-    _maps = json.load(open(args.ot_maps))["ot_maps"]
-    LIB.qwn_ot_hook_add.restype = ctypes.c_int
-    LIB.qwn_ot_hook_add.argtypes = ([ctypes.c_int, ctypes.c_float] +
-                                    [ctypes.POINTER(ctypes.c_float)] * 4)
-    _H = int(LIB.qwn_hidden_size())
-    _armed = []
-    for _ln in [int(x) for x in args.ot_layers.split(",") if x.strip()]:
-        m = _maps[str(_ln)]
-        P  = _np.ascontiguousarray(_np.asarray(m["P"], dtype=_np.float32))
-        A  = _np.ascontiguousarray(_np.asarray(m["A_k_minus_I"], dtype=_np.float32)).reshape(4)
-        mu = _np.ascontiguousarray(_np.asarray(m["mu_H"], dtype=_np.float32))
-        ms = _np.ascontiguousarray(_np.asarray(m["mean_shift"], dtype=_np.float32))
-        assert P.shape == (_H, 2) and mu.shape == (_H,) and ms.shape == (_H,), (P.shape, mu.shape)
-        def _f32p(a):
-            return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        ck(LIB.qwn_ot_hook_add(_ln, ctypes.c_float(args.ot_scale),
-                               _f32p(P), _f32p(A), _f32p(mu), _f32p(ms)),
-           f"ot_hook_add layer {_ln}")
-        _armed.append(_ln)
+if args.residual_map:
+    try:
+        _rm = load_residual_map(args.residual_map, layers=args.residual_map_layers,
+                                scale=args.residual_map_scale, hidden_size=int(LIB.qwn_hidden_size()))
+        _armed = arm_residual_map(LIB, _rm)
+    except (OSError, ValueError, RuntimeError) as _e:
+        sys.exit(f"--residual-map: {_e}")
+    LIB.qwn_ot_hook_count.restype = ctypes.c_int
     assert int(LIB.qwn_ot_hook_count()) == len(_armed)
-    BARK = {"layers": _armed, "scale": args.ot_scale, "maps": os.path.basename(args.ot_maps)}
-    print(f"[bark] OT hooks armed on layers {_armed}, scale={args.ot_scale:g} "
-          f"({args.ot_maps}) -- the tower barks all day now", flush=True)
-    DEF_SCHED = None
-    if args.bark_decay_default:
-        _p = [x.strip() for x in args.bark_decay_default.split(",")]
-        DEF_SCHED = {"end": float(_p[0]),
-                     "len": int(_p[1]) if len(_p) > 1 and _p[1] else 192,
-                     "reset_think": len(_p) > 2 and _p[2] in ("reset", "1", "true"),
-                     "shape": _p[3] if len(_p) > 3 and _p[3] else "linear",
-                     "end_answer": float(_p[4]) if len(_p) > 4 and _p[4] else None,
-                     "len_answer": int(_p[5]) if len(_p) > 5 and _p[5] else 400}
-        print(f"[bark] default schedule -> {DEF_SCHED}", flush=True)
-    if args.bark_sched_api or DEF_SCHED is not None:
+    RMAP = {"layers": _armed, "scale": _rm["scale"], "maps": os.path.basename(args.residual_map)}
+    print(f"[residual-map] armed on layers {_armed}, scale={_rm['scale']:g} ({args.residual_map})", flush=True)
+    try:
+        DEF_SCHED = parse_decay(args.residual_map_decay)
+    except ValueError as _e:
+        sys.exit(f"--residual-map-decay: {_e}")
+    if DEF_SCHED is not None:
+        print(f"[residual-map] default schedule -> {DEF_SCHED}", flush=True)
+    if args.residual_map_sched_api or DEF_SCHED is not None:
         LIB.qwn_ot_set_scale.restype = ctypes.c_int
         LIB.qwn_ot_set_scale.argtypes = [ctypes.c_int, ctypes.c_float]
-    if args.bark_sched_api:
-        print("[bark] schedule API on: per-request bark_decay overrides accepted", flush=True)
+    if args.residual_map_sched_api:
+        print("[residual-map] schedule API on: per-request residual_map_decay overrides accepted", flush=True)
+elif args.residual_map_decay or args.residual_map_sched_api or args.residual_map_layers or args.residual_map_scale is not None:
+    print("[serve] note: --residual-map-* flags given without --residual-map PATH: no hook armed", flush=True)
 print(f"[serve] ready on :{args.port} (eos={sorted(EOS_IDS)}, "
       f"prefix_cache={'on' if args.prefix_cache else 'off'}"
       f"{'+live' if args.prefix_cache_live else ''}, "
       f"thinking={'off (default)' if args.no_thinking else 'template-default (on)'}, "
       f"wide_prefill={'on' if os.environ.get('TQ_WIDE_PREFILL', '0') not in ('', '0') else 'off'}"
       f"+mma={'on' if os.environ.get('TQ_WIDE_ATTN_MMA', '0') not in ('', '0') else 'off'}"
-      f"{', bark=' + str(BARK['layers']) + '@' + format(BARK['scale'], 'g') if BARK else ''})", flush=True)
+      f"{', residual_map=' + str(RMAP['layers']) + '@' + format(RMAP['scale'], 'g') if RMAP else ''})", flush=True)
 if args.dogs:
     print(f"[serve] dogs on: ladder {' -> '.join(_dogs_ladder_labels(_dogs_ladder(args.depth, args.k)))} "
           f"(accept_min={args.dogs_accept_min:g}, min_rounds={args.dogs_min_rounds}, "
@@ -427,9 +396,9 @@ def _req_think_cap(req, thinking_primed):
 
 def _shape_fn(name, f, p=0.5):
     """Decay-shape curves on normalized progress f in [0,1]. All are convex
-    variants of 'thick short head, long thin tail' -- spiral risk is a
+    variants of 'thick short head, long thin tail' -- loop risk is a
     short-window residence effect, so leave the high-scale region fast but
-    never drop the refusal floor. linear=baseline; pow=f**p (p<1 front-decays);
+    never drop below the end scale. linear=baseline; pow=f**p (p<1 front-decays);
     exp=(1-e^-3f)/(1-e^-3); invlog=1/ln-normalized (the 1/ln(sqrt(x)) family)."""
     f = min(1.0, max(0.0, f))
     if f <= 0.0 or f >= 1.0:
@@ -445,19 +414,19 @@ def _shape_fn(name, f, p=0.5):
     return f   # linear
 
 
-def _bark_step(sched, n_out):
-    """Per-round bark schedule: shaped decay s0 -> s1 over L emitted tokens."""
+def _rmap_step(sched, n_out):
+    """Per-round residual-map schedule: shaped decay s0 -> s1 over L emitted tokens."""
     f = min(1.0, max(0, n_out - sched["base"]) / sched["L"])
     f = _shape_fn(sched.get("shape", "linear"), f, sched.get("p", 0.5))
     s = sched["s0"] + (sched["s1"] - sched["s0"]) * f
     if s != sched["applied"]:
-        for ln in BARK["layers"]:
+        for ln in RMAP["layers"]:
             LIB.qwn_ot_set_scale(ln, ctypes.c_float(s))
         sched["applied"] = s
 
 
 def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=False,
-             bark_decay=None, think_cap=0, thinking_primed=False, allow_live=False):
+             rmap_decay=None, think_cap=0, thinking_primed=False, allow_live=False):
     """Run spec rounds; call on_tokens(new_token_list) as chunks commit.
     Returns (gen_count, finish_reason, stats)."""
     P = len(prompt_ids)
@@ -465,16 +434,16 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
     with ENG_LOCK:
         LIB.qwn_set_sampling(ctypes.c_float(temp), ctypes.c_ulonglong(seed))
         sched = None
-        bd = bark_decay if (args.bark_sched_api and isinstance(bark_decay, dict)) else None
+        bd = rmap_decay if (args.residual_map_sched_api and isinstance(rmap_decay, dict)) else None
         if bd is None:
             bd = DEF_SCHED
-        # bark only when thinking is OFF: on thinking-primed requests the OT
-        # intervention on the think channel produced deterministic recall loops
-        # (measured 2026-08-18 and before). Thinking turns always run clean,
-        # even when the request carries an explicit bark_decay override.
-        if (BARK is not None and isinstance(bd, dict) and bd.get("end") is not None
+        # the schedule runs only when thinking is OFF: on thinking-primed
+        # requests a decaying map on the think channel produced deterministic
+        # recall loops (measured 2026-08-18 and before). Thinking turns keep the
+        # armed scale, even when the request carries an explicit override.
+        if (RMAP is not None and isinstance(bd, dict) and bd.get("end") is not None
                 and not thinking_primed):
-            sched = {"s0": float(bd.get("start", args.ot_scale)), "s1": float(bd["end"]),
+            sched = {"s0": float(bd.get("start", RMAP["scale"])), "s1": float(bd["end"]),
                      "L": max(1, int(bd.get("len") or 192)),
                      "reset": bool(bd.get("reset_think")),
                      "shape": str(bd.get("shape") or "linear"),
@@ -484,7 +453,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                      "Lb": (max(1, int(bd["len_answer"])) if bd.get("len_answer") is not None
                             else None),
                      "reset_done": False, "base": 0, "applied": None}
-            _bark_step(sched, 0)            # prefill itself runs at s0
+            _rmap_step(sched, 0)            # prefill itself runs at s0
         # ---- prefix-cache decision (token-level, against the LAST request) ----
         mode, reused = "full", 0
         if args.prefix_cache and not no_cache and PC["valid"]:
@@ -571,7 +540,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                     finish = "think_cap"
                     break
                 if sched is not None:
-                    _bark_step(sched, len(out))
+                    _rmap_step(sched, len(out))
                 if dense:
                     nt = LIB.qwn_decode(int(cur_seed), int(cur_pos))
                     if nt < 0:
@@ -632,8 +601,8 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
                     break
         finally:
             if sched is not None and sched["applied"] is not None:
-                for ln in BARK["layers"]:
-                    LIB.qwn_ot_set_scale(ln, ctypes.c_float(args.ot_scale))
+                for ln in RMAP["layers"]:
+                    LIB.qwn_ot_set_scale(ln, ctypes.c_float(RMAP["scale"]))
         dt = time.time() - t1
         if finish != "error":
             _pc_store(prompt_ids, anchor_in_slot, eng_extra, temp, rounds)
@@ -642,12 +611,14 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
              "gen_tok_s": round(len(out) / dt, 1) if dt > 0 else None,
              "prefix": mode, "reused_tokens": reused,
              "prefilled_tokens": P - reused}
-    if sched is not None:
-        stats["bark_sched"] = {"s0": sched["s0"], "s1": sched["s1"], "L": sched["L"],
-                               "reset": sched["reset"], "reset_done": sched["reset_done"],
-                               "shape": sched.get("shape", "linear"),
-                               "final": sched["applied"],
-                               "s1_now": sched["s1"], "L_now": sched["L"]}
+    if RMAP is not None:
+        stats["residual_map"] = {"layers": list(RMAP["layers"]), "scale": RMAP["scale"], "schedule": None}
+        if sched is not None:
+            stats["residual_map"]["schedule"] = {
+                "s0": sched["s0"], "s1": sched["s1"], "L": sched["L"],
+                "reset": sched["reset"], "reset_done": sched["reset_done"],
+                "shape": sched.get("shape", "linear"), "final": sched["applied"],
+                "s1_now": sched["s1"], "L_now": sched["L"]}
     if dogs is not None:
         stats["dogs"] = {"ladder": _dogs_ladder_labels(dogs.ladder),
                          "final": "dense" if dense else dogs.label,
@@ -677,7 +648,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
             bd2["reset_think"] = False
         n2, finish, st2 = generate(p2, max(1, max_new - n1), temp, seed,
                                    on_tokens, no_cache=no_cache, dbg=dbg,
-                                   bark_decay=bd2, allow_live=True)
+                                   rmap_decay=bd2, allow_live=True)
         st2["think_cap"] = {"cap": think_cap, "think_tokens": n1,
                             "phase1": {k: stats.get(k) for k in
                                        ("rounds", "gen_s", "prefill_s")}}
@@ -703,7 +674,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         rescue = min(768, max(64, args.ctx - len(p2) - 2))
         n2, finish, st2 = generate(p2, rescue, temp, seed, on_tokens,
                                    no_cache=no_cache, dbg=dbg,
-                                   bark_decay=bd2, allow_live=True)
+                                   rmap_decay=bd2, allow_live=True)
         st2["think_overflow"] = {"think_tokens": n1, "rescue": rescue,
                                  "phase1": {k: stats.get(k) for k in
                                             ("rounds", "gen_s", "prefill_s")}}
@@ -811,7 +782,7 @@ def parse_tool_calls(text, tools=None):
 # --------------------------- /v1/responses ---------------------------
 # Minimal-but-correct OpenAI Responses API surface so the Codex CLI (which
 # dropped wire_api=chat) runs against the local tower. Translates the item
-# list to our chat messages, reuses the same generate() path (dogs, bark,
+# list to our chat messages, reuses the same generate() path (dogs, residual map,
 # prefix cache all active), and re-emits the result as Responses SSE events.
 
 # ----------------------- hosted web_search -----------------------
@@ -1113,7 +1084,7 @@ class H(BaseHTTPRequestHandler):
     def _do_responses(self, req):
         """POST /v1/responses: Codex-CLI-grade subset (message/function_call items,
         plain-text streaming, tool calling). Internally the same engine path as
-        /v1/chat/completions -- dogs bark identically."""
+        /v1/chat/completions -- Dogs and the residual map behave identically."""
         msgs, tools = responses_to_chat_inputs(req)
         ws_item = None
         if any(isinstance(t, dict) and t.get("type") in _HOSTED_TOOLS
@@ -1158,7 +1129,7 @@ class H(BaseHTTPRequestHandler):
         no_cache = bool(req.get("tl_no_cache", False))
         dbg = bool(req.get("tl_debug", False))
         # clients that omit temperature (Codex) get the engine's greedy path:
-        # temp=1.0 sampling turns a barked tower erratic in long agentic prompts
+        # temp=1.0 sampling turned a steered tower erratic in long agentic prompts
         temp = float(req.get("temperature", 0.0))
         seed = int(req.get("seed", int.from_bytes(os.urandom(4), "little")))
         # 8192 default: clients that omit max_output_tokens (Codex app-server
@@ -1319,7 +1290,7 @@ class H(BaseHTTPRequestHandler):
 
         try:
             ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
-                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
+                                           no_cache=no_cache, dbg=dbg, rmap_decay=request_decay(req),
                                            think_cap=_req_think_cap(req, thinking_primed),
                                            thinking_primed=thinking_primed)
         except BrokenPipeError:
@@ -1571,7 +1542,7 @@ class H(BaseHTTPRequestHandler):
                      "created": created, "model": args.model_name, "choices": [ch]})
 
             ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens,
-                                           no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
+                                           no_cache=no_cache, dbg=dbg, rmap_decay=request_decay(req),
                                            think_cap=_req_think_cap(req, thinking_primed),
                                            thinking_primed=thinking_primed)
             stats.update(clamp_fields(clamped_from, args.max_tokens_cap))
@@ -1602,7 +1573,7 @@ class H(BaseHTTPRequestHandler):
             text_parts.append(TOK.decode(toks))
 
         ngen, finish, stats = generate(list(ids), max_new, temp, seed, on_tokens_ns,
-                                       no_cache=no_cache, dbg=dbg, bark_decay=req.get("bark_decay"),
+                                       no_cache=no_cache, dbg=dbg, rmap_decay=request_decay(req),
                                            think_cap=_req_think_cap(req, thinking_primed),
                                            thinking_primed=thinking_primed)
         stats.update(clamp_fields(clamped_from, args.max_tokens_cap))
