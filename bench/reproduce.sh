@@ -19,6 +19,9 @@
 #   LIB=/path/to/libforward_qwen.so                  optional   default: the library built in step 1 (build-qwen-repro/)
 #   NVCC=/usr/local/cuda-13.1/bin/nvcc               optional   default: /usr/local/cuda-13.1/bin/nvcc if present, else `nvcc` on PATH
 #   PYTHON=python3  GPU=0  PORT=8100  CORPUS=<this repo>  OUT_DIR=bench  MAX_SLOTS=12  NUM_BLOCKS=4500  MODEL_NAME=qwen3.8-27b
+#   NOTE: the spec-decode speed depends on the prompt text (accepted draft length). The README's 167 / 81 tok/s were measured
+#   on a checkout of github.com/vllm-project/vllm (CORPUS=<that checkout>); on this repository's own code the first run gave
+#   129 / 72 (bench/results-20261017-145336-3e349a3.json). TTFT, needle and spec-off decode do not depend on the corpus.
 #   --quality needs REF_DIR=/path/to/Qwen3.8-27B (the bf16 original) and E2E_DIR=/path/to/runs/e2e holding the reference
 #   states and the FP8 rows (docs/QUALITY.md section 5 (a) and (c) `ref`); it scores the 4K and 32K prefill cells.
 #

@@ -36,3 +36,4 @@ bench/*
 !bench/reproduce.sh
 # bench/results-<date>-<commit>.json and bench/work-*/ are run outputs; add a result file with `git add -f` to publish it.
 
+bench/work-*/
