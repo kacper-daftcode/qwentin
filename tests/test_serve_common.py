@@ -123,7 +123,7 @@ def test_add_hardening_args_defaults():
     assert a.host == "127.0.0.1"
     assert a.api_key is None
     assert a.max_body_bytes == 32 * 1024 * 1024
-    assert a.max_tokens_cap == 4096
+    assert a.max_tokens_cap == 16384
     assert a.socket_timeout == 600.0
     a = ap.parse_args(["--host", "0.0.0.0", "--api-key", "k", "--max-body-bytes", "1024", "--max-tokens-cap", "16", "--socket-timeout", "5"])
     assert (a.host, a.api_key, a.max_body_bytes, a.max_tokens_cap, a.socket_timeout) == ("0.0.0.0", "k", 1024, 16, 5.0)
