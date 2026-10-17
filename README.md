@@ -36,23 +36,39 @@ serves the 27B **at FP8 quality**, with **576K tokens of KV cache** shared by 12
 with speculative decoding on every stream — where the 2026-08 build held 196K pooled tokens at
 FP6 quality.
 
-**One 32 GB RTX 5090, 12 sessions** (ours measured 2026-10-17; the vLLM column is being
-measured by a separate run and is a placeholder until then):
+**One 32 GB RTX 5090, 12 sessions** — ours and stock vLLM measured on the same cards on
+2026-10-17 (vLLM `0.32.0rc1.dev281`, nightly image of 2026-10-16, prefix caching on; the NVFP4
+checkpoint is a llm-compressor W4A4 export of the bf16 model, 512 × 2048 calibration; the
+official FP8 checkpoint **does not fit one 5090** — it OOMs after loading 27.5 GiB of weights even
+at `--max-model-len 4096` — so its row is tensor-parallel on **two** cards; full tables, commands
+and caveats in `notes/baselines-vllm-20261017.md` of the research repo):
 
-| | **qwentin 2026-10** (EXL3 opt-5.75 + trellis KV + spec) | qwentin 2026-08 (FP6, previous README) | vLLM, stock (Qwen3.8-27B) |
-|---|---|---|---|
-| Weights | EXL3 trellis, 5.75 bpw (exllamav3 checkpoint), ~18.5 GiB on the device | FP6 E2M3, ~20 GiB | NVFP4 (FP8 does not fit) |
-| KV cache | 4-bit trellis-coded K+V, **16.5 KiB/token** | int4 K + E4M3 V, 26.2 KiB/token | *(to be measured)* |
-| Pooled context, 12 slots | **576K tokens** (`--num-blocks 4500`), 29 894 MiB (29.2 GiB) | 196K tokens (`--num-blocks 1536`) | *(to be measured)*; 2026-08: ~200k max context, ~2 sequences @128k |
-| Quality vs the bf16 original (KL / top-1, see protocol below) | **0.0022–0.0027 / 99.0–99.1 %** = the FP8 checkpoint's 0.0037 / 98.7 % or better | 0.0139 / 97.4 % (bf16-sourced tqf; 0.0169 / 97.1 % from the FP8 checkpoint) | *(to be measured)*; 2026-08 NVFP4: tf-top1 85.8 on the previous README's ladder (FP8 95.9, FP6 91.3) |
-| Decode per stream @32K, N = 1 / 4 / 8 | **167 / 109 / 81 tok/s** (65 / 56 / 47 spec off) | 142 tok/s (single-stream server, N = 1) | *(to be measured)*; 2026-08 NVFP4: 142 tok/s mean |
-| Decode per stream @128K, N = 1 / 2 | **133 / 111 tok/s** | 123 (N = 1) | *(to be measured)* |
-| Time to first token, cold, 32K / 128K | **15.9 s / 86.6 s** | 18.7 s / 116 s | *(to be measured)* |
-| Needle-in-a-repository (3 depths, 3 decoys) | 6/6 at 32K and 128K | 4/4 @239k | *(to be measured)* |
-| Decode under a concurrent long prefill (8-session mix) | 40 / 25 / 43 tok/s per client (32K / 96K / 160K classes) | — | *(to be measured)* |
+| | **qwentin 2026-10** (EXL3 opt-5.75 + trellis KV + spec), 1 card | vLLM NVFP4, 1 card (bf16 KV / `--kv-cache-dtype fp8`) | vLLM FP8, **2 cards** (TP2, bf16 KV) | qwentin 2026-08 (FP6, previous README), 1 card |
+|---|---|---|---|---|
+| Weights on the device | EXL3 trellis 5.75 bpw, ~18.5 GiB | NVFP4 4.5 bpw, 17.6 GiB (4.7 GiB of it bf16 embed + lm_head) | FP8, 13.8 GiB per card | FP6 E2M3, ~20 GiB |
+| KV cache | 4-bit trellis-coded K+V, **16.5 KiB/token** | bf16 K+V (832-token blocks) / fp8 | bf16 K+V | int4 K + E4M3 V, 26.2 KiB/token |
+| Max context accepted | **262 144, 12 slots** | 131 072 (262 144 rejected: "est. max 147 264") / 262 144 | 262 144 | 131 072 pooled |
+| Pooled KV capacity | **576K tokens** (`--num-blocks 4500`), 29 894 MiB total | **147–179K** (the same command gave both, cold vs warm compile cache) / 283K | 493K **across two cards** | 196K |
+| Sessions @128K | 4.4 | 1.1–1.4 / ~2.1 | 3.7 (two cards) | ~1.5 |
+| Quality vs the bf16 original (KL / top-1; protocol below) | **0.0022–0.0027 / 99.0–99.1 %** — the FP8 checkpoint's own 0.0037 / 98.7 % or better | NVFP4 PTQ: ~3.5× the KL of the 4.25-bpw EXL3 model in the project's fake-quant yardstick (≈ 0.04); 2026-08 tf-top1 85.8 on the previous ladder (FP8 95.9, FP6 91.3) | = the FP8 checkpoint (0.0037 / 98.7 %) | 0.0139 / 97.4 % |
+| Decode per stream @32K, N = 1 / 4 / 8 | **167 / 109 / 81 tok/s** (65 / 56 / 47 with spec decode off) | 71.5 / 51.4 / — (N = 8 does not fit the pool) / 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 (vLLM's own MTP spec path: 56 / 55 / 50 — slower than without) | 142 (N = 1, single-stream server) |
+| Decode per stream @128K, N = 1 | **133 tok/s** | 55.5 / 66.0 | 65.8 | 123 |
+| Time to first token, cold, 32K / 128K | 15.9 s / 86.6 s (~2 000 / ~1 500 prompt tok/s) | **3.1 s / 25.2 s** / 3.3 s / 30.0 s (~10 000 prompt tok/s) | **4.4 s / 24.1 s** | 18.7 s / 116 s |
+| Needle-in-a-repository (3 depths, 3 decoys) | 6/6 at 32K and 128K | 6/6 | 6/6 | 4/4 @239k |
+| Decode under a concurrent long prefill (8-session mix) | 40 / 25 / 43 tok/s per client (32K / 96K / 160K classes) | — | — | — |
 
-<!-- vLLM baseline placeholder: numbers from notes/baselines-vllm-20261017.md (qwentin-internal) go here;
-     do not fill from memory. The 2026-08 NVFP4 figures above are the previous README's measurement. -->
+Reading the table honestly: on one card qwentin holds **2–3.9× the context** of stock vLLM at
+**FP8 quality instead of NVFP4**, decodes **2.2× faster per stream** with speculative decoding
+(equal without it: the trellis GEMV is as memory-bound as the FP4 one), and is the only one of
+the three that fits 12 sessions or the FP8-class quality on a 32 GB card at all. **vLLM's clear
+win is prefill**: 3–5× lower time to first token (FlashInfer gated-DeltaNet prefill + CUTLASS NVFP4
+GEMMs on the FP4 tensor cores vs our trellis-decode-to-fp16 GEMM, chunkwise DeltaNet and wide
+attention kernels at ~2 000 prompt tok/s) — that is the next engineering target. Two caveats
+from the measurement: vLLM's KV budget for this hybrid model was not deterministic across
+startups (same command, 147K vs 179K tokens), and the NVFP4 export needed one repair (a shared
+global scale for the fused gated-DeltaNet `in_proj_qkv` / `in_proj_z`, which vLLM fuses and
+llm-compressor scales separately); needle 6/6 passed either way, so needle is not a sensitive
+quality probe — the KL yardstick is.
 
 **One 16 GB card** — measured on a 5090 under a 16 GiB process budget, **not on a physical
 16 GB card** (`logs/p16-check.log`; the budget convention and the exact `--num-blocks` ladder are
@@ -60,7 +76,7 @@ in `ASSUMPTIONS.md` "16 GiB variant, exact"):
 
 | | **qwentin 16 GB variant** (EXL3 t45-s425 4.25 bpw + trellis KV + spec, 2 slots) | vLLM, stock |
 |---|---|---|
-| Context | **51K tokens** (`--num-blocks 400`) at 16 006 MiB after a full run; `--num-blocks 360` = 46K as the safe pick | no 27B option for a 16 GB card *(baseline run to confirm)* |
+| Context | **51K tokens** (`--num-blocks 400`) at 16 006 MiB after a full run; `--num-blocks 360` = 46K as the safe pick | none: the NVFP4 27B alone loads 17.6 GiB in vLLM (measured above), the FP8 one 27.5 GiB — no stock 27B fits a 16 GB card |
 | Decode, N = 1 | **184 tok/s @32K** (76 without spec), **173 @49K** (74) | — |
 | Needle | 3/3 at 48K; 3/3 at 53K / 48K / 43K on the 10-16 binary | — |
 | Quality vs the bf16 original | weights 0.0110 / 97.9 %; with FP4 K+V 0.0130 / 97.7 % (trellis KV end to end: *to be measured*; it costs less than FP4 K+V) — better than the FP6 build's 0.0139 / 97.4 % on the same yardstick | — |
