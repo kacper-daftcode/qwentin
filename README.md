@@ -3,6 +3,39 @@
 **Qwen3.8-27B on a single RTX 5090 (32 GB): 576K pooled context tokens across 12 concurrent sessions at FP8 quality — EXL3 trellis-quantized weights (5.75 bpw) + a 4-bit trellis-coded KV cache (16.5 KiB/token) + speculative decoding, 167 / 109 / 81 tok/s per stream at 1 / 4 / 8 streams @32K, 133 tok/s @128K, TTFT 15.9 s @32K / 86.6 s @128K (2026-10-17, CUDA 13.1, measured on the 5090 itself).** A 16 GB variant (4.25 bpw, 51K tokens, 184 tok/s) and a 24 GB variant (a full 256K single session at FP8 quality) are measured as well. Qwen3.6-27B shares the text-tower layout and runs identically on the FP6
 path (the EXL3 path was measured on Qwen3.8 only).
 
+## TL;DR — what is new in the 2026-10 build, and where the memory went
+
+**A 27B model with 576K tokens of live context on one 32 GB consumer GPU, at FP8 quality, with
+speculative decoding on every stream.** The official FP8 checkpoint of this model does not even
+fit the card (it OOMs after loading 27.5 GiB of weights); stock vLLM with NVFP4 weights holds
+147–179K tokens on it at an order of magnitude more KL. Same card, same model — this is how the
+memory was found:
+
+| | bf16 / stock | qwentin 2026-10 | how |
+|---|---|---|---|
+| Weights | 54 GB bf16 · 27.5 GiB FP8 (does not fit) | **18.5 GiB at FP8 quality** | EXL3 **trellis-coded weights** (5.75 bpw, exllamav3 checkpoint) decoded straight on the tensor cores; 6-bit lm_head; the embedding table lives in host RAM |
+| KV cache | ~70 KiB/token bf16 (~35 fp8) | **16.5 KiB/token** | our own 4-bit **trellis-coded KV cache**: a 12-bit-state bitshift trellis with a Lloyd-trained codebook, encoded by a 5.8 M-tiles/s CUDA Viterbi during prefill, decoded inside the attention kernel — passes the FP8 gate where plain int4 / FP4 K+V does not |
+| Recurrent state, per session (48 gated-DeltaNet layers) | 155 MiB fp32 (vLLM: 163 MB per request) | **80 MiB** | fp16 with deterministic stochastic rounding — plain fp16 drifts over a long decode, bf16 fails the gate; this one is indistinguishable from fp32 at 64K |
+| Idle sessions | resident in VRAM | **parked in host RAM** at 37–45 GB/s | a pinned staging ring; a 32K session leaves or returns in ~16–19 ms, so a follow-up turn costs ~nothing |
+| Speculative drafter | 0.85 GB bf16 MTP head | **0.25 GB** | the model's own multi-token-prediction head, EXL3-quantized at 4 bpw; the verified output is bit for bit the plain decode's |
+| **Total** | | **29.9 GB for 12 sessions, each up to 256K** | |
+
+The speed side came from the same toolbox: speculative decoding through the paged batched server
+(2.6× per stream), fp16 staged trellis attention, the decode step as one CUDA graph with concurrent
+GEMM groups, 128-token prefill GEMM units — **167 tok/s per stream at 32K, 133 at 128K, 12 sessions
+in flight.** The one place stock vLLM wins is cold prefill (3–5× lower time to first token, see the
+table below) — that is the next target.
+
+**What we took from DeepSeek-V4.1.** We read the V4.1-Flash report as a recipe for VRAM-cheap long
+context and tested, with numbers, what transfers to a dense hybrid Qwen *without retraining it*:
+hybrid linear / full attention (Qwen3.8 already has it — 48 gated-DeltaNet + 16 full-attention
+layers — and the engine implements both), multi-token prediction (shipped, through the model's own
+MTP head), a low-rank KV latent (MLA-style — measured: a zero-shot or distilled retrofit does not
+reach FP8 quality below rank 1536, so it needs training), cross-layer KV reuse (same), and a trained
+sparse-attention indexer (the page-selection kernels are in the engine; the indexer is a training
+project). Every pilot is in the research repo with its numbers; the part that pays without training
+is the trellis toolbox above.
+
 qwentin is a from-scratch CUDA inference engine for the 27B hybrid-attention Qwen3.6/3.8 tower
 on one consumer Blackwell GPU (SM120), with hand-written tensor-core kernels and an
 OpenAI-compatible API, so any client — including an `opencode`/`continue`-style coding agent —
