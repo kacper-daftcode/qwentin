@@ -1209,7 +1209,8 @@ def serve(args):
     spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k})" if eng.spec
                  else "speculative decoding OFF (" + (eng.spec_off_reason or getattr(args, "spec_off_reason", "") or "--no-spec") + ")")
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
-          f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}", flush=True)
+          f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}; "
+          f"decode steps per mixed wave {args.decode_steps_per_wave}", flush=True)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(eng, tok, args))
     print(f"listening on {args.host}:{args.port}  (model={args.model_name})", flush=True)
     try:
@@ -1311,10 +1312,12 @@ def main():
                          "the consumed history continues from there (only the new tokens are "
                          "prefilled). Parked slots are evicted LRU when slots/blocks are needed.")
     ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
-    ap.add_argument("--decode-steps-per-wave", type=int, default=0,
+    ap.add_argument("--decode-steps-per-wave", type=int, default=1,
                     help="extra pure decode steps after each mixed prefill wave (decoders get 1+k tokens "
                          "per wave; prefill slows by ~k x 25%%). 0 = one token per wave. With --spec each extra "
-                         "step is a speculative round (3-5 tokens per slot for ~20-30 ms).")
+                         "step is a speculative round (3-5 tokens per slot for ~20-30 ms). DEFAULT 1 since 10-17 "
+                         "(owner's decision (a): T5 mix 13 / 8 / 11 -> 43 / 28 / 43 tok/s per client under prefill load, "
+                         "wall -6 %%; the cold 96K-class TTFT +16 s).")
     ap.add_argument("--park-ram-gb", type=float, default=64.0,
                     help="host-RAM budget for parked sessions evicted from the GPU (KV blocks + DeltaNet "
                          "state, ~26 KiB/token + 155 MiB each; LRU). 0 disables the host tier. Needs the "
@@ -1367,17 +1370,19 @@ def main():
     ap.add_argument("--no-spec", dest="spec", action="store_false")
     ap.add_argument("--spec-k", default="auto",
                     help="draft depth: auto = 4 at <= 2 active slots, 3 at <= 8, 2 above; or a fixed number (1..16).")
-    ap.add_argument("--dstate-bf16", dest="dstate", action="store_const", const=1, default=0,
+    ap.add_argument("--dstate-bf16", dest="dstate", action="store_const", const=1, default=4,
                     help="store the per-slot GatedDeltaNet recurrent state as bf16 instead of fp32 (TQ_DSTATE_BF16=1; "
                          "compute stays fp32): 75.5 instead of 151 MiB per slot, ~0.9 GB freed at 12 slots (~+440 "
-                         "trellis blocks); parking blobs shrink the same way (versioned header). Default off (fp32, "
-                         "bitwise the 10-16 served line). Quality gate: notes/session10-dstate.md.")
+                         "trellis blocks); parking blobs shrink the same way (versioned header). bf16 FAILED its "
+                         "quality gate; the DEFAULT since 10-17 is fp16sr (owner's decision (c)); --dstate fp32 = the "
+                         "10-16 served line bitwise. Quality gate: notes/session10-dstate.md.")
     ap.add_argument("--dstate-fp16", dest="dstate", action="store_const", const=2,
                     help="the same with fp16 storage (TQ_DSTATE_BF16=2; 11-bit significand, clamped to +-65504).")
     ap.add_argument("--dstate", dest="dstate_name", default=None, choices=["fp32", "bf16", "fp16", "bf16+8", "fp16sr"],
-                    help="the recurrent-state storage format by name (TQ_DSTATE_BF16 = 0 / 1 / 2 / 3 / 4): fp16sr = fp16 with "
-                         "deterministic stochastic rounding (the gated candidate: e2e-neutral in prefill AND pure decode at "
-                         "4K-64K, verify == decode bitwise, 75.5 MiB per slot); bf16+8 = 24-bit (108 MiB per slot).")
+                    help="the recurrent-state storage format by name (TQ_DSTATE_BF16 = 0 / 1 / 2 / 3 / 4): fp16sr (DEFAULT "
+                         "since 10-17) = fp16 with deterministic stochastic rounding (e2e-neutral in prefill AND pure decode at "
+                         "4K-64K, verify == decode bitwise, 75.5 MiB per slot -> --num-blocks 4500 fits the 4100 footprint); "
+                         "bf16+8 = 24-bit (108 MiB per slot); fp32 = the 10-16 line.")
     args = ap.parse_args()
     if args.dstate_name is not None:
         args.dstate = ["fp32", "bf16", "fp16", "bf16+8", "fp16sr"].index(args.dstate_name)

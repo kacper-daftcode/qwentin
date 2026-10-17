@@ -4322,9 +4322,11 @@ static void tq_launch(bool pdl, void (*kern)(KArgs...), dim3 grid, dim3 block, s
 // (re)allocated only in a handful of places; each of them bumps g_graph_gen, which drops every cached graph.
 // TQ_GRAPH=1: the paged decode step as a graph; TQ_GRAPH=2: also the verify wave and the MTP draft (measured: no
 // gain over the eager spec round, and the verify key varies with the wave's column count -> more captures).
+// DEFAULT 1 since 2026-10-17 (owner's decision (g), with TQ_GEMM_FORK: -0.35 ms per step at every N / context,
+// bitwise); TQ_GRAPH=0 = the eager launch sequence.
 static int tq_graph_enabled(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_GRAPH"); v = (e && *e) ? atoi(e) : 0; if (v < 0) v = 0; }
+    if (v < 0) { const char *e = getenv("TQ_GRAPH"); v = (e && *e) ? atoi(e) : 1; if (v < 0) v = 0; }
     return v;
 }
 static int tq_graph_debug(void) {
@@ -20816,14 +20818,14 @@ __global__ void __launch_bounds__(256) k_tq_exl3_bf16_pair(float *out0, const ui
 // needle, not bit-exact). Scratch grows lazily. ---------------------------------------
 static uint8_t *g_wproj_b = NULL; static float *g_wproj_bscale = NULL, *g_wproj_part = NULL;
 static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
-// TQ_GEMM_FORK=1 (session 10, decode-graph; default off): the 2nd / 3rd Linear of a group that shares one input
+// TQ_GEMM_FORK=1 (session 10, decode-graph; DEFAULT ON since 2026-10-17, owner's decision (g)): the 2nd / 3rd Linear of a group that shares one input
 // (k/v after q, z after qkv, up after gate) run on side streams concurrently with the first -- they are independent
 // (the fragment buffer is read-only, the outputs distinct), so the small k/v_proj GEMMs (80 of 680 blocks) and every
 // member's tail fill the GPU instead of serializing. Same kernels, same grids, same k-splits -> bitwise; each side
 // member gets its own k-split partial buffer (the shared one would race) and, as every launch, its own counter slot.
 static int tq_gemm_fork_enabled(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_GEMM_FORK"); v = (e && *e) ? (atoi(e) != 0) : 0; }
+    if (v < 0) { const char *e = getenv("TQ_GEMM_FORK"); v = (e && *e) ? (atoi(e) != 0) : 1; }
     return v;
 }
 static float *g_wproj_part_side[2] = {NULL, NULL}; static size_t g_wproj_part_side_bytes[2] = {0, 0};
@@ -25468,7 +25470,7 @@ static int paged_gqa_split_S_f16(int N, int pos_max, int qt, int kf16) {
 // The key-split count of the kernel the launcher will pick for this mode (decode: qt = 1; verify: its QT).
 static int g_pg_v4 = 0;                         // TQ_KV_V4, read by qwn_paged_init (the pool's V is int4 like K)
 static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below)
-// TQ_T4_ATTN_F16 (default 0 on main until the owner's decision (b) in the handoff; the B2 branch recommends 1): 1 = the
+// TQ_T4_ATTN_F16 (DEFAULT 1 since 2026-10-17, owner's decision (b); it was 0 on main from 10-16 23:37 to 10-17 08:56): 1 = the
 // trellis pool's decode step and verify wave run k_tq_paged_attn_q4_gqa_seg_t4<QT, 1> (fp16 operands, one kernel for
 // both, cp.async-staged V codes for the decode step); 0 = the bf16 per-column decode kernel + the bf16 segment kernel
 // (the 10-15 path, bit for bit). MEASURED (notes/session10-b2.md
@@ -25478,7 +25480,7 @@ static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below
 // 335 -> 277 us per layer at 32K N=8 (-1.0 ms per step vs the bf16 kernels; FP4 + ST3 = 249 us).
 static int paged_attn_t4_f16_enabled(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 0; }
+    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 1; }
     return c;
 }
 // resident-block capacity of the T4 fp16 kernel (QT = 1's: decode and verify share one picker, so a column's split
@@ -26619,9 +26621,11 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     paged_free_all();
     { const char *e = getenv("TQ_KV_V4"); g_pg_v4 = (e && atoi(e) != 0) ? 1 : 0; }
     { const char *e = getenv("TQ_KV_T4"); g_pg_t4 = (e && atoi(e) != 0) ? 1 : 0; }
-    {   // TQ_DSTATE_BF16: 0 = fp32 recurrent state (default), 1 = bf16, 2 = fp16, 3 = bf16 + 8 bits (24-bit), 4 = fp16 with
-        // stochastic rounding (tq_ds_acc)
-        const char *e = getenv("TQ_DSTATE_BF16"); int m = (e && *e) ? atoi(e) : 0;
+    {   // TQ_DSTATE_BF16: 0 = fp32 recurrent state, 1 = bf16, 2 = fp16, 3 = bf16 + 8 bits (24-bit), 4 = fp16 with deterministic
+        // stochastic rounding (tq_ds_acc) -- DEFAULT 4 since 2026-10-17 (owner's decision (c): e2e-neutral at 4K-64K in prefill
+        // and pure decode, 80 instead of 155 MiB per slot = +400 blocks at the served footprint); 0 = the fp32 state (bitwise the
+        // 10-16 line). notes/session10-dstate.md.
+        const char *e = getenv("TQ_DSTATE_BF16"); int m = (e && *e) ? atoi(e) : 4;
         if (m < 0 || m > 4) return -13;
         g_pg_dstate = m; g_pg_ds_es = tq_ds_elem_bytes(m);
     }
