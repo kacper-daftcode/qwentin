@@ -83,6 +83,40 @@ def load_corpus(root: str = DEFAULT_CORPUS, exts=CODE_EXTS, min_bytes: int = 512
     return out
 
 
+def calibration_ids(tokenizer, corpus, n_tokens: int, seed: int = 12345) -> list[int]:
+    """The quality yardstick's held-out token stream (docs/QUALITY.md): shuffle the corpus file list with
+    random.Random(seed), tokenize '### FILE: <relpath>\\n<text>\\n\\n' per file with a HF tokenizer (no special tokens)
+    and concatenate until n_tokens. The published rows use seed 12345 and n_tokens 200_000 (cut into 48 x 4096 or
+    6 x 32768 rows by the caller). Vendored from analysis/kv_lowrank_act.py of the research project, unchanged."""
+    rng = random.Random(seed)
+    order = list(range(len(corpus)))
+    rng.shuffle(order)
+    ids: list[int] = []
+    for i in order:
+        rel, text = corpus[i]
+        ids.extend(tokenizer(f"### FILE: {rel}\n{text}\n\n", add_special_tokens=False)["input_ids"])
+        if len(ids) >= n_tokens:
+            break
+    return ids[:n_tokens]
+
+
+def corpus_fingerprint(root: str, corpus) -> dict:
+    """What the corpus was, for the result JSON: path, file count, bytes and the git HEAD of the tree if it is a
+    checkout (so a published number can be paired with the exact commit; see docs/QUALITY.md on the vLLM corpus)."""
+    import subprocess
+
+    fp = {"path": os.path.abspath(root), "files": len(corpus), "chars": sum(len(t) for _, t in corpus)}
+    try:
+        head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+        if head.returncode == 0:
+            fp["git_head"] = head.stdout.strip()
+            dirty = subprocess.run(["git", "-C", root, "status", "--porcelain"], capture_output=True, text=True, timeout=30)
+            fp["git_dirty"] = bool(dirty.stdout.strip()) if dirty.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return fp
+
+
 def build_context(corpus, target_tokens: int, seed: int, tok: Tok) -> str:
     """Concatenate shuffled files with '### FILE:' headers up to target_tokens."""
     rng = random.Random(seed)

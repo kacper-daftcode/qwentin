@@ -138,8 +138,11 @@ away (`--no-kv-t4 --no-spec`).
 
 ### The quality protocol
 
-Every quality number above comes from one yardstick, run on the engine itself (not a
-simulation): **197K held-out code tokens** (files of a large Python/C++ repository, 48 × 4096
+(The full protocol — tokens, tools, gate rule, reference rows, what is not measured — is
+[`docs/QUALITY.md`](docs/QUALITY.md); the tools are `tools/qwentin_e2e.py`, `tools/exl3_diff.py`,
+`tools/e2e_frontier.py`.) Every quality number above comes from one yardstick, run on the engine itself (not a
+simulation): **197K held-out code tokens** (files of a large Python/C++ repository — the `vllm/` package of a
+pinned vLLM checkout, 48 × 4096
 rows for the "4K" cells, 6 × 32768 rows for the "32K" cells), scored teacher-forced against the
 **original bf16 `Qwen/Qwen3.8-27B`**. **KL** = mean per-token KL(bf16 ‖ candidate) over the
 next-token distributions; **top-1** = the share of positions where the candidate's argmax equals
@@ -713,11 +716,14 @@ python3 -c "import torch; a=torch.load('a.pt'); b=torch.load('b.pt'); print(max(
 ```
 
 The quality yardstick (KL / top-1 vs the bf16 original on the 197K held-out tokens, the FP8
-reference row, the engine-side runner, the EvalPlus T1 driver, the 8-session load generator and
-the parking / prefix-cache probes) lives in the research repository
-`kacper-daftcode/qwentin-internal` (`analysis/exl3_diff.py`, `analysis/qwentin_e2e.py`,
-`analysis/e2e_frontier.py`, `eval/evalplus.sh`, `eval/loadgen.py`, `eval/park_probe.py`,
-`eval/prefix_cache_probe.py`); it needs the bf16 27B and exllamav3 on the box.
+reference row, the engine-side runner, the paired block-bootstrap CI and the EvalPlus T1 driver)
+is in this repo — `tools/qwentin_e2e.py`, `tools/exl3_diff.py`, `tools/e2e_frontier.py`,
+`tools/dequant_fp8_to_bf16.py`, `tools/evalplus.sh` — with the protocol, the held-out corpus (a
+pinned vLLM commit, `--corpus`), the gate rule and the reference rows in
+[`docs/QUALITY.md`](docs/QUALITY.md); it needs the bf16 27B and exllamav3 on the box. The
+8-session load generator and the parking / prefix-cache probes (`eval/loadgen.py`,
+`eval/park_probe.py`, `eval/prefix_cache_probe.py`) stay in the research repository
+`kacper-daftcode/qwentin-internal`.
 
 Legacy single-stream tools (FP6 tqf): `tools/mtp_spec_smoke.py` (end-to-end MTP spec-decode:
 tok/s, accept-length, divergence vs greedy), `tools/bench_rounds.py` (decode-only round benchmark;
