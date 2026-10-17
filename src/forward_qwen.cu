@@ -21938,6 +21938,17 @@ static int tq_gemm_fork_enabled(void) {
     if (v < 0) { const char *e = getenv("TQ_GEMM_FORK"); v = (e && *e) ? (atoi(e) != 0) : 1; }
     return v;
 }
+// TQ_GEMM_FORK_MAXN (session 11, wave-sched thread; default 64): the fork only up to this N. At decode / verify
+// sizes the members underfill the GPU and the fork pays (-0.35 ms per step with the graph); at the 128-column
+// prefill wave every member is a full one-block-per-SM pass (gate + up: 2 x 136 blocks on 170 SMs), the side
+// member only runs when the main one retires (175 us concurrent vs 2 x 90 serial = no overlap), and the join
+// breaks the PDL chain -- measured 0.0 ms either way (notes/session11-sched.md), so the wave runs its groups
+// serially: one stream, no join, the idle SMs of each pass free for the low-priority encoder (TQ_T4_SCHED).
+static int tq_gemm_fork_maxn(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TQ_GEMM_FORK_MAXN"); v = (e && *e) ? atoi(e) : 64; if (v < 0) v = 0; }
+    return v;
+}
 static float *g_wproj_part_side[2] = {NULL, NULL}; static size_t g_wproj_part_side_bytes[2] = {0, 0};
 static int g_exl3_part_sel = 0;                     // 0 = the main partial buffer, 1..2 = side member i's
 static cudaStream_t g_fork_st[2] = {NULL, NULL};
@@ -21946,8 +21957,10 @@ static int fork_streams_ok(void) {
     static int state = 0;                           // 0 = not tried, 1 = ok, -1 = failed
     if (state == 0) {
         state = 1;
+        int prio = 0;                               // the members are the main stream's work: its priority
+        if (!g_qwen.stream || cudaStreamGetPriority(g_qwen.stream, &prio) != cudaSuccess) prio = 0;
         for (int i = 0; i < 2 && state == 1; i++)
-            if (cudaStreamCreateWithFlags(&g_fork_st[i], cudaStreamNonBlocking) != cudaSuccess ||
+            if (cudaStreamCreateWithPriority(&g_fork_st[i], cudaStreamNonBlocking, prio) != cudaSuccess ||
                 cudaEventCreateWithFlags(&g_fork_ev[i], cudaEventDisableTiming) != cudaSuccess) state = -1;
         if (state == 1 && cudaEventCreateWithFlags(&g_fork_ev0, cudaEventDisableTiming) != cudaSuccess) state = -1;
         if (state < 0) fprintf(stderr, "[gemm-fork] side streams unavailable -- serial GEMM groups\n");
@@ -22209,7 +22222,7 @@ static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs
     }
     size_t need_w = 0;
     int r = exl3_build_frags(ws, n, N, &need_w);
-    if (r == 0 && tq_gemm_fork_enabled() && fork_streams_ok()) {
+    if (r == 0 && tq_gemm_fork_enabled() && N <= tq_gemm_fork_maxn() && fork_streams_ok()) {
         // members 1.. on the side streams, concurrently with member 0 (fork after the fragments, join before the
         // next op of the main stream: the consumer and the next PDL launch wait for every member)
         cudaStream_t ms = g_qwen.stream;
