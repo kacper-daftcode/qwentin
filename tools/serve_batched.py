@@ -1413,11 +1413,11 @@ def main():
                          "10-16 served line bitwise. Quality gate: notes/session10-dstate.md.")
     ap.add_argument("--dstate-fp16", dest="dstate", action="store_const", const=2,
                     help="the same with fp16 storage (TQ_DSTATE_BF16=2; 11-bit significand, clamped to +-65504).")
-    ap.add_argument("--gdn-prefill", dest="gdn_prefill", action="store_true", default=False,
+    ap.add_argument("--gdn-prefill", dest="gdn_prefill", action="store_true", default=True,
                     help="session 11: the paged prefill waves run the gated-DeltaNet layers through the hoisted-prep + "
-                         "register-resident chunk kernels (TQ_GDN_PREFILL=1; bit-identical to the default kernels, "
-                         "DeltaNet 14.9 -> 2.8 ms per 128-column wave at 32K; notes/session11-gdn.md). Default off until "
-                         "integrated; --no-gdn-prefill forces the default kernels.")
+                         "register-resident chunk kernels (TQ_GDN_PREFILL=1; bit-identical to the 10-16 kernels, "
+                         "DeltaNet 14.9 -> 2.8 ms per 128-column wave, 32K TTFT 16.0 -> 13.2 s; notes/session11-gdn.md). "
+                         "DEFAULT ON since 10-17; --no-gdn-prefill = the 10-16 kernels.")
     ap.add_argument("--no-gdn-prefill", dest="gdn_prefill", action="store_false")
     ap.add_argument("--dstate", dest="dstate_name", default=None, choices=["fp32", "bf16", "fp16", "bf16+8", "fp16sr"],
                     help="the recurrent-state storage format by name (TQ_DSTATE_BF16 = 0 / 1 / 2 / 3 / 4): fp16sr (DEFAULT "

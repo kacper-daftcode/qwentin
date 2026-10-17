@@ -18633,13 +18633,14 @@ static int ensure_gdn_buffers(int T) {
     return 0;
 }
 
-// TQ_GDN_PREFILL: 0 = the kernels above (default); 1 = the gdn path with KT = 2 (4 warps per block); 2 = KT = 1 (8 warps);
-// 3 = KT = 4 (2 warps). Read once.
+// TQ_GDN_PREFILL: 0 = the kernels above (the 10-16 path, bit-identical); 1 = the gdn path with KT = 2 (4 warps per block) --
+// DEFAULT since 2026-10-17 (session 11: DeltaNet 14.95 -> 2.76 ms per 128-column wave, bitwise on every gate,
+// notes/session11-gdn.md); 2 = KT = 1 (8 warps); 3 = KT = 4 (2 warps). Read once.
 static int tq_gdn_prefill_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = getenv("TQ_GDN_PREFILL");
-        mode = (e && *e) ? atoi(e) : 0;
+        mode = (e && *e) ? atoi(e) : 1;
         if (mode < 0 || mode > 3) mode = 0;
     }
     return mode;
