@@ -578,6 +578,31 @@ static __device__ __forceinline__ uint16_t tq_f16_sr_fast(float v, uint32_t r, f
     *rounded = f;
     return __half_as_ushort(__float2half_rn(f));
 }
+// The same rounding, branch-free (selects instead of the three range branches, so the compiler can interleave the
+// independent elements of a thread) and without the final F2F: returns the rounded value as fp32. Bit-identical to
+// tq_f16_sr followed by __half2float (the unit test covers it too). r = the hash of (element index, position).
+static __device__ __forceinline__ float tq_f16_sr_round(float v, uint32_t r) {
+    v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+    const uint32_t u = __float_as_uint(v);
+    const uint32_t a = u & 0x7FFFFFFFu, sign = u & 0x80000000u;
+    const bool normal = a >= 0x38800000u, tiny = a < 0x33800000u;
+    const int sh = normal ? 13 : min(126 - (int)(a >> 23), 31);     // dropped mantissa bits (-1 - e in the subnormal range)
+    const uint32_t step = 1u << sh;
+    const uint32_t m = a & (tiny ? 0xFFFFFFFFu : step - 1u);
+    const uint32_t lo_a = a - m;
+    const uint32_t hi_a = tiny ? 0x33800000u : lo_a + step;
+    const float pm = __uint_as_float(0x4B000000u | m) - 8388608.0f;   // (float)m exactly (m < 2^23 whenever used)
+    const float p = tiny ? __uint_as_float(a) * 16777216.0f : pm * __uint_as_float((uint32_t)(127 - sh) << 23);
+    const float pp = sign ? (1.0f - p) : p;
+    const bool up = (float)r * (1.0f / 4294967296.0f) < pp;
+    uint32_t pick = (up != (sign != 0u)) ? hi_a : lo_a;
+    pick = (m == 0u) ? a : pick;
+    return __uint_as_float(pick | sign);
+}
+static __device__ __forceinline__ uint32_t tq_ds_hash_mix(uint32_t h) {   // the fmix tail of tq_ds_hash
+    h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+    return h;
+}
 // The state slice of one head of one slot in format DS: ld(i) / st(i, v) with i the element index inside the head
 // (kk * dim + tid); pos is the token position (DS = 4's rounding seed; set per column by the kernels).
 template <int DS> struct tq_ds_acc {
@@ -18207,22 +18232,9 @@ static int launch_deltanet_chunk_hs_ds(int ds, float *core_out, void *recurrent_
 // Also the conv window of the slot is advanced (first blocks of the chunk kernel, after the prep consumed the old one).
 // Everything below is additive; TQ_GDN_PREFILL=0 (default) runs the kernels above unchanged.
 
-static __device__ __forceinline__ float tq_gdn_conv_silu(const float *__restrict__ x, const float *__restrict__ cs,
-                                                         const uint16_t *__restrict__ w, int c, int t, int conv_dim, int KS) {
-    // k_tq_linear_conv_chunk's window at token t: [e(t-KS+1) .. e(t)], e(u) = x[u] for u >= 0, else the slot window
-    // cs[c*KS + KS + u]; the same shift-and-accumulate order (sum = 0; += win[j] * w[j] for j < KS-1; += win[KS-1] * w[KS-1]).
-    const uint16_t *wt = w + (size_t)c * KS;
-    const float *s = cs + (size_t)c * KS;
-    float win[8];
-    for (int j = 0; j < KS; j++) { int u = t - (KS - 1) + j; win[j] = (u >= 0) ? x[(size_t)u * conv_dim + c] : s[KS + u]; }
-    float sum = 0.0f;
-    for (int j = 0; j < KS - 1; j++) sum = __fmaf_rn(win[j], tq_bf16_to_float(wt[j]), sum);
-    sum = __fmaf_rn(win[KS - 1], tq_bf16_to_float(wt[KS - 1]), sum);
-    return sum / (1.0f + expf(-sum));
-}
-
-// grid = key_heads * nsub (role a: 8-token sub-chunk x key head) + T * value_dim / 256 (role b: v conv) + ceil(value_heads *
-// nsub / 256) (role c: gates); block = 256.
+// grid = nsub * (key_heads + value_dim / 256) (an 8-token sub-chunk x a 256-channel group: the q+k channels of one key
+// head, or 256 v channels) + ceil(value_heads * nsub / 256) (role c: gates); block = 256. KS = 4 (the window of the
+// sub-chunk's 8 tokens = 11 rows, loaded once into registers).
 template <int D>
 __global__ void __launch_bounds__(256) k_tq_gdn_prep(
         const float *__restrict__ x, const float *__restrict__ conv_state, const uint16_t *__restrict__ conv_w,
@@ -18232,19 +18244,43 @@ __global__ void __launch_bounds__(256) k_tq_gdn_prep(
         float2 *__restrict__ dd_out,                                   // [key_heads][nsub][8][8] (dkk, dqk)
         float *__restrict__ v_out,                                     // [T][value_dim]
         float4 *__restrict__ gates,                                    // [value_heads][T] {beta, la, e^la, e^(la_last - la)}
-        int T, int value_heads, int key_heads, int KS) {
+        int T, int value_heads, int key_heads) {
+    constexpr int KS = 4;
     const int key_dim = key_heads * D, value_dim = value_heads * D, conv_dim = 2 * key_dim + value_dim;
-    const int nsub = (T + 7) / 8;
-    const int nqk = key_heads * nsub, nvb = T * (value_dim / 256);
+    const int nsub = (T + 7) / 8, ngrp = key_heads + value_dim / 256;
     int blk = blockIdx.x, tid = threadIdx.x;
-    if (blk < nqk) {
+    if (blk < nsub * ngrp) {
         __shared__ float qk[2][8][D + 1];          // normalised q / k of the sub-chunk's 8 tokens (post conv + SiLU)
         __shared__ float fac[2][8];
-        int kh = blk / nsub, sc = blk % nsub, s = sc * 8, L = min(8, T - s);
-        // 8 tokens x 256 channels, 8 per thread: thread -> (channel tid, token j)
-        int c = (tid < D) ? kh * D + tid : key_dim + kh * D + (tid - D);
-        int d = tid & (D - 1), which = tid >> 7;
-        for (int j = 0; j < L; j++) qk[which][j][d] = tq_gdn_conv_silu(x, conv_state, conv_w, c, s + j, conv_dim, KS);
+        int sc = blk / ngrp, g = blk % ngrp, s = sc * 8, L = min(8, T - s);
+        const bool isqk = g < key_heads;
+        int kh = g, d = tid & (D - 1), which = tid >> 7;
+        int c = isqk ? ((tid < D) ? kh * D + tid : key_dim + kh * D + (tid - D)) : 2 * key_dim + (g - key_heads) * 256 + tid;
+        // the window rows s-3 .. s+7 of channel c (rows < 0 from the slot's conv window, rows >= T unused)
+        float xr[8 + KS - 1];
+        const float *cs = conv_state + (size_t)c * KS;
+        #pragma unroll
+        for (int jj = 0; jj < 8 + KS - 1; jj++) {
+            int u = s - (KS - 1) + jj;
+            xr[jj] = (u < 0) ? cs[KS + u] : (u < T) ? x[(size_t)u * conv_dim + c] : 0.0f;
+        }
+        const uint16_t *wt = conv_w + (size_t)c * KS;
+        float wf[KS];
+        #pragma unroll
+        for (int j = 0; j < KS; j++) wf[j] = tq_bf16_to_float(wt[j]);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (j < L) {
+                // k_tq_linear_conv_chunk's order: sum = 0; += win[0] w0; += win[1] w1; += win[2] w2; += win[3] w3
+                float sum = 0.0f;
+                #pragma unroll
+                for (int jj = 0; jj < KS; jj++) sum = __fmaf_rn(xr[j + jj], wf[jj], sum);
+                float y = sum / (1.0f + expf(-sum));
+                if (isqk) qk[which][j][d] = y;
+                else v_out[(size_t)(s + j) * value_dim + (g - key_heads) * 256 + tid] = y;
+            }
+        }
+        if (!isqk) return;
         __syncthreads();
         if (tid < 16) {                              // the sequential sum of squares of token tid/2 (q: even, k: odd)
             int j = tid >> 1, wq = tid & 1;
@@ -18258,9 +18294,10 @@ __global__ void __launch_bounds__(256) k_tq_gdn_prep(
         __syncthreads();
         for (int j = 0; j < L; j++) qk[which][j][d] = qk[which][j][d] * fac[which][j];
         __syncthreads();
-        int perm = (d & 7) * (D / 8) + (d >> 3);
+        // lane-permuted rows, written coalesced: position d holds dim (d & 15) * 8 + (d >> 4) (the inverse of (dim & 7) * 16 + (dim >> 3))
+        int src = (d & 15) * 8 + (d >> 4);
         float *out = which ? kn_out : qn_out;
-        for (int j = 0; j < L; j++) out[((size_t)kh * T + s + j) * D + perm] = qk[which][j][d];
+        for (int j = 0; j < L; j++) out[((size_t)kh * T + s + j) * D + d] = qk[which][j][src];
         if (tid < 64) {                              // the 8x8 decayed inner products' dot parts (d-sequential chains)
             int j = tid >> 3, m = tid & 7;
             if (j < L && m < L) {
@@ -18276,13 +18313,7 @@ __global__ void __launch_bounds__(256) k_tq_gdn_prep(
         }
         return;
     }
-    blk -= nqk;
-    if (blk < nvb) {
-        int nb = value_dim / 256, t = blk / nb, c0 = (blk % nb) * 256;
-        v_out[(size_t)t * value_dim + c0 + tid] = tq_gdn_conv_silu(x, conv_state, conv_w, 2 * key_dim + c0 + tid, t, conv_dim, KS);
-        return;
-    }
-    blk -= nvb;
+    blk -= nsub * ngrp;
     int g = blk * 256 + tid;
     if (g >= value_heads * nsub) return;
     int head = g / nsub, sc = g % nsub, s = sc * 8, L = min(8, T - s);
@@ -18445,12 +18476,25 @@ static __device__ __forceinline__ void tq_gdn_subchunk(
             }
         }
     }
-    if constexpr (DS != 0) {
+    if constexpr (DS == 4) {
+        // tq_ds_hash(gbase + idx, pos) with idx = (kk + 8 i) * D + col: idx * K1 = (gbase + kk * D + col) * K1 + i * (8 D K1)
+        // (mod 2^32); the asm barrier keeps the compiler from hoisting the 32 per-element sums into registers.
+        const uint32_t posterm = (acc.pos + 0x7F4A7C15u) * 0x85EBCA77u;
+        #pragma unroll
+        for (int h = 0; h < KT; h++) {
+            const int kk = w + NW * h;
+            uint32_t hk = (acc.gbase + (uint32_t)(kk * D + col)) * 0x9E3779B1u;
+            asm volatile("" : "+r"(hk));
+            #pragma unroll
+            for (int i = 0; i < 16; i++)
+                S[h][i] = tq_f16_sr_round(S[h][i], tq_ds_hash_mix((hk + (uint32_t)(i * 8 * D) * 0x9E3779B1u) ^ posterm));
+        }
+    } else if constexpr (DS != 0) {
         #pragma unroll
         for (int h = 0; h < KT; h++) {
             const int kk = w + NW * h;
             #pragma unroll
-            for (int i = 0; i < 16; i++) S[h][i] = acc.rnd_fast((size_t)(kk + 8 * i) * D + col, S[h][i]);
+            for (int i = 0; i < 16; i++) S[h][i] = acc.rnd(( size_t)(kk + 8 * i) * D + col, S[h][i]);
         }
     }
 }
@@ -18581,13 +18625,13 @@ static int launch_gdn_prefill(int mode, int ds, float *core_out, void *recur_slo
                               const uint16_t *dt_bias, const uint16_t *conv_w, const float *norm_weight,
                               int n, int value_heads, int key_heads, int dim, int KS, float eps, cudaStream_t st,
                               const int *tok_pos) {
-    if (dim != 128 || KS > 8 || (value_heads * dim) % 256 != 0 || value_heads % key_heads != 0) return -100;
+    if (dim != 128 || KS != 4 || (value_heads * dim) % 256 != 0 || value_heads % key_heads != 0) return -100;
     if (ensure_gdn_buffers(n) != 0) return -90;
     int key_dim = key_heads * dim, value_dim = value_heads * dim, conv_dim = 2 * key_dim + value_dim;
     int nsub = (n + 7) / 8;
-    int grid_p = key_heads * nsub + n * (value_dim / 256) + (value_heads * nsub + 255) / 256;
+    int grid_p = nsub * (key_heads + value_dim / 256) + (value_heads * nsub + 255) / 256;
     k_tq_gdn_prep<128><<<grid_p, 256, 0, st>>>(x_qkv, conv_slot, conv_w, b_proj, a_proj, A_log, dt_bias,
-                                                g_gdn_qn, g_gdn_kn, g_gdn_dd, g_gdn_v, g_gdn_gates, n, value_heads, key_heads, KS);
+                                                g_gdn_qn, g_gdn_kn, g_gdn_dd, g_gdn_v, g_gdn_gates, n, value_heads, key_heads);
     int kt = (mode == 2) ? 1 : (mode == 3) ? 4 : 2;
     int grid_c = value_heads * 4;
     if (grid_c * (256 / kt) < conv_dim) return -103;          // the window update rides on the first blocks
@@ -28178,12 +28222,13 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
                 if (tq_gdn_prefill_mode() != 0) {   // session 11: hoisted prep + register-resident chunk kernel (bitwise)
-                    if (launch_gdn_prefill(tq_gdn_prefill_mode(), g_pg_dstate, g_wide_lcore + (size_t)off * value_dim,
+                    int rg = launch_gdn_prefill(tq_gdn_prefill_mode(), g_pg_dstate, g_wide_lcore + (size_t)off * value_dim,
                             pg_recur_slot(L, slot), g_pg_conv[L] + (size_t)slot * conv_f, g_wide_qkv + (size_t)off * conv_dim,
                             g_wide_z + (size_t)off * value_dim, g_wide_b + (size_t)off * lvh, g_wide_a + (size_t)off * lvh,
                             l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_conv1d, l->d_linear_norm, n, lvh, lkh, ld,
-                            g_qwen.linear_conv_kernel_dim, g_qwen.eps, g_qwen.stream, g_wide_pos + off) != 0) return -99;
-                    continue;
+                            g_qwen.linear_conv_kernel_dim, g_qwen.eps, g_qwen.stream, g_wide_pos + off);
+                    if (rg == 0) continue;
+                    if (rg != -100) return -99;     // -100 = a geometry the gdn kernels do not cover: the kernels below
                 }
                 k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
                     g_wide_qkv + (size_t)off * conv_dim, g_pg_conv[L] + (size_t)slot * conv_f,
