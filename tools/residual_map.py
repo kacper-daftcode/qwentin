@@ -2,7 +2,7 @@
 """Residual-stream steering hook of the single-stream engine: the maps file, the server
 flags (with the deprecated 2026-08 aliases), the decay-schedule parser, the numpy reference.
 
-The engine (src/forward_qwen.cu) can apply one affine map per hooked decoder layer to the
+The engine (src/engine/loader.cuh) can apply one affine map per hooked decoder layer to the
 fp32 residual stream right after that layer, in every forward path (wide prefill, per-node
 spec verify, dense decode):
 

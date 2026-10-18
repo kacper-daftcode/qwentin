@@ -5,10 +5,11 @@ Usage: python3 tools/serve_smoke.py [port] [doc_chars]
 Turn 1 = cold long prompt; turn 2 = same conversation + one short user turn
 (the prefix-cache anchor path should prefill only the suffix)."""
 import json, sys, time, urllib.request
+from engine_text import engine_source_text
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8077
 DOC_CHARS = int(sys.argv[2]) if len(sys.argv) > 2 else 32000
-src = open("/root/workspace/qwentin/src/forward_qwen.cu").read()
+src = engine_source_text()
 doc = src[:DOC_CHARS]
 
 def chat(messages, max_tokens=48):

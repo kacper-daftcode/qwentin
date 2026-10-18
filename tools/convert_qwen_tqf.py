@@ -865,7 +865,7 @@ def mtp_emit_enabled() -> bool:
 
 def mtp_tensor_specs(config) -> list[TensorSpec]:
     """Canonical MTP section tensor order. MUST match the engine's read order in
-    forward_qwen.cu (parse_tqf MTP block). The MTP head is structurally one
+    src/engine/loader.cuh (parse_tqf MTP block). The MTP head is structurally one
     full_attention decoder layer (mtp.layers.0.*) plus the fc projection and the
     pre_fc/post norms, so its weights pack with the SAME quant/layout as the main
     model's full-attention layers."""
@@ -880,7 +880,7 @@ def mtp_tensor_specs(config) -> list[TensorSpec]:
     # The MTP head is tiny (~0.42 GB FP8 / ~0.85 GB BF16); quantizing it costs accept
     # for negligible memory, so all 8 projection weights (fc + q/k/v/o + gate/up/down)
     # are stored FULL-PRECISION BF16 (non_quant), like the norms. Order MUST match the
-    # engine's read order in forward_qwen.cu (parse_tqf MTP block).
+    # engine's read order in src/engine/loader.cuh (parse_tqf MTP block).
     return [
         TensorSpec(f"{p}pre_fc_norm_embedding.weight", (hidden,), "non_quant"),
         TensorSpec(f"{p}pre_fc_norm_hidden.weight", (hidden,), "non_quant"),

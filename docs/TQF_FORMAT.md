@@ -2,7 +2,7 @@
 
 `.tqf` is qwentin's on-disk model format: one header, then the text tower's tensors in a fixed order, then (optionally)
 the MTP head section. It is written by `tools/convert_qwen_tqf.py`, read by the engine's `parse_tqf` (in
-`src/forward_qwen.cu`) and validated by `tools/inspect_tqf.py`, whose slot walk mirrors the writer and is the
+`src/engine/loader.cuh`) and validated by `tools/inspect_tqf.py`, whose slot walk mirrors the writer and is the
 reference for this document. Byte order is little-endian throughout.
 
 ## Header

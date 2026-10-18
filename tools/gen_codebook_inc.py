@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write src/kv_t4_codebook.inc, the trellis-KV codebook compiled into the engine, from tools/codebooks/lloyd_kv12a.f32
+"""Write src/engine/kv_t4_codebook.inc, the trellis-KV codebook compiled into the engine, from tools/codebooks/lloyd_kv12a.f32
 (4096 raw little-endian fp32: the Lloyd-trained 12-bit-state codebook of `--kv-t4`). TQ_KV_T4_CODEBOOK=<file> still
 overrides the built-in table at run time; tests/test_codebook_inc.py fails when the two files disagree.
 
@@ -13,7 +13,7 @@ import struct
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = "tools/codebooks/lloyd_kv12a.f32"
-OUT = "src/kv_t4_codebook.inc"
+OUT = "src/engine/kv_t4_codebook.inc"
 N = 4096
 
 

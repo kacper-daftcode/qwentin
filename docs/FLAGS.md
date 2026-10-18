@@ -8,7 +8,7 @@ restore each previous served line bit for bit.
 
 ## Engine environment flags
 
-Environment flags read by the engine (`src/forward_qwen.cu`; the server sets several of them
+Environment flags read by the engine (`src/forward_qwen.cu` and its `src/engine/` parts; the server sets several of them
 from its arguments unless they are already in the environment):
 
 | Flag | Default | Meaning |
@@ -17,7 +17,7 @@ from its arguments unless they are already in the environment):
 | `TQ_KV_Q4=1` | — | int4 K paged pool (required by the batched server) |
 | `TQ_KV_V4` | server: 1 | V stored like K: FWHT-256-rotated int4, asymmetric per 32 channels (20.0 KiB/token); required by `TQ_KV_T4` (`--kv-v4`) |
 | `TQ_KV_T4` | server: 1 | 4-bit trellis-coded K+V for every committed token, 16.5 KiB/token; the open page is staged exact (`--kv-t4`). `TQ_KV_T4_ASYNC` (1): prefill waves attend their own columns exact and encode on a side stream (=0 reproduces the exllamav3 simulation exactly) |
-| `TQ_KV_T4_CODEBOOK` | unset | a file of 4096 raw fp32 entries that replaces the built-in codebook (`--kv-t4-codebook`); unset = the Lloyd-trained `lloyd_kv12a` compiled into the engine (`src/kv_t4_codebook.inc`, generated from `tools/codebooks/lloyd_kv12a.f32`) |
+| `TQ_KV_T4_CODEBOOK` | unset | a file of 4096 raw fp32 entries that replaces the built-in codebook (`--kv-t4-codebook`); unset = the Lloyd-trained `lloyd_kv12a` compiled into the engine (`src/engine/kv_t4_codebook.inc`, generated from `tools/codebooks/lloyd_kv12a.f32`) |
 | `TQ_T4_ATTN_F16` | 1 | the trellis pool's decode step and verify wave run the fp16-operand segment kernel with cp.async-staged V codes (one kernel for both; −1.0 ms/step at 32K N = 8); 0 = the bf16 per-column + segment kernels (the 10-15 path, bit for bit) |
 | `TQ_PAGED_ATTN_ST` | 3 | FP4 / E4M3 pools only (a no-op under `TQ_KV_T4`): 0 base GQA decode kernel, 1 staged-V kernel (bitwise = base), 2 fp16 P·V, 3 also fp16 K dequant and Q (−1.5 ms/step at 32K N = 8, verify == decode) |
 | `TQ_GRAPH` | 1 | the paged decode step as a CUDA graph (captured per N / key split / MTP columns / flags, LRU of instantiated graphs; a buffer grown inside a capture drops the graph and recaptures); 2 = also the verify wave and the MTP draft (measured: no gain, keep off); 0 = eager |

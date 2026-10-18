@@ -28,7 +28,15 @@ import argparse, ctypes, os, time
 import numpy as np
 from transformers import AutoTokenizer
 
-BIGTEXT = os.environ.get("TQ_BENCH_TEXT", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "forward_qwen.cu"))
+BIGTEXT = os.environ.get("TQ_BENCH_TEXT")            # a text file for the prompts; default: the engine source
+
+
+def bench_text():
+    if BIGTEXT:
+        with open(BIGTEXT) as f:
+            return f.read()
+    from engine_text import engine_source_text
+    return engine_source_text()
 
 
 def load_lib(path):
@@ -417,7 +425,7 @@ def main():
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    text = open(BIGTEXT).read() if os.path.exists(BIGTEXT) else "The history of cartography is"
+    text = bench_text()
     ids = tok(text, add_special_tokens=False).input_ids
     P, N = args.prompt_tokens, args.gen
     L = load_lib(args.lib)

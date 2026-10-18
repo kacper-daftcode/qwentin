@@ -20,7 +20,7 @@ import argparse, ctypes, os, sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mtp_spec_smoke import load_lib, Eng, prefill, ck, BIGTEXT
+from mtp_spec_smoke import load_lib, Eng, prefill, ck, bench_text
 from transformers import AutoTokenizer
 
 ap = argparse.ArgumentParser()
@@ -48,7 +48,7 @@ FLOWS = {
 FLOW = FLOWS[{1: 1, 2: 0, 3: 2}[PROF]]
 
 tok = AutoTokenizer.from_pretrained(os.path.dirname(args.tqf), trust_remote_code=True)
-ids = tok(open(BIGTEXT).read(), add_special_tokens=False).input_ids
+ids = tok(bench_text(), add_special_tokens=False).input_ids
 P = args.prompt_tokens
 L = load_lib(args.lib)
 ck(L.qwn_init(args.tqf.encode()), "init")

@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse, ctypes, os, subprocess, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIGTEXT = os.path.join(HERE, "src", "forward_qwen.cu")
 
 
 def load_lib(path):
@@ -96,8 +95,8 @@ def main():
     # Four (or Nmax) distinct prompts from distinct slices of the reference text.
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    text = open(BIGTEXT).read() if os.path.exists(BIGTEXT) else (
-        "The history of cartography is the study of maps. " * 400)
+    from engine_text import engine_source_text
+    text = engine_source_text(HERE)
     all_ids = tok(text, add_special_tokens=False).input_ids
     if len(all_ids) < Nmax * (P + 4):
         all_ids = (all_ids * (Nmax * (P + 4) // max(1, len(all_ids)) + 1))

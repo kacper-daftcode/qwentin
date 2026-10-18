@@ -14,7 +14,7 @@ import argparse, ctypes, os, sys, time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mtp_spec_smoke import load_lib, Eng, prefill, ck, BIGTEXT
+from mtp_spec_smoke import load_lib, Eng, prefill, ck, bench_text
 from transformers import AutoTokenizer
 
 ap = argparse.ArgumentParser()
@@ -33,7 +33,7 @@ ap.add_argument("--profile", action="store_true",
 args = ap.parse_args()
 
 tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-text = open(BIGTEXT).read()
+text = bench_text()
 ids = tok(text, add_special_tokens=False).input_ids
 P = args.prompt_tokens
 assert len(ids) >= P + 8, f"bench text too short: {len(ids)}"

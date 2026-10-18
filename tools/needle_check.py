@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mini needle-in-a-haystack gate for the FP8 KV cache (TQ_KV_FP8).
 
-Builds a ~12k-token haystack from the in-repo engine source (src/forward_qwen.cu),
+Builds a ~12k-token haystack from the in-repo engine source (src/engine/, tools/engine_text.py),
 injects a passphrase sentence ("Sekretny kod projektu to ZETA-<n>.") at a given
 token depth, appends a question at the end, and greedy-decodes the answer
 through the DENSE per-token path (qwn_decode reads the live prefix KV cache, so
@@ -24,6 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mtp_spec_smoke import load_lib, Eng, prefill, ck  # noqa: E402
+from engine_text import engine_source_files  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,13 +34,12 @@ MODEL_DIR = os.environ.get("TQ_MODEL_DIR", "/workspace/models/Qwen3.6-27B")
 DEPTHS = [int(x) for x in os.environ.get("DEPTHS", "1000,4000,8000,11000").split(",")]
 GEN = int(os.environ.get("GEN", "24"))
 HAYSTACK_TOKENS = int(os.environ.get("HAYSTACK_TOKENS", "11500"))
-CORPUS = os.environ.get("CORPUS",
-    os.path.join(REPO, "src", "forward_qwen.cu")).split(",")
+CORPUS = os.environ["CORPUS"].split(",") if os.environ.get("CORPUS") else engine_source_files(REPO)
 # long-context haystacks (>= ~12k tokens): widen the corpus with repo docs +
 # tools sources until HAYSTACK_TOKENS is covered (deterministic file order);
 # the engine source itself (~210k tokens) unlocks 240k+ haystacks
 _EXTRA = (sorted(__import__("glob").glob(os.path.join(REPO, "tools", "*.py"))) +
-          [os.path.join(REPO, "src", "forward_qwen.cu")])
+          engine_source_files(REPO))
 # distinct code per depth so a stale/wrong retrieval cannot pass by accident
 CODES = {1000: 471, 4000: 832, 8000: 159, 11000: 604}
 

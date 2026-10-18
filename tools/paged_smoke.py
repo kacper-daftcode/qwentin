@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse, ctypes, os, subprocess
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIGTEXT = os.path.join(HERE, "src", "forward_qwen.cu")
 
 
 def load_lib(path):
@@ -85,7 +84,8 @@ def main():
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    text = open(BIGTEXT).read() if os.path.exists(BIGTEXT) else ("The quick brown fox. " * 600)
+    from engine_text import engine_source_text
+    text = engine_source_text(HERE)
     all_ids = tok(text, add_special_tokens=False).input_ids
     need = args.ncorr * (P + 2)
     if len(all_ids) < need:

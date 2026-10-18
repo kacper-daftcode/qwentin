@@ -7,7 +7,7 @@ equal the state after j decode steps. The split pickers are pinned (TQ_QMMA_SF_K
 column's GEMM k-splits / attention key-splits do not depend on the wave width (--no-pin shows the unpinned band).
 
 Per (ctx, N):
-  1. prefill N slots with distinct prefixes of forward_qwen.cu (--distinct of them prefilled, the rest clones via
+  1. prefill N slots with distinct prefixes of the engine source (--distinct of them prefilled, the rest clones via
      slot save/restore), snapshot every slot;
   2. reference: S plain lockstep decode steps (greedy); the logits of every step per slot (logits sink) + the final
      slot snapshots;
@@ -24,7 +24,7 @@ usage: spec_paged_check.py --tqf MODEL.tqf --model-dir HF_DIR [--lib LIB] [--ctx
                            [--distinct 3] [--no-pin] [--bench]
 The README's "spec exactness ALL PASS" gate is `--no-pin --ctx 4096` and `--ctx 32768` with the served env in front
 (TQ_KV_T4=1; the per-column key splits of the verify wave make it bitwise without pins). Vendored from the qwen256k
-research harness (analysis/spec_paged_check.py); run from the repo root (it reads src/forward_qwen.cu as its text).
+research harness (analysis/spec_paged_check.py); its text is the engine source (tools/engine_text.py).
 """
 import argparse, ctypes, os, random, sys, time
 
@@ -59,6 +59,7 @@ if not args.no_pin:
 import torch  # noqa: E402
 sys.path.insert(0, HERE)
 from serve_batched import load_lib, ck, paged_prefill_slot, _ci  # noqa: E402
+from engine_text import engine_source_text  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 Ns = [int(x) for x in args.n.split(",")]
@@ -89,7 +90,7 @@ def sink_on(on):
     else:
         ck(L.qwn_paged_logits_sink(None, 0, 0), "sink off")
 tok = AutoTokenizer.from_pretrained(args.model_dir)
-text = open(os.path.join(REPO, "src", "forward_qwen.cu")).read()
+text = engine_source_text(REPO)
 all_ids = tok(text, add_special_tokens=False).input_ids
 print(f"[spec-check] lib={args.lib} ctx={args.ctx} Ns={Ns} rounds={R} S={S} pin={'off' if args.no_pin else PIN} "
       f"env TQ_PDL={os.environ['TQ_PDL']} corpus={len(all_ids)} tokens", flush=True)
