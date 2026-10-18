@@ -307,7 +307,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Validate engine MTP head vs mtp_accept.py")
     ap.add_argument("--model-dir", default="/workspace/models/Qwen3.5-0.8B")
     ap.add_argument("--tqf", default="/workspace/models/Qwen3.5-0.8B/qwen3_5-0_8b-e2m3-mtp.tqf")
-    ap.add_argument("--lib", default="/workspace/qwentin/build-qwen/libforward_qwen.so")
+    ap.add_argument("--lib", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build-qwen", "libforward_qwen.so"))
     ap.add_argument("--max-tokens", type=int, default=192, help="prompt tokens / MTP slots to test")
     ap.add_argument("--topk", type=int, default=8)
     ap.add_argument("--prompt", default=None, help="override prompt text")

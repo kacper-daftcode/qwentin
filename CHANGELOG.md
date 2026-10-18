@@ -13,12 +13,23 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
   per 128-column wave at 32K, 67.6 → 34.2 ms at 128K; served-line **TTFT 13.3 → 11.8 s @32K, 77.0 → 60.4 s @128K**.
   Not bitwise (a different tiling of the same fp32 softmax): e2e within the 95 % CI at 4K and 32K, spec exactness ALL
   PASS, needle 6/6, A/B 10/10 (`docs/evidence/cand9-all.log`); `TQ_PATTN_GQA=0` = the v0.10 kernel bit for bit.
-- **The trellis-KV codebook is compiled into the engine** (`src/kv_t4_codebook.inc`, generated from
+- **The trellis-KV codebook is compiled into the engine** (`src/engine/kv_t4_codebook.inc`, generated from
   `tools/codebooks/lloyd_kv12a.f32` by `tools/gen_codebook_inc.py` and checked by `tests/test_codebook_inc.py`).
   `TQ_KV_T4_CODEBOOK` / `--kv-t4-codebook` only override it; the engine's fallback to the measurement box's path is
   gone. Same values, bitwise (`docs/evidence/cand10-all.log`).
 - README cut to the pitch, the table, a quick start and the docs index; its details moved to `docs/FLAGS.md`
   (endpoints, the startup line) and `docs/evidence/README.md` (`bench/reproduce.sh` options, build reproducibility).
+- **The engine in 26 parts**: `src/forward_qwen.cu` includes `src/engine/*.cuh` in order — still one translation unit,
+  per-kernel SASS identical to the unsplit file. Tools that use the engine source as prompt text read it through
+  `tools/engine_text.py`; `tests/test_unity_build.py` checks the part list.
+- `TQ_GEMM_FORK_MAXN` (default 64): the concurrent GEMM groups only up to N = 64 — decode steps and verify waves keep
+  them, the 128-column prefill wave runs its gate / up groups on one stream (bitwise, neutral on the wave;
+  `TQ_GEMM_FORK_MAXN=1000000` = the previous behaviour).
+- The residual-stream hook's entry points are `qwn_rmap_hook_add` / `_hook_count` / `_set_scale` / `_apply_debug`; the
+  2026-08 `qwn_ot_*` names stay as aliases for one release. Stale comments (the file header, June/July dates) and
+  never-called code (the single-stream spec path's graph experiment, an unused fork kernel) removed.
+- Tools: the default `--lib` is this repository's `build-qwen/libforward_qwen.so` (was a path on the development box),
+  and both servers require `--tqf` / `--model-dir` instead of defaulting to files that do not exist.
 
 ## [v0.10] — 2026-10-17
 

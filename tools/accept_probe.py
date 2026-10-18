@@ -36,7 +36,7 @@ for _r in REF_LIST:
     assert len(_ids) >= P + STEPS + DEPTH + 4, f"reference too short: {_r} ({len(_ids)})"
     REF_IDS[_r] = _ids
 
-L = load_lib(os.environ.get("TQ_LIB", "/workspace/qwentin/build-qwen/libforward_qwen.so"))
+L = load_lib(os.environ.get("TQ_LIB", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build-qwen", "libforward_qwen.so")))
 TQF = os.environ.get("TQ_MODEL_TQF", "/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
 ck(L.qwn_init(TQF.encode()), "init")
 e = Eng(L)

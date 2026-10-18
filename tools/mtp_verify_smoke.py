@@ -335,7 +335,7 @@ def main():
     ap = argparse.ArgumentParser(description="MTP-tree dense verify (Step 3+4)")
     ap.add_argument("--model-dir", default="/workspace/models/Qwen3.6-27B")
     ap.add_argument("--tqf", default="/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
-    ap.add_argument("--lib", default="/workspace/qwentin/build-qwen/libforward_qwen.so")
+    ap.add_argument("--lib", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build-qwen", "libforward_qwen.so"))
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--max-tokens", type=int, default=128, help="prompt token cap")
     ap.add_argument("--gate", choices=("a", "b", "both"), default="both")

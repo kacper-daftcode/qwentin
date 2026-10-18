@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--tqf", default="/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
-ap.add_argument("--lib", default="/workspace/qwentin/build-qwen/libforward_qwen.so")
+ap.add_argument("--lib", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build-qwen", "libforward_qwen.so"))
 ap.add_argument("--prompt-tokens", type=int, default=1024)
 ap.add_argument("--rounds", type=int, default=30)
 ap.add_argument("--warmup", type=int, default=5)

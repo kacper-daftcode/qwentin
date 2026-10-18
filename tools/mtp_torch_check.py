@@ -22,7 +22,7 @@ STEPS = int(os.environ.get("STEPS", "96"))
 P = 48
 tok = AutoTokenizer.from_pretrained("/workspace/models/Qwen3.6-27B", trust_remote_code=True)
 ids = tok(open(REF).read(), add_special_tokens=False).input_ids
-L = load_lib("/workspace/qwentin/build-qwen/libforward_qwen.so")
+L = load_lib(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build-qwen", "libforward_qwen.so"))
 L.qwn_copy_mtp_debug.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 ck(L.qwn_init(b"/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf"), "init")
 e = Eng(L)

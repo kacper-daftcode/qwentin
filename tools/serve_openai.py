@@ -75,10 +75,10 @@ from transformers import AutoTokenizer  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8000)
 add_hardening_args(ap)   # --host (127.0.0.1; was 0.0.0.0 before 2026-10) --api-key --max-body-bytes --max-tokens-cap --socket-timeout
-ap.add_argument("--tqf", default=os.environ.get("TQ_MODEL_TQF",
-                "/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf"))
-ap.add_argument("--model-dir", default="/workspace/models/Qwen3.6-27B")
-ap.add_argument("--lib", default="/workspace/qwentin/build-qwen/libforward_qwen.so")
+ap.add_argument("--tqf", default=os.environ.get("TQ_MODEL_TQF"), required=not os.environ.get("TQ_MODEL_TQF"),
+                help="the .tqf model file (default: $TQ_MODEL_TQF)")
+ap.add_argument("--model-dir", required=True, help="the HF checkpoint dir (tokenizer and chat template)")
+ap.add_argument("--lib", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build-qwen", "libforward_qwen.so"))
 ap.add_argument("--model-name", default="qwentin-qwen3.6-27b-fp6")
 ap.add_argument("--ctx", type=int, default=0, help="max prompt+gen tokens (0 = engine limit)")
 ap.add_argument("--depth", type=int, default=6)

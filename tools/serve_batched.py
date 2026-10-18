@@ -1284,8 +1284,8 @@ def bench(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tqf", default="/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
-    ap.add_argument("--model-dir", default="/workspace/models/Qwen3.6-27B")
+    ap.add_argument("--tqf", required=True, help="the .tqf model file")
+    ap.add_argument("--model-dir", required=True, help="the HF checkpoint dir (tokenizer and chat template only)")
     ap.add_argument("--lib", default=os.path.join(HERE, "build-qwen", "libforward_qwen.so"))
     ap.add_argument("--model-name", default="qwentin-qwen3.6-27b-batched")
     ap.add_argument("--page", type=int, default=128)
