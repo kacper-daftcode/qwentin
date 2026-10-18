@@ -176,3 +176,52 @@ def test_cli_exit_codes(tmp_path):
     assert subprocess.run([sys.executable, script, str(p), "--expect", "exl3-mtp"], capture_output=True).returncode == 2
     p2 = _write(tmp_path, "short.tqf", make_header(flags), b"\0" * (expected - 1))
     assert subprocess.run([sys.executable, script, str(p2)], capture_output=True).returncode == 1
+
+
+def _sealed(flags: int, payload: bytes) -> bytes:
+    """A version-2 file the way tools/convert_qwen_tqf.py writes it: extension added, payload hashed, header sealed."""
+    import hashlib
+    header = it.add_extension(make_header(flags))
+    return it.seal_header(header, len(payload), hashlib.blake2b(payload, digest_size=32).digest()) + payload
+
+
+def test_version2_integrity(tmp_path, capsys):
+    flags = 0x53d
+    expected, _, _ = it.walk_payload(it.read_header(io.BytesIO(make_header(flags))))
+    payload = bytes(range(256)) * (expected // 256) + bytes(expected % 256)
+    data = _sealed(flags, payload)
+    h = it.read_header(io.BytesIO(data))
+    assert h.format_version == 2 and h.header_bytes == len(make_header(flags)) + it.EXT_SIZE
+    assert h.payload_bytes == expected and h.header_hash_ok and h.layer_types == [1, 2]
+    p = tmp_path / "v2.tqf"; p.write_bytes(data)
+    r = it.inspect(p, verify=True)
+    out = capsys.readouterr().out
+    assert r["payload_ok"] and r["integrity_ok"] and r["payload_hash_ok"] and r["production_fp6"]
+    assert "format_version: 2" in out and "header hash: OK" in out and "OK" in out.split("payload hash")[1].split("\n")[0]
+    # one flipped payload byte: the size and the header still check out, only --verify sees it
+    bad = bytearray(data); bad[-1000] ^= 1
+    p.write_bytes(bytes(bad))
+    assert it.inspect(p, verbose=False)["payload_ok"]
+    r = it.inspect(p, verbose=False, verify=True)
+    assert r["payload_hash_ok"] is False and not r["payload_ok"] and not r["production_fp6"]
+    # truncated: the recorded size disagrees with the file
+    p.write_bytes(data[:-4096])
+    assert not it.inspect(p, verbose=False)["integrity_ok"]
+    # a header field changed after sealing: the header hash disagrees -- max_position_embeddings (the payload layout
+    # still walks) and the vocab size (it does not: an unaligned slot, reported instead of raised)
+    for field in (15, 6):
+        bad = bytearray(data); bad[8 + 4 * field] ^= 1
+        p.write_bytes(bytes(bad))
+        assert it.read_header(io.BytesIO(bytes(bad))).header_hash_ok is False
+        assert not it.inspect(p, verbose=False)["payload_ok"]
+
+
+def test_version2_unknown_flags_and_bad_extension(tmp_path):
+    expected, _, _ = it.walk_payload(it.read_header(io.BytesIO(make_header(0x53d))))
+    p = tmp_path / "v2f.tqf"
+    p.write_bytes(_sealed(0x53d | (1 << 20), b"\0" * expected))
+    assert not it.inspect(p, verbose=False)["integrity_ok"]
+    short = it.add_extension(make_header(0x53d))[:-8]       # an extension shorter than the format's 80 bytes
+    short = short[:4] + struct.pack("<I", len(short)) + short[8:]
+    with pytest.raises(ValueError):
+        it.read_header(io.BytesIO(short))

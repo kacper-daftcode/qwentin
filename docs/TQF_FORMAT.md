@@ -1,4 +1,4 @@
-# The `.tqf` file format (TQF1) — layout, flags, and the versioning / checksum TODO
+# The `.tqf` file format (TQF1) — layout, flags, format version 2 (recorded size and hashes)
 
 `.tqf` is qwentin's on-disk model format: one header, then the text tower's tensors in a fixed order, then (optionally)
 the MTP head section. It is written by `tools/convert_qwen_tqf.py`, read by the engine's `parse_tqf` (in
@@ -10,8 +10,8 @@ reference for this document. Byte order is little-endian throughout.
 ```
 offset  size  field
 0       4     magic "TQF1"
-4       4     u32 header_bytes            = 8 + 100 + num_hidden_layers (the whole header incl. the layer-type bytes)
-8       100   struct "<16I3f8I":
+4       4     u32 header_bytes            = 8 + 108 + num_hidden_layers (+ 80 in format version 2: the extension below)
+8       108   struct "<16I3f8I":
                 u32 flags                 (below)
                 u32 model_family          1 = Qwen3.5-class text tower (Qwen3.5 / 3.6 / 3.8 share the layout)
                 u32 non_quant_dtype       1 = fp16, 2 = bf16 (the storage dtype of embeddings, norms, conv, dt_bias)
@@ -22,7 +22,7 @@ offset  size  field
                 f32 rms_norm_eps, rope_theta, partial_rotary_factor
                 u32 mrope_interleaved, mrope_section[3]
                 u32 tie_word_embeddings, text_only, has_vision_config, has_mtp
-108     L     u8 layer_types[num_hidden_layers]   1 = linear_attention (gated DeltaNet), 2 = full_attention
+116     L     u8 layer_types[num_hidden_layers]   1 = linear_attention (gated DeltaNet), 2 = full_attention
 ```
 
 `has_vision_config` / `has_mtp` describe the *source* checkpoint (the vision tower is always dropped); whether an MTP
@@ -117,34 +117,39 @@ Appended right after the main payload, in this order (`mtp_tensor_specs()` in th
 `non_quant` bf16 matrices (0.85 GB for the 27B; the single-stream MTP tools and `--mtp-source`) or, with `0x1000`,
 EXL3 records (0.25 GB on the device; the batched server's paged drafter, `--mtp-exl3`).
 
-## What is missing: a format version, a checksum, and a loader that refuses (TODO for the next engine integration)
+## Format version 2: recorded size, hashes, and a loader that refuses
 
-The format has grown by flags only; the engine trusts the header. Three gaps, and the design agreed for closing them
-when `src/forward_qwen.cu` is next touched (the engine is out of scope for this document's commit):
+Since `src/engine/loader.cuh` / `tools/convert_qwen_tqf.py` of 2026-10-18 the converter writes **format version 2**:
+the header above, then an 80-byte **extension** right after the layer-type bytes (`header_bytes` = 116 + L + 80),
+then the payload as before. The magic stays `TQF1`; a file without the extension is version 1 and loads as it always
+did (the served `-mtp4.tqf` of v0.10 is version 1). An engine older than this rule refuses a version-2 file
+("Unexpected header_bytes") instead of misreading it.
 
-1. **Format version.** The magic `TQF1` is the only version marker and has not changed while the payload gained block
-   scales, E2M3 tiles, EXL3 records and the EXL3 MTP section. Proposal: keep the magic, add `u32 format_version` as
-   the first field of a **header extension** placed after the layer-type bytes (so `header_bytes` grows and old readers
-   that only index the fixed struct still parse the dimensions), together with `u32 extension_bytes` so later fields can
-   follow. Writers set `format_version = 2` for files with the extension; the current files are implicitly version 1.
-   The loader refuses a `format_version` above the one it was built for (`"tqf format v3 needs a newer engine"`) instead
-   of misreading records, and warns on version 1 files that carry flags it does not know (`flags & ~KNOWN_FLAGS`).
-2. **Checksum.** No integrity check exists: a truncated copy (the common failure — a 21 GB file interrupted by a full
-   disk) is detected only because `parse_tqf` runs off the end, and a bit-flipped record is not detected at all.
-   Proposal: in the extension, `u8 payload_hash[32]` = **BLAKE2b-256 of the payload** (everything after the header,
-   computed by the converter while writing; ~20 s for 21 GB on one core, or `xxh3_128` if that matters), `u64
-   payload_bytes`, and `u8 header_hash[32]` over the header with the two hash fields zeroed. `tools/inspect_tqf.py`
-   verifies both (`--verify`), the loader verifies `payload_bytes` always (cheap: a `stat`) and the payload hash on
-   demand (`TQ_VERIFY_TQF=1`, or a `--verify-tqf` server flag — a full read of the file, which the load does anyway, so
-   the cost is one hash pass on the host).
-3. **Loader refusal.** Today `qwn_init` accepts any file with the magic and the right dimensions; a `-mtp.tqf` on
-   `--spec` is caught by the server (warning, spec off), while a plain-FP8 file loads and runs on the FP8 kernels — a
-   larger, slower format than the FP6 `docs/legacy-fp6.md` documents — without any notice. Proposal: `qwn_init` returns a distinct error code and prints the reason
-   when (a) `format_version` is newer than supported, (b) `payload_bytes` ≠ the file size minus the header, (c) a
-   required flag combination for the requested path is absent (`TQ_KV_T4`/`--spec` with no `0x1000`; the FP6 single-
-   stream path with no `0x100`), (d) unknown flag bits are set in a version-2 file. The server surfaces the code in
-   its startup line and exits non-zero. Until then: run `tools/inspect_tqf.py <file> --expect exl3-mtp` (or `fp6`)
-   before serving — `bench/reproduce.sh` does, and the converter prints a WARNING whenever it writes something other
-   than the two production formats.
+```
+extension (struct "<IIQ32s32s", 80 bytes)
+0       4     u32 format_version            2
+4       4     u32 extension_bytes           80 (later versions may append fields after these)
+8       8     u64 payload_bytes             file size - header_bytes: the main payload + the MTP section
+16      32    u8  payload_hash[32]          BLAKE2b-256 (digest_size 32, unkeyed) of the payload
+48      32    u8  header_hash[32]           BLAKE2b-256 of the header [0, header_bytes) with bytes 16..80 of the
+                                            extension (both hashes) zeroed
+```
 
-None of this changes the bytes of existing files: version-1 files stay loadable, the extension is additive.
+The converter hashes the payload while writing it and seals the header last, so an interrupted conversion leaves a
+header with `payload_bytes` 0 and zero hashes, which the engine refuses. The checks, and who makes them:
+
+| check | engine (`qwn_init`, `qwn_probe`) | `tools/inspect_tqf.py` |
+|---|---|---|
+| format version above 2 | refused, code **-40** ("format vN needs a newer engine") | FAIL |
+| malformed extension (`extension_bytes` < 80 or not matching `header_bytes`) | refused, **-45** | FAIL (`ValueError`) |
+| unknown flag bits | refused in a version-2 file, **-44**; a warning in version 1 | FAIL in version 2, a note in version 1 |
+| header hash | always (a few hundred bytes), **-42** on a mismatch | always |
+| `payload_bytes` vs the file size (a truncated or extended copy) | always (one `fseek`), **-41** | always |
+| payload hash (a flipped bit anywhere) | with `TQ_VERIFY_TQF=1`: one extra read of the file, ~20 s for 21 GB at ~1 GB/s, **-43** | with `--verify` (~30 s) |
+
+`qwn_init` prints one line per file (`TQF1 format v2: payload ... bytes as recorded, header hash OK, payload hash
+...`); the servers stop on a negative code. `tests/test_inspect_tqf.py` (CPU) covers the extension, the hashes and each
+defect on synthetic files; `tests/test_tqf_hash.py` checks the engine's BLAKE2b against `hashlib` and each refusal code
+through `qwn_probe` (it needs a built library and is skipped without one). Re-converting a version-1 file gives the same
+payload byte for byte (checked on the served opt-5.75 `-mtp4.tqf`: the version-2 file is the version-1 file plus the
+80-byte extension, and the engine's paged-decode logits on both are bitwise equal).

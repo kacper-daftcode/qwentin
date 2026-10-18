@@ -25,6 +25,7 @@ int qwn_ot_hook_count(void);
 int qwn_ot_set_scale(int layer, float scale);
 int qwn_ot_apply_debug(int layer, int rows, float *io);
 void qwn_free(void);
+int qwn_tqf_blake2b256(const void *data, size_t n, uint8_t *out);
 int qwn_gpu_pack_e2m3_test(const uint16_t *h_bf16, int M, int K, uint8_t *h_out_dA, float *h_out_scale);
 int qwn_probe(const char *path);
 int qwn_init(const char *path);

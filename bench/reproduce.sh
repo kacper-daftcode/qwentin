@@ -3,7 +3,8 @@
 # with the environment they were measured in, to bench/results-<date>-<commit>.json.
 #
 #   1. build          cmake + make of src/forward_qwen.cu into build-qwen-repro/ (skip with --no-build and LIB=...)
-#   2. model check    tools/inspect_tqf.py on the .tqf (header flags, payload size, the EXL3 + MTP verdict)
+#   2. model check    tools/inspect_tqf.py --verify on the .tqf (header flags, payload size, a format-v2 file's hashes,
+#                     the EXL3 + MTP verdict)
 #   3. serve          THE SERVED STACK line of the README (tools/serve_batched.py, 12 slots, 4500 blocks, 127.0.0.1:$PORT)
 #   4. wait           for /health
 #   5. needle         tools/code_needle.py   32K x depths 0.95 / 0.5 / 0.05, 3 decoys            -> 3/3, TTFT = cold prefill
@@ -115,8 +116,8 @@ fi
 # ---------------------------------------------------------------- 2. model check
 if [ $CHECK -eq 1 ]; then
   log "model check: tools/inspect_tqf.py $TQF"
-  run "$PYTHON" tools/inspect_tqf.py "$TQF" --expect exl3-mtp > "$WORK/inspect_tqf.log" 2>&1 || log "inspect_tqf exited non-zero: the file is not the served EXL3 + MTP format or is inconsistent (see $WORK/inspect_tqf.log)"
-  [ $DRY -eq 1 ] || grep -E "^(flags|exl3_bitrates|payload_match|verdict)" "$WORK/inspect_tqf.log" || true
+  run "$PYTHON" tools/inspect_tqf.py "$TQF" --expect exl3-mtp --verify > "$WORK/inspect_tqf.log" 2>&1 || log "inspect_tqf exited non-zero: the file is not the served EXL3 + MTP format or is inconsistent (see $WORK/inspect_tqf.log)"
+  [ $DRY -eq 1 ] || grep -E "^(flags|format_version|exl3_bitrates|payload_match|header hash|payload hash|verdict)" "$WORK/inspect_tqf.log" || true
 fi
 
 # ---------------------------------------------------------------- 3. serve (THE SERVED STACK line of the README)

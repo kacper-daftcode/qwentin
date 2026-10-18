@@ -16,6 +16,7 @@ SIGNATURES = {
     "qwn_ot_set_scale": (C.c_int, [C.c_int, C.c_float]),
     "qwn_ot_apply_debug": (C.c_int, [C.c_int, C.c_int, C.c_void_p]),
     "qwn_free": (None, []),
+    "qwn_tqf_blake2b256": (C.c_int, [C.c_void_p, C.c_size_t, C.c_void_p]),
     "qwn_gpu_pack_e2m3_test": (C.c_int, [C.c_void_p, C.c_int, C.c_int, C.c_void_p, C.c_void_p]),
     "qwn_probe": (C.c_int, [C.c_char_p]),
     "qwn_init": (C.c_int, [C.c_char_p]),

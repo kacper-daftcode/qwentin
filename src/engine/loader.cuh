@@ -311,6 +311,144 @@ extern "C" void qwn_free(void) {
     memset(&g_qwen, 0, sizeof(g_qwen));
 }
 
+// BLAKE2b (RFC 7693, unkeyed), for the .tqf header and payload hashes.
+typedef struct { uint64_t h[8], t[2]; uint8_t b[128]; size_t c, outlen; } tq_b2b_ctx;
+static const uint64_t tq_b2b_iv[8] = {
+    0x6A09E667F3BCC908ULL, 0xBB67AE8584CAA73BULL, 0x3C6EF372FE94F82BULL, 0xA54FF53A5F1D36F1ULL,
+    0x510E527FADE682D1ULL, 0x9B05688C2B3E6C1FULL, 0x1F83D9ABFB41BD6BULL, 0x5BE0CD19137E2179ULL};
+static const uint8_t tq_b2b_sigma[12][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+    {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4}, {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+    {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13}, {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+    {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11}, {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+    {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5}, {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0},
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3}};
+static inline uint64_t tq_rotr64(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
+static void tq_b2b_compress(tq_b2b_ctx *c, int last) {
+    uint64_t v[16], m[16];
+    for (int i = 0; i < 8; i++) { v[i] = c->h[i]; v[i + 8] = tq_b2b_iv[i]; }
+    v[12] ^= c->t[0]; v[13] ^= c->t[1];
+    if (last) v[14] = ~v[14];
+    for (int i = 0; i < 16; i++) {
+        uint64_t w = 0;
+        for (int j = 7; j >= 0; j--) w = (w << 8) | c->b[8 * i + j];
+        m[i] = w;
+    }
+    static const int G[8][4] = {{0, 4, 8, 12}, {1, 5, 9, 13}, {2, 6, 10, 14}, {3, 7, 11, 15},
+                                {0, 5, 10, 15}, {1, 6, 11, 12}, {2, 7, 8, 13}, {3, 4, 9, 14}};
+    for (int r = 0; r < 12; r++) {
+        const uint8_t *s = tq_b2b_sigma[r];
+        for (int g = 0; g < 8; g++) {
+            int a = G[g][0], b = G[g][1], cc = G[g][2], d = G[g][3];
+            v[a] = v[a] + v[b] + m[s[2 * g]];     v[d] = tq_rotr64(v[d] ^ v[a], 32);
+            v[cc] = v[cc] + v[d];                 v[b] = tq_rotr64(v[b] ^ v[cc], 24);
+            v[a] = v[a] + v[b] + m[s[2 * g + 1]]; v[d] = tq_rotr64(v[d] ^ v[a], 16);
+            v[cc] = v[cc] + v[d];                 v[b] = tq_rotr64(v[b] ^ v[cc], 63);
+        }
+    }
+    for (int i = 0; i < 8; i++) c->h[i] ^= v[i] ^ v[i + 8];
+}
+static void tq_b2b_init(tq_b2b_ctx *c, size_t outlen) {
+    for (int i = 0; i < 8; i++) c->h[i] = tq_b2b_iv[i];
+    c->h[0] ^= 0x01010000ULL ^ (uint64_t)outlen;
+    c->t[0] = c->t[1] = 0; c->c = 0; c->outlen = outlen;
+}
+static void tq_b2b_update(tq_b2b_ctx *c, const void *in, size_t n) {
+    const uint8_t *p = (const uint8_t *)in;
+    while (n > 0) {
+        if (c->c == 128) {                     // a full block is compressed only once more input follows it
+            c->t[0] += 128; if (c->t[0] < 128) c->t[1]++;
+            tq_b2b_compress(c, 0); c->c = 0;
+        }
+        size_t k = 128 - c->c < n ? 128 - c->c : n;
+        memcpy(c->b + c->c, p, k); c->c += k; p += k; n -= k;
+    }
+}
+static void tq_b2b_final(tq_b2b_ctx *c, uint8_t *out) {
+    c->t[0] += c->c; if (c->t[0] < c->c) c->t[1]++;
+    memset(c->b + c->c, 0, 128 - c->c);
+    tq_b2b_compress(c, 1);
+    for (size_t i = 0; i < c->outlen; i++) out[i] = (uint8_t)(c->h[i >> 3] >> (8 * (i & 7)));
+}
+extern "C" int qwn_tqf_blake2b256(const void *data, size_t n, uint8_t *out) {
+    tq_b2b_ctx c; tq_b2b_init(&c, 32); tq_b2b_update(&c, data, n); tq_b2b_final(&c, out);
+    return 0;
+}
+
+// .tqf format version 2 (docs/TQF_FORMAT.md): an 80-byte extension after the layer types records the payload size,
+// a BLAKE2b-256 of the payload and one of the header (with both hash fields zeroed). A version-1 file (no extension)
+// loads as before. Refused: a newer format (-40), a payload size that differs from the record (-41: truncated or
+// extended file), a header that does not match its hash (-42), with TQ_VERIFY_TQF=1 a payload that does not (-43; a
+// full extra read of the file), unknown flag bits in a version-2 file (-44; a warning in version 1), a malformed
+// extension (-45). Leaves the file positioned at the payload.
+#define TQF_FORMAT_VERSION 2
+#define TQF_EXT_BYTES 80
+#define TQF_KNOWN_FLAGS 0x1FFFu
+static int tqf_check_integrity(FILE *f, const char *path, uint32_t header_bytes, uint32_t base_header) {
+    uint32_t unknown = g_qwen.flags & ~TQF_KNOWN_FLAGS;
+    if (header_bytes == base_header) {
+        if (unknown) fprintf(stderr, "[tqf] WARNING: %s sets unknown flag bits 0x%x\n", path, unknown);
+        printf("TQF1 format v1: no recorded payload size or hashes (a re-conversion writes v2)\n");
+        return 0;
+    }
+    uint8_t *hdr = (uint8_t *)malloc(header_bytes);
+    if (!hdr || fseeko(f, 0, SEEK_SET) != 0 || fread(hdr, 1, header_bytes, f) != header_bytes) {
+        free(hdr); fprintf(stderr, "[tqf] %s: cannot re-read the %u-byte header\n", path, header_bytes); return -1;
+    }
+    uint8_t *ext = hdr + base_header, payload_hash[32], header_hash[32], h[32];
+    uint32_t version, ext_bytes; uint64_t payload_bytes;
+    memcpy(&version, ext, 4); memcpy(&ext_bytes, ext + 4, 4); memcpy(&payload_bytes, ext + 8, 8);
+    memcpy(payload_hash, ext + 16, 32); memcpy(header_hash, ext + 48, 32);
+    int rc = 0;
+    if (version > TQF_FORMAT_VERSION) {
+        fprintf(stderr, "[tqf] %s: format v%u needs a newer engine (this one reads v1..v%d)\n", path, version, TQF_FORMAT_VERSION);
+        rc = -40;
+    } else if (version < 2 || ext_bytes < TQF_EXT_BYTES || base_header + ext_bytes != header_bytes) {
+        fprintf(stderr, "[tqf] %s: malformed header extension (format_version %u, extension_bytes %u)\n", path, version, ext_bytes);
+        rc = -45;
+    } else if (unknown) {
+        fprintf(stderr, "[tqf] %s: unknown flag bits 0x%x in a format-v2 file\n", path, unknown);
+        rc = -44;
+    } else {
+        memset(ext + 16, 0, 64);
+        qwn_tqf_blake2b256(hdr, header_bytes, h);
+        if (memcmp(h, header_hash, 32) != 0) {
+            fprintf(stderr, "[tqf] %s: the header does not match its recorded hash (corrupted header)\n", path);
+            rc = -42;
+        }
+    }
+    free(hdr);
+    if (rc != 0) return rc;
+    if (fseeko(f, 0, SEEK_END) != 0) return -1;
+    uint64_t on_disk = (uint64_t)ftello(f) - header_bytes;
+    if (on_disk != payload_bytes) {
+        fprintf(stderr, "[tqf] %s: the payload is %llu bytes, the header records %llu (truncated or extended file)\n",
+                path, (unsigned long long)on_disk, (unsigned long long)payload_bytes);
+        return -41;
+    }
+    const char *ve = getenv("TQ_VERIFY_TQF");
+    int verify = ve && *ve && atoi(ve) != 0;
+    if (verify) {
+        if (fseeko(f, (off_t)header_bytes, SEEK_SET) != 0) return -1;
+        const size_t cap = (size_t)1 << 24;
+        uint8_t *buf = (uint8_t *)malloc(cap);
+        if (!buf) return -1;
+        tq_b2b_ctx c; tq_b2b_init(&c, 32);
+        size_t n;
+        while ((n = fread(buf, 1, cap, f)) > 0) tq_b2b_update(&c, buf, n);
+        free(buf);
+        tq_b2b_final(&c, h);
+        if (memcmp(h, payload_hash, 32) != 0) {
+            fprintf(stderr, "[tqf] %s: the payload does not match its recorded hash (corrupted file)\n", path);
+            return -43;
+        }
+    }
+    if (fseeko(f, (off_t)header_bytes, SEEK_SET) != 0) return -1;
+    printf("TQF1 format v%u: payload %llu bytes as recorded, header hash OK, payload hash %s\n", version,
+           (unsigned long long)payload_bytes, verify ? "OK (TQ_VERIFY_TQF)" : "not checked (TQ_VERIFY_TQF=1)");
+    return 0;
+}
+
 static int parse_tqf(const char *path, int upload) {
     if (upload) qwn_free();
     else memset(&g_qwen, 0, sizeof(g_qwen));
@@ -379,15 +517,20 @@ static int parse_tqf(const char *path, int upload) {
         fclose(f);
         return -1;
     }
-    uint32_t expected_header = 4u + 4u + 16u * 4u + 3u * 4u + 8u * 4u + (uint32_t)g_qwen.L;
-    if (header_bytes != expected_header) {
-        fprintf(stderr, "Unexpected header_bytes=%u expected=%u\n", header_bytes, expected_header);
+    uint32_t base_header = 4u + 4u + 16u * 4u + 3u * 4u + 8u * 4u + (uint32_t)g_qwen.L;
+    if (header_bytes != base_header && header_bytes < base_header + TQF_EXT_BYTES) {
+        fprintf(stderr, "Unexpected header_bytes=%u expected=%u (format v1) or >= %u (v2)\n", header_bytes, base_header,
+                base_header + TQF_EXT_BYTES);
         fclose(f);
         return -1;
     }
     if (read_exact(f, g_qwen.layer_types, (size_t)g_qwen.L, "layer types") != 0) {
         fclose(f);
         return -1;
+    }
+    {
+        int irc = tqf_check_integrity(f, path, header_bytes, base_header);
+        if (irc != 0) { fclose(f); return irc; }
     }
 
     if (upload) {

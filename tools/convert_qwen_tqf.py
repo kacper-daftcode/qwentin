@@ -20,6 +20,7 @@ verdict for both production formats."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,7 @@ from tools.convert import (  # noqa: E402
     repack_to_qmma_layout_f6_dense,
 )
 from tools.sparse_pack import wanda_2of4_mask, pack_2of4_e2m3_codes  # noqa: E402
+from tools.inspect_tqf import add_extension, seal_header  # noqa: E402
 
 
 DEFAULT_MODEL = "/workspace/models/Qwen3.5-0.8B"
@@ -996,6 +998,19 @@ def expected_names_for_text(config) -> set[str]:
     return {spec.name for spec in tensor_specs(config, set())}
 
 
+class _HashingWriter:
+    """The output file as the tensor writers see it: what they write is the payload, hashed and counted on the way.
+    An interrupted conversion leaves the header unsealed (payload_bytes 0), which the engine refuses to load."""
+
+    def __init__(self, f):
+        self.f, self.h, self.n = f, hashlib.blake2b(digest_size=32), 0
+
+    def write(self, b):
+        self.h.update(b)
+        self.n += len(b)
+        return self.f.write(b)
+
+
 def write_tqf(
     model_path: str,
     output_path: str,
@@ -1086,18 +1101,18 @@ def write_tqf(
         if emit_mtp and mtp_exl3:
             print(f"  MTP projections as EXL3 records (flag 0x{FLAG_MTP_EXL3:x})")
 
-        header = build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp, exl3,
-                              emit_mtp and mtp_exl3)
+        header = add_extension(build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp, exl3,
+                                            emit_mtp and mtp_exl3))
         bytes_written = len(header)
         kind_counts: dict[str, int] = {}
         output_file = None
         if not dry_run:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            output_file = open(output_path, "wb")
+            output_file = _HashingWriter(open(output_path, "wb"))
 
         try:
             if output_file is not None:
-                output_file.write(header)
+                output_file.f.write(header)
             for spec in specs:
                 kind_counts[spec.kind] = kind_counts.get(spec.kind, 0) + 1
                 if spec.kind == "non_quant":
@@ -1176,9 +1191,14 @@ def write_tqf(
                     bytes_written += size
                     if dry_run:
                         print(f"  {spec.name:72s} {spec.shape!s:18s} {spec.kind}")
+            if output_file is not None:
+                digest = output_file.h.digest()
+                output_file.f.seek(0)
+                output_file.f.write(seal_header(header, output_file.n, digest))
+                print(f"  sealed: format v2, payload {output_file.n} bytes, BLAKE2b-256 {digest.hex()[:16]}...")
         finally:
             if output_file is not None:
-                output_file.close()
+                output_file.f.close()
             if mtp_store_cm is not None:
                 mtp_store_cm.__exit__(None, None, None)
 

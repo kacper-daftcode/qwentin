@@ -33,6 +33,12 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 - The residual-stream hook's entry points are `qwn_rmap_hook_add` / `_hook_count` / `_set_scale` / `_apply_debug`; the
   2026-08 `qwn_ot_*` names stay as aliases for one release. Stale comments (the file header, June/July dates) and
   never-called code (the single-stream spec path's graph experiment, an unused fork kernel) removed.
+- **`.tqf` format version 2**: the converter appends an 80-byte header extension with the payload size and BLAKE2b-256
+  hashes of the payload and of the header (sealed last, so an interrupted conversion is refused). The engine checks
+  the header hash and the size on every load, the payload hash with `TQ_VERIFY_TQF=1` (~20 s for 21 GB), and refuses
+  a newer format, a truncated copy, a corrupted header or payload and unknown flags with distinct codes (-40 … -45);
+  `tools/inspect_tqf.py --verify` does the same offline. Version-1 files load as before; re-converting the served
+  `-mtp4.tqf` gives the same payload byte for byte plus the extension (docs/TQF_FORMAT.md).
 - Tools: the default `--lib` is this repository's `build-qwen/libforward_qwen.so` (was a path on the development box),
   and both servers require `--tqf` / `--model-dir` instead of defaulting to files that do not exist.
 

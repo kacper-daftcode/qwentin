@@ -10,15 +10,18 @@ tensors the header announces, and prints two one-line verdicts:
                                       --spec; flags 0x800 | 0x400 | 0x1000)
 
 A FAIL names what is missing (e.g. a plain-FP8 file written by an old `--block-scaled auto` default, an EXL3 file
-converted without --mtp-exl3 that runs with speculative decoding OFF). Exit code: 0 when the payload matches the
-header, 1 when it does not (a truncated / foreign file), 2 when --expect {fp6,exl3-mtp} names a verdict that failed.
+converted without --mtp-exl3 that runs with speculative decoding OFF). A version-2 file (docs/TQF_FORMAT.md) also
+carries its payload size, a payload hash and a header hash: the size and the header hash are always checked, the
+payload hash with --verify (a full read). Exit code: 0 when the payload matches the header, 1 when it does not (a
+truncated / foreign / corrupted file), 2 when --expect {fp6,exl3-mtp} names a verdict that failed.
 
-  python3 tools/inspect_tqf.py model.tqf [--expect exl3-mtp]
+  python3 tools/inspect_tqf.py model.tqf [--expect exl3-mtp] [--verify]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import struct
 import sys
@@ -52,6 +55,10 @@ FLAG_NAMES = {
     FLAG_BLOCK_SCALED_E2M3: "block_scaled_e2m3", FLAG_SPARSE_24_E2M3: "sparse_24_e2m3", FLAG_HAS_MTP: "has_mtp_section",
     FLAG_EXL3_WEIGHTS: "exl3_weights", FLAG_MTP_EXL3: "mtp_exl3",
 }
+KNOWN_FLAGS = (FLAG_MTP_EXL3 << 1) - 1
+FORMAT_VERSION = 2                 # files with the header extension; a file without one is version 1
+EXT_FMT = "<IIQ32s32s"             # format_version, extension_bytes, payload_bytes, payload_hash, header_hash
+EXT_SIZE = struct.calcsize(EXT_FMT)
 PRODUCTION_FP6_FLAGS = FLAG_FP8_QMMA_WEIGHTS | FLAG_BLOCK_SCALED_QMMA | FLAG_BLOCK_SCALED_E2M3 | FLAG_HAS_MTP
 EXL3_MTP_FLAGS = FLAG_EXL3_WEIGHTS | FLAG_HAS_MTP | FLAG_MTP_EXL3
 
@@ -85,6 +92,10 @@ class TqfHeader:
     has_vision_config: int
     has_mtp: int
     layer_types: list[int]
+    format_version: int = 1
+    payload_bytes: int | None = None       # version 2: the payload size the writer recorded
+    payload_hash: bytes | None = None      # version 2: BLAKE2b-256 of the payload
+    header_hash_ok: bool | None = None     # version 2: the stored header hash matches the header
 
 
 @dataclass(frozen=True)
@@ -95,6 +106,36 @@ class Slot:
     kind: str
     count: int                 # elements (non_quant / f32)
     shape: tuple[int, int] = (0, 0)
+
+
+def header_hash(header: bytes, ext_start: int) -> bytes:
+    """BLAKE2b-256 of a version-2 header with its two hash fields (extension bytes 16..80) zeroed."""
+    h = bytearray(header)
+    h[ext_start + 16:ext_start + 80] = bytes(64)
+    return hashlib.blake2b(bytes(h), digest_size=32).digest()
+
+
+def add_extension(header_v1: bytes) -> bytes:
+    """A version-1 header (magic .. layer types) -> a version-2 header whose extension is not sealed yet."""
+    return (header_v1[:4] + struct.pack("<I", len(header_v1) + EXT_SIZE) + header_v1[8:]
+            + struct.pack(EXT_FMT, FORMAT_VERSION, EXT_SIZE, 0, bytes(32), bytes(32)))
+
+
+def seal_header(header: bytes, payload_bytes: int, payload_hash: bytes) -> bytes:
+    """Fill in the payload size, the payload hash and the header hash of a header made by add_extension."""
+    ext = len(header) - EXT_SIZE
+    h = bytearray(header)
+    h[ext:] = struct.pack(EXT_FMT, FORMAT_VERSION, EXT_SIZE, payload_bytes, payload_hash, bytes(32))
+    h[ext + 48:] = header_hash(bytes(h), ext)
+    return bytes(h)
+
+
+def payload_hash(f: BinaryIO, header_bytes: int) -> bytes:
+    f.seek(header_bytes)
+    h = hashlib.blake2b(digest_size=32)
+    while chunk := f.read(1 << 24):
+        h.update(chunk)
+    return h.digest()
 
 
 def read_exact(f: BinaryIO, nbytes: int) -> bytes:
@@ -112,7 +153,8 @@ def read_header(f: BinaryIO) -> TqfHeader:
     if header_bytes < 8 + FIXED_HEADER_SIZE:
         raise ValueError(f"invalid header_bytes: {header_bytes}")
 
-    values = struct.unpack(FIXED_HEADER_FMT, read_exact(f, FIXED_HEADER_SIZE))
+    rest = read_exact(f, header_bytes - 8)
+    values = struct.unpack_from(FIXED_HEADER_FMT, rest, 0)
     (
         flags,
         model_family,
@@ -142,12 +184,21 @@ def read_header(f: BinaryIO) -> TqfHeader:
         has_vision_config,
         has_mtp,
     ) = values
-    layer_type_bytes = read_exact(f, header_bytes - 8 - FIXED_HEADER_SIZE)
-    layer_types = list(layer_type_bytes)
-    if len(layer_types) != num_hidden_layers:
-        raise ValueError(
-            f"layer type count mismatch: header has {num_hidden_layers}, bytes have {len(layer_types)}"
-        )
+    tail = rest[FIXED_HEADER_SIZE:]
+    if len(tail) < num_hidden_layers:
+        raise ValueError(f"layer type count mismatch: header has {num_hidden_layers}, bytes have {len(tail)}")
+    layer_types = list(tail[:num_hidden_layers])
+    ext = tail[num_hidden_layers:]
+    version, stored_size, stored_hash, hh_ok = 1, None, None, None
+    if ext:
+        if len(ext) < EXT_SIZE:
+            raise ValueError(f"layer type count mismatch: header has {num_hidden_layers}, bytes have {len(tail)}")
+        version, ext_bytes, stored_size, stored_hash, stored_hh = struct.unpack_from(EXT_FMT, ext, 0)
+        if version < 2 or ext_bytes != len(ext):
+            raise ValueError(f"bad header extension: format_version {version}, extension_bytes {ext_bytes} "
+                             f"({len(ext)} present)")
+        ext_start = 8 + FIXED_HEADER_SIZE + num_hidden_layers
+        hh_ok = header_hash(magic + struct.pack("<I", header_bytes) + rest, ext_start) == stored_hh
     return TqfHeader(
         header_bytes=header_bytes,
         flags=flags,
@@ -176,6 +227,10 @@ def read_header(f: BinaryIO) -> TqfHeader:
         has_vision_config=has_vision_config,
         has_mtp=has_mtp,
         layer_types=layer_types,
+        format_version=version,
+        payload_bytes=stored_size,
+        payload_hash=stored_hash,
+        header_hash_ok=hh_ok,
     )
 
 
@@ -370,13 +425,24 @@ def verdict_exl3_mtp(flags: int, payload_ok: bool) -> tuple[bool, str]:
     return True, "EXL3 trellis weights + EXL3 MTP layer: tools/serve_batched.py --spec reads it"
 
 
-def inspect(path: Path, verbose: bool = True) -> dict:
+def inspect(path: Path, verbose: bool = True, verify: bool = False) -> dict:
     with path.open("rb") as f:
         header = read_header(f)
-        expected_payload_bytes, counts, details = walk_payload(header, f)
+        v2 = header.format_version >= 2
+        if v2 and not header.header_hash_ok:          # the dimensions cannot be trusted: no payload walk
+            expected_payload_bytes, counts, walk_error = -1, Counter(), "the header hash does not match the header"
+            details = {"exl3_kbits": Counter(), "exl3_codebooks": Counter(), "exl3_bf16_linears": []}
+        else:
+            expected_payload_bytes, counts, details = walk_payload(header, f)
+            walk_error = None
+        hash_ok = (payload_hash(f, header.header_bytes) == header.payload_hash) if (verify and v2) else None
     actual_payload_bytes = os.path.getsize(path) - header.header_bytes
     sparse = bool(header.flags & FLAG_SPARSE_24_E2M3)
-    payload_ok = expected_payload_bytes == actual_payload_bytes or (sparse and expected_payload_bytes < actual_payload_bytes)
+    unknown_flags = header.flags & ~KNOWN_FLAGS
+    integrity_ok = not v2 or (header.format_version <= FORMAT_VERSION and header.header_hash_ok
+                              and header.payload_bytes == actual_payload_bytes and hash_ok is not False and not unknown_flags)
+    payload_ok = integrity_ok and (expected_payload_bytes == actual_payload_bytes
+                                   or (sparse and expected_payload_bytes < actual_payload_bytes))
     fp6_ok, fp6_why = verdict_production_fp6(header.flags, payload_ok)
     exl3_ok, exl3_why = verdict_exl3_mtp(header.flags, payload_ok)
     if verbose:
@@ -384,6 +450,7 @@ def inspect(path: Path, verbose: bool = True) -> dict:
         print(f"path: {path}")
         print(f"size: {os.path.getsize(path)}")
         print(f"header_bytes: {header.header_bytes}")
+        print(f"format_version: {header.format_version}" + ("" if v2 else " (no header extension: no recorded size, no hashes)"))
         print(f"flags: 0x{header.flags:08x} ({', '.join(flag_names(header.flags)) or 'none'})")
         for bit in sorted(FLAG_NAMES):
             if bit >= FLAG_BLOCK_SCALED_QMMA:
@@ -422,6 +489,8 @@ def inspect(path: Path, verbose: bool = True) -> dict:
             print(f"exl3_bf16_linears (kept unquantized by the checkpoint): {len(details['exl3_bf16_linears'])}")
         print()
         print("== Payload validation ==")
+        if walk_error:
+            print(f"payload walk skipped: {walk_error}")
         print(f"expected_payload_bytes: {expected_payload_bytes}")
         print(f"actual_payload_bytes: {actual_payload_bytes}")
         print(f"payload_match: {expected_payload_bytes == actual_payload_bytes}")
@@ -431,11 +500,25 @@ def inspect(path: Path, verbose: bool = True) -> dict:
             print("note: sparse_24_e2m3 set; per-tensor sparse records not accounted -> "
                   "expected < actual is normal")
         print()
+        print("== Integrity ==")
+        if unknown_flags:
+            print(f"unknown flag bits: 0x{unknown_flags:x}" + (" (refused in a version-2 file)" if v2 else " (warning)"))
+        if v2:
+            if header.format_version > FORMAT_VERSION:
+                print(f"format v{header.format_version} is newer than this tool (v{FORMAT_VERSION})")
+            print(f"payload_bytes (recorded): {header.payload_bytes} -- {'match' if header.payload_bytes == actual_payload_bytes else 'MISMATCH: truncated or extended file'}")
+            print(f"header hash: {'OK' if header.header_hash_ok else 'MISMATCH'}")
+            print(f"payload hash (BLAKE2b-256 {header.payload_hash.hex()[:16]}...): "
+                  + ({True: 'OK', False: 'MISMATCH', None: 'not checked (--verify)'}[hash_ok]))
+        else:
+            print("version-1 file: only the slot walk above checks it (re-convert for a recorded size and hashes)")
+        print()
         print("== Verdicts ==")
         print(f"verdict production FP6 (flags 0x1|0x20|0x100|0x400 + payload): {'PASS' if fp6_ok else 'FAIL'} -- {fp6_why}")
         print(f"verdict EXL3 + MTP (flags 0x800|0x400|0x1000 + payload):     {'PASS' if exl3_ok else 'FAIL'} -- {exl3_why}")
     return {"header": header, "expected_payload_bytes": expected_payload_bytes, "actual_payload_bytes": actual_payload_bytes,
-            "payload_ok": payload_ok, "counts": counts, "details": details,
+            "payload_ok": payload_ok, "integrity_ok": integrity_ok, "payload_hash_ok": hash_ok,
+            "counts": counts, "details": details,
             "production_fp6": fp6_ok, "exl3_mtp": exl3_ok}
 
 
@@ -444,8 +527,10 @@ def main() -> None:
     parser.add_argument("path", help="the .tqf file")
     parser.add_argument("--expect", choices=("fp6", "exl3-mtp"), default=None,
                         help="exit 2 unless this verdict is PASS (fp6 = production FP6 + MTP; exl3-mtp = EXL3 + EXL3 MTP)")
+    parser.add_argument("--verify", action="store_true",
+                        help="also hash the payload and compare it with the recorded BLAKE2b-256 (version-2 files; a full read)")
     args = parser.parse_args()
-    r = inspect(Path(args.path))
+    r = inspect(Path(args.path), verify=args.verify)
     if not r["payload_ok"]:
         sys.exit(1)
     if args.expect == "fp6" and not r["production_fp6"]:

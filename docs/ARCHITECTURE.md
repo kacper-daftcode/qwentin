@@ -190,7 +190,8 @@ tools/serve_batched.py       THE SERVED SERVER: multi-client OpenAI API, paged K
 tools/serve_openai.py        legacy single-stream OpenAI server (FP6 + MTP tree, prefix cache, tools, reasoning split,
                              residual-map hook, Dogs)
 tools/convert_qwen_tqf.py    HuggingFace / EXL3 checkpoint -> .tqf (--exl3, --mtp-exl3, the FP6 block-scaled formats)
-tools/inspect_tqf.py         inspect a .tqf model file (flags, payload walk incl. EXL3 records, production FP6 / EXL3 + MTP verdicts)
+tools/inspect_tqf.py         inspect a .tqf model file (flags, payload walk incl. EXL3 records, format-v2 size and hashes
+                             with --verify, production FP6 / EXL3 + MTP verdicts); the format's reference parser
 tools/codebooks/lloyd_kv12a.f32   the codebook's source: 4096 fp32, Lloyd-trained (TQ_KV_T4_CODEBOOK loads another file)
 tools/gen_codebook_inc.py    lloyd_kv12a.f32 -> src/engine/kv_t4_codebook.inc (tests/test_codebook_inc.py checks the two agree)
 tools/engine_text.py         the engine source in include order as prompt text (needle haystacks, prefill prompts, benches)
@@ -222,7 +223,7 @@ tools/residual_map_check.py  kernel-vs-numpy parity of the hook on a maps file (
 tools/mtp_*.py               MTP draft-head training / accept-length eval / dump (single-stream)
 tools/convert.py, tools/sparse_pack.py           older converter pieces
 bench/reproduce.sh           build -> model check -> served line -> needle / spec A-B / speed -> results-<date>-<commit>.json
-tests/                       CPU pytest: the .tqf header parser / payload walk, the servers' request guards, the residual-map
+tests/                       CPU pytest: the .tqf header parser / payload walk / format-v2 integrity, the servers' request guards, the residual-map
                              flags / file format, the built-in codebook vs its source file, the unity build's part list,
                              qwentin.h / qwentin_abi.py current and the tools' ctypes declarations consistent with them
 docs/NOTES.md                the 2026-10 build's narrative: where the memory went, DeepSeek-V4.1, the served stack's performance
