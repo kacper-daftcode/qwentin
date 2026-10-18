@@ -1,8 +1,8 @@
 /*
- * forward_qwen.cu - experimental Qwen TQF1 loader.
- *
- * This file intentionally starts as a loader/probe separate from the TLF/LLaMA
- * runtime. Full Qwen forward kernels will build on this state layout.
+ * forward_qwen.cu - the qwentin engine: Qwen3.6/3.8 27B (gated DeltaNet + GQA) on SM120 GPUs, one CUDA translation
+ * unit behind the qwn_* C ABI. It loads .tqf model files (docs/TQF_FORMAT.md) and is driven by tools/serve_batched.py
+ * (paged KV pool, continuous batching, speculative decoding) and the legacy single-stream tools/serve_openai.py.
+ * How it works: docs/ARCHITECTURE.md; environment flags: docs/FLAGS.md.
  */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -57,7 +57,7 @@ static void hist_reset(void);           // n-gram drafter history (defined with 
 #define TQ_DELTA_SNAP_SLOTS 6  // DeltaNet state snapshot slots for tree-verify forking (Step 3)
 #ifndef TQ_SPEC_MAX_N
 #define TQ_SPEC_MAX_N 16       // max batched verify nodes/round (16 = 2 m16n8 column groups).
-                               // MEASURED dead-end (roadmap D stopgap, 2026-06-14, GPU7):
+                               // MEASURED dead-end (roadmap D stopgap):
                                // -DTQ_SPEC_MAX_N=32 + TQ_PREFILL_CHUNK=32 gives +50% prefill
                                // (695->1032 tok/s @2k; lever is REAL) BUT the tree-attention
                                // verify (k_tq_spec_attn_tree_mma) uses a single 16-slot m16
@@ -2670,7 +2670,7 @@ static int attn_mma_chunk_tokens(void) {
 }
 
 // Chunk-count cap for the flash-decoding split below (TQ_ATTN_MMA_NCHUNKS to
-// A/B). MEASURED (2026-07-07, PRO 6000, prod Q4): unpaired items want the old
+// A/B). MEASURED (RTX PRO 6000, prod Q4): unpaired items want the old
 // cap 16 (384 items ~= one wave of the ~376-CTA grid; 32 chunks = 28.5 vs 26.7
 // ms/round @32k -- extra per-item Q-prep, no balance win). PAIRED items halve
 // the head count, so cap 16 leaves half the grid idle: with cap 32 the wave is
@@ -2722,8 +2722,8 @@ static int attn_mma_pair_ok(int N) {
 // GROUP mode (whole kv group per item, staged Q) for the standalone launcher.
 // MODE 3 only, needs the exact production GQA shape. HISTORY: the 2-half group
 // kernel beat the pair path only past ~196k on the 188-SM PRO 6000 and from
-// ~32k on the 170-SM 5090 (2026-07-08 sweeps; SM-aware thresholds). With the
-// GROUP2 producer/consumer kernel (2026-07-09, default) the group mode wins
+// ~32k on the 170-SM 5090 (sweeps; SM-aware thresholds). With the
+// GROUP2 producer/consumer kernel (default) the group mode wins
 // from 32k up on BOTH dies -- 5090: 32k 23.8 vs 24.2, 128k 26.5 vs 33.9,
 // 250k 30.8 vs 40.2; PRO 6000: 32k 22.7 vs 23.8, 245k 28.0 vs 34.7 ms/round
 // -- so the auto threshold is a flat 32768. TQ_ATTN_MMA_GROUP=1/0 forces
@@ -2734,7 +2734,7 @@ static int attn_mma_group_ok(int N, int mode, int host_base) {
         const char *e = getenv("TQ_ATTN_MMA_GROUP");
         en = (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1;           // -1 = auto
         const char *m = getenv("TQ_ATTN_MMA_GROUP_MIN");
-        // 8192 with GROUP2 (5090 sweep 2026-07-09: 8k 22.3 -> 21.4, 16k 22.5
+        // 8192 with GROUP2 (5090 sweep: 8k 22.3 -> 21.4, 16k 22.5
         // -> 21.7 ms/round free-run; teacher-forced verify -0.8 ms/round @8k)
         gmin = (m && *m) ? atoi(m) : 8192;
     }
@@ -2751,8 +2751,8 @@ static int ensure_attn_qa_stage(void) {
     return cudaMalloc(&g_attn_qa_stage, words * 4) == cudaSuccess ? 0 : -1;
 }
 
-// GROUP2 (producer/consumer single-pass kernel above): DEFAULT ON (2026-07-09
-// A/B, 200 rounds each, ms/round vs the 2-half group kernel):
+// GROUP2 (producer/consumer single-pass kernel above): DEFAULT ON (A/B, 200
+// rounds each, ms/round vs the 2-half group kernel):
 //   5090 / 170 SM: 32k 23.8->22.8, 64k 26.4->23.9, 128k 31.4->26.5,
 //                  200k 36.7->29.1 (->27.2 with the one-wave nc3), 250k 40.2->30.8
 //   PRO 6000 / 188 SM: 128k 28.8->25.5, 200k 33.3->27.9, 245k 34.7->28.0
@@ -2775,7 +2775,7 @@ static int attn_mma_group2_enabled(void) {
 }
 
 // STAGE extension gate (TQ_ATTN_MMA_GROUP2_STAGE, default OFF -- measured
-// NEUTRAL on the 5090, 2026-07-09: 64k 23.15 vs 23.13, 128k 25.17 vs 25.11,
+// NEUTRAL on the 5090: 64k 23.15 vs 23.13, 128k 25.17 vs 25.11,
 // 200k 27.27 vs 27.27 ms/round; streams bit-exact). After the producer/consumer
 // split the producers' K-load stalls already hide behind consumer P.V work; the
 // remaining latency sits in the consumers' V byte loads (8 useful bytes per
@@ -8563,106 +8563,10 @@ __global__ void k_tq_linear_decode_core_hs_b(float *core_out, float *recurrent_s
     if (klane == 0) core_o[head * dim + tid] = core;
 }
 
-// Fused fork + head-split DeltaNet core: reads recurrent state from the PARENT
-// node (or committed state for root, parent < 0) and writes the updated state to
-// the CHILD node. Eliminates the per-sibling cudaMemcpyAsync for recurrent state.
-// Bit-identical per node to k_tq_linear_decode_core_hs_b preceded by a state copy.
-template <int G, int HS>
-__global__ void k_tq_linear_decode_core_hs_b_fork(float *core_out, float *recurrent_state,
-                                             const float *qkv_conv,
-                                             const float *b_proj, const float *a_proj,
-                                             const float *A_log, const uint16_t *dt_bias,
-                                             int value_heads, int key_heads, int dim,
-                                             const int *group_ids, const int *parent_ids,
-                                             int recur_stride, int conv_dim, int core_stride,
-                                             const float *committed_recur) {
-    extern __shared__ float smem[];
-    float *qn = smem;
-    float *kn = smem + dim;
-    float *red = smem + 2 * dim;
-    int node = group_ids[blockIdx.y];
-    int par = parent_ids[node];
-    float *core_o = core_out + (size_t)node * core_stride;
-    const float *src_rstate = (par >= 0) ? recurrent_state + (size_t)par * recur_stride
-                                         : committed_recur;
-    float *dst_rstate = recurrent_state + (size_t)node * recur_stride;
-    qkv_conv += (size_t)node * conv_dim;
-    b_proj += (size_t)node * value_heads;
-    a_proj += (size_t)node * value_heads;
-    int blk = blockIdx.x;
-    int head = blk / HS;
-    int part = blk % HS;
-    if (head >= value_heads) return;
-    int t = threadIdx.x;
-    int bs = blockDim.x;
-    int tids_per = dim / HS;
-    int tid_local = t / G;
-    int klane = t % G;
-    int tid = part * tids_per + tid_local;
-
-    int group = value_heads / key_heads;
-    int key_head = head / group;
-    int key_dim = key_heads * dim;
-    const float *q = qkv_conv + key_head * dim;
-    const float *k = qkv_conv + key_dim + key_head * dim;
-    const float *v = qkv_conv + 2 * key_dim + head * dim;
-
-    for (int i = t; i < dim; i += bs) red[i] = q[i] * q[i];
-    __syncthreads();
-    float qsum = tq_block_reduce_sum_sh(red, dim, t);
-    __syncthreads();
-    for (int i = t; i < dim; i += bs) red[i] = k[i] * k[i];
-    __syncthreads();
-    float ksum = tq_block_reduce_sum_sh(red, dim, t);
-    __syncthreads();
-    for (int i = t; i < dim; i += bs) {
-        qn[i] = q[i] * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
-        kn[i] = k[i] * rsqrtf(ksum + 1.0e-6f);
-    }
-    __syncthreads();
-
-    float beta = 1.0f / (1.0f + expf(-b_proj[head]));
-    float softplus_arg = a_proj[head] + tq_bf16_to_float(dt_bias[head]);
-    float softplus = log1pf(expf(-fabsf(softplus_arg))) + fmaxf(softplus_arg, 0.0f);
-    float gg = -expf(A_log[head]) * softplus;
-    float decay = expf(gg);
-    const float *src_state = src_rstate + (size_t)head * dim * dim;
-    float *dst_state = dst_rstate + (size_t)head * dim * dim;
-
-    float st[(128 + G - 1) / G];
-    int nkk = 0;
-    float psum = 0.0f;
-    for (int kk = klane; kk < dim; kk += G) {
-        float s = src_state[(size_t)kk * dim + tid];
-        st[nkk++] = s;
-        psum += s * kn[kk];
-    }
-    #pragma unroll
-    for (int off = G >> 1; off > 0; off >>= 1)
-        psum += __shfl_down_sync(0xffffffffu, psum, off, G);
-    float kv_mem = __shfl_sync(0xffffffffu, psum, 0, G) * decay;
-    float delta = (v[tid] - kv_mem) * beta;
-
-    float pcore = 0.0f;
-    nkk = 0;
-    for (int kk = klane; kk < dim; kk += G) {
-        float newv = st[nkk] * decay + kn[kk] * delta;
-        dst_state[(size_t)kk * dim + tid] = newv;
-        pcore += newv * qn[kk];
-        nkk++;
-    }
-    #pragma unroll
-    for (int off = G >> 1; off > 0; off >>= 1)
-        pcore += __shfl_down_sync(0xffffffffu, pcore, off, G);
-    float core = __shfl_sync(0xffffffffu, pcore, 0, G);
-
-    if (klane == 0) core_o[head * dim + tid] = core;
-}
-
 // Fused-tree head-split DeltaNet core: processes ALL depth groups in a single
 // launch. Blocks at depth d spin-wait on a global atomic counter until every
 // block at depths 0..d-1 has finished, then compute their node's head slice.
-// Bit-identical per node to k_tq_linear_decode_core_hs_b_fork.
+// Bit-identical per node to k_tq_linear_decode_core_hs_b preceded by a copy of the parent's state.
 template <int G, int HS>
 __global__ void k_tq_linear_decode_core_hs_fused_tree(float *core_out, float *recurrent_state,
                                              const float *qkv_conv,
@@ -9202,7 +9106,7 @@ static __device__ void tq_persist_quant_item(const tq_spec_persist_args_t *A, in
     int base_tile = base >> 5;
     int remaining = K - base;
     int live_tiles = remaining >= 128 ? 4 : (remaining + 31) / 32;
-    // Parallel factor pre-scan (2026-06-12): every thread used to walk all
+    // Parallel factor pre-scan: every thread used to walk all
     // nvar*amax_stride partial maxes through global memory serially (~64
     // strided reads on the item's critical path). Now one thread per partial
     // loads it once; the column maxes and global max fold through smem. Max
@@ -9699,7 +9603,7 @@ static __device__ __forceinline__ float tq_persist_red_read(const tq_spec_persis
 
 // Reduce one TQ_RED_CHUNK-element chunk of a weight's [N x M] output: out =
 // (sum of split partials) / factors[col]. Same split order and divide as the
-// pc-reduce kernel. 512 chunks (2026-06-12): the 1024 chunking used at most
+// pc-reduce kernel. 512 chunks: the 1024 chunking used at most
 // ~1/3 of the 340 CTAs; doubling the item count stays inside one wave and
 // halves the per-item latency chain (pure re-chunk of element-wise work).
 #define TQ_RED_CHUNK 512
@@ -9756,7 +9660,7 @@ static __device__ void tq_persist_gated_norm_item(const tq_spec_persist_args_t *
     __syncthreads();
 }
 
-// Two-head gated RMSNorm item (2026-06-12): N*heads single-head items used only
+// Two-head gated RMSNorm item: N*heads single-head items used only
 // 128 of 256 threads AND overflowed the grid (384 items on 340 CTAs = 2 waves).
 // Each 128-thread half runs the IDENTICAL per-head sumsq tree / norm / gate math
 // as the single-head item, on its own smem half -> bit-exact; the absmax fold
@@ -9808,7 +9712,7 @@ static __device__ void tq_persist_gated_norm_pair_item(const tq_spec_persist_arg
 
 // silu(gate)*up for one TQ_SILU_CHUNK-element chunk into pack2_in, with the
 // per-column absmax folded in (a chunk spans at most 2 columns; exact max via
-// atomicMax). 512-element chunks (2026-06-12): N*I/1024 = 136 items left 204 of
+// atomicMax). 512-element chunks: N*I/1024 = 136 items left 204 of
 // 340 CTAs idle for the whole phase; 272 half-size items still fit one wave at
 // half the per-item latency. Pure re-chunking of element-wise work + exact-max
 // folds -> bit-exact by construction.
@@ -10352,7 +10256,7 @@ static __device__ void tq_persist_dnprep_item(const tq_spec_persist_args_t *A,
     if (klane == 0) vbuf[head * dim + tid] = v_val;
 
     // q/k conv + silu + norms ONLY in the two designated items per (node,
-    // key_head): part 0 publishes qn, part 1 publishes kn (split 2026-06-12 --
+    // key_head): part 0 publishes qn, part 1 publishes kn (split --
     // one item carrying both q and k was the longest pole of the phase; the
     // halves are independent per-channel convs + their own block-reduce on
     // their own vector, so the split publishes identical floats). The other
@@ -10776,7 +10680,7 @@ static __device__ void tq_persist_layer_body(const tq_spec_persist_args_t &A, fl
     // absmax comes pre-reduced as stripe partials from the host norm kernel.
     // (also zero absmax for the later gated-norm/silu folds)
     if (blockIdx.x == 0 && threadIdx.x < TQ_SPEC_MAX_N) A.absmax[threadIdx.x] = 0.0f;
-    // NOTE (2026-06-11): per-block quant->GEMV flag pipelining (no bar0, items
+    // NOTE: per-block quant->GEMV flag pipelining (no bar0, items
     // gate on their k-slice's flags) measured -5.5 tok/s: ~2700 spinning GEMV
     // warps x 10-40 flag reads cost more L2 than the two-level barrier with 340
     // pollers on one root. Mechanism kept inert (qtag=0) for future regimes.
@@ -10818,7 +10722,7 @@ static __device__ void tq_persist_layer_body(const tq_spec_persist_args_t &A, fl
         // ph1b: materialize the DeltaNet inputs (qkv conv stream, b, a) -- they are
         // read several times with latency-critical access patterns, so a parallel
         // reduce beats inline partial sums there. z / gate / up stay inline.
-        // NOTE (2026-06-12): inlining b/a into the dnprep bd-publisher (red_read)
+        // NOTE: inlining b/a into the dnprep bd-publisher (red_read)
         // measured NEUTRAL: reduce1 -0.6us but dnprep +0.5us -- the partials'
         // L2 round-trips just move to the publisher's thread 0, the queue
         // drains were never the cost. Keep the materialized reduce.
@@ -13005,7 +12909,7 @@ extern "C" int qwn_init(const char *path) {
     }
     {
         // TQ_ATTN_MMA: tensor-core attention + online softmax. Default ON since
-        // 2026-06-12: short-ctx neutral (111.7 vs 111.8 tok/s @1k), long-ctx
+        // Short-ctx neutral (111.7 vs 111.8 tok/s @1k), long-ctx
         // +52..87% (maraton @10k 57->87, @16k 45->84), quality gates A-F PASS.
         // TQ_ATTN_MMA=0 is the escape hatch. The prefix-cache format picks the
         // flavor: fp32 cache -> bf16 HMMA (1), E4M3 cache (TQ_KV_FP8) -> QMMA (2),
@@ -13030,7 +12934,7 @@ extern "C" int qwn_init(const char *path) {
     maybe_e2m1_convert_all();
     maybe_ldsm_convert_all();
     {
-        // Default ON since 2026-07-08: bit-exact by construction (deadlock-free
+        // Default ON: bit-exact by construction (deadlock-free
         // per-m-tile gating), measured +0.5-0.6% e2e on both 5090 and PRO 6000.
         // TQ_PERSIST_P2P=0 reverts to the plain bar6 grid barrier.
         const char *e = getenv("TQ_PERSIST_P2P");
@@ -17239,42 +17143,6 @@ static int spec_linear_core_b(tq_layer_t *l, float *core_base, float *recur_base
     return 0;
 }
 
-// Fused fork + batched DeltaNet core (WITHOUT norm): reads recurrent state from
-// parent, writes to child. The norm is NOT launched here — it is deferred so the
-// caller can batch all depth groups' norms into a single launch. Returns 0 on the
-// hs path, -1 otherwise.
-static int spec_linear_core_b_fork(tq_layer_t *l, float *core_base, float *recur_base,
-                                   const float *qkv_base,
-                                   const float *bp_base, const float *ap_base,
-                                   const int *group_dev, const int *parent_dev, int gc,
-                                   int recur_f, int conv_dim, int value_dim,
-                                   const float *committed_recur) {
-    int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
-    int dim = g_qwen.linear_value_head_dim;
-    int lc_g = linear_core_par_g();
-    int lc_hs = linear_core_hs();
-    bool lc_par_ok = lc_g > 0 && dim > 0 && dim <= 128 && (dim & (dim - 1)) == 0 && dim * lc_g <= 1024;
-    bool lc_hs_ok = lc_par_ok && lc_hs >= 2 && (dim % lc_hs) == 0 && lc_g >= lc_hs &&
-                    ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) ||
-                     (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
-    if (!lc_hs_ok) return -1;
-    size_t shA = (size_t)3 * dim * sizeof(float);
-    int blkA = (dim / lc_hs) * lc_g;
-    dim3 gridA(heads * lc_hs, gc);
-    #define SPEC_CORE_HS_B_FORK(GG, HH)                                                     \
-        k_tq_linear_decode_core_hs_b_fork<GG, HH><<<gridA, blkA, shA, g_qwen.stream>>>(     \
-            core_base, recur_base, qkv_base, bp_base, ap_base,                              \
-            l->d_linear_A_log, l->d_linear_dt_bias, heads, key_heads, dim,                  \
-            group_dev, parent_dev, recur_f, conv_dim, value_dim, committed_recur)
-    if (lc_g == 8 && lc_hs == 8) SPEC_CORE_HS_B_FORK(8, 8);
-    else if (lc_g == 8 && lc_hs == 4) SPEC_CORE_HS_B_FORK(8, 4);
-    else if (lc_g == 8 && lc_hs == 2) SPEC_CORE_HS_B_FORK(8, 2);
-    else if (lc_g == 4 && lc_hs == 4) SPEC_CORE_HS_B_FORK(4, 4);
-    else SPEC_CORE_HS_B_FORK(4, 2);
-    #undef SPEC_CORE_HS_B_FORK
-    return 0;
-}
-
 // Fused-tree DeltaNet core launch: all N nodes in one kernel, with global atomic
 // depth synchronisation. Grid: (heads*HS, N). Bit-identical to the per-depth loop.
 static int spec_linear_core_fused_tree(tq_layer_t *l, float *core_base, float *recur_base,
@@ -17617,9 +17485,9 @@ static int g_spec_persist_nsegs = 0;   // segments uploaded for this round (0 = 
 // the persistent part2 -- its attention kernel gets its own occupancy instead
 // of sharing the 128-reg __launch_bounds__(256,2) budget (already spilling,
 // STACK:192), and the branch is what unlocks the group/GROUP2 attention items.
-// MEASURED: on the 5090 legacy wins at every base from 32k (2026-07-08); on
+// MEASURED: on the 5090 legacy wins at every base from 32k; on
 // the PRO 6000 the persistent overlap won below ~96k against PAIR, but with
-// GROUP2 in the standalone branch (2026-07-09) legacy+group2 wins from 32k
+// GROUP2 in the standalone branch legacy+group2 wins from 32k
 // there too (32k 22.7 vs 23.8, 64k 23.5 vs 25.8, 98k 25.8 vs 27.1 ms/round)
 // -> flat 32768 default. Free-run trajectories are identical across the flip
 // at matched kernels (scheduling only). TQ_SPEC_ATTN_LEGACY=1/0 forces
@@ -20226,309 +20094,6 @@ static int set_spec_graph_params(const int *tok, const int *posv, int N) {
     err = cudaMemcpyAsync(g_qwen.d_spec_positions, posv, (size_t)N * sizeof(int),
                           cudaMemcpyHostToDevice, g_qwen.stream);
     if (err != cudaSuccess) return -4;
-    return 0;
-}
-
-static int spec_graph_n_depths;
-static int spec_graph_grp_off[TQ_SPEC_MAX_N];
-static int spec_graph_grp_cnt[TQ_SPEC_MAX_N];
-static int spec_graph_parent[TQ_SPEC_MAX_N];
-
-static int setup_spec_graph_topology(const int *parent, const int *depth, int N) {
-    for (int i = 0; i < N; i++) spec_graph_parent[i] = parent[i];
-    if (spec_tree_attn_enabled()) {
-        int h_anc[TQ_SPEC_MAX_N][TQ_SPEC_MAX_N];
-        spec_build_anc(parent, depth, N, h_anc);
-        cudaMemcpyAsync(g_qwen.d_spec_anc, h_anc, (size_t)N * TQ_SPEC_MAX_N * sizeof(int),
-                        cudaMemcpyHostToDevice, g_qwen.stream);
-    }
-    int use_batch_recur = !getenv("TQ_SPEC_NOBATCH_RECUR");
-    if (!use_batch_recur) return 0;
-    int h_order[TQ_SPEC_MAX_N];
-    int maxd = 0;
-    for (int i = 0; i < N; i++) if (depth[i] > maxd) maxd = depth[i];
-    int pos = 0;
-    for (int d = 0; d <= maxd; d++) {
-        spec_graph_grp_off[d] = pos;
-        for (int i = 0; i < N; i++) if (depth[i] == d) h_order[pos++] = i;
-        spec_graph_grp_cnt[d] = pos - spec_graph_grp_off[d];
-    }
-    spec_graph_n_depths = maxd + 1;
-    cudaMemcpyAsync(g_qwen.d_spec_group_ids, h_order, (size_t)N * sizeof(int),
-                    cudaMemcpyHostToDevice, g_qwen.stream);
-    cudaMemcpyAsync(g_qwen.d_spec_parent, parent, (size_t)N * sizeof(int),
-                    cudaMemcpyHostToDevice, g_qwen.stream);
-    int h_depth_offsets[TQ_SPEC_MAX_N + 1];
-    for (int d = 0; d < spec_graph_n_depths; d++) h_depth_offsets[d] = spec_graph_grp_off[d];
-    h_depth_offsets[spec_graph_n_depths] = N;
-    cudaMemcpyAsync(g_qwen.d_spec_depth_offsets, h_depth_offsets,
-                    (size_t)(spec_graph_n_depths + 1) * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    g_spec_persist_nsegs = 0;
-    {
-        static int h_segs[TQ_SEGS_NSEGS_SLOT + 1];
-        if (spec_seg_fuse_enabled() && g_qwen.linear_conv_kernel_dim <= 8) {
-            int ks = g_qwen.linear_conv_kernel_dim;
-            g_spec_persist_nsegs = spec_build_segments(parent, N, ks, h_segs);
-        }
-        h_segs[TQ_SEGS_NSEGS_SLOT] = g_spec_persist_nsegs;
-        cudaMemcpyAsync(g_qwen.d_spec_segs, h_segs,
-                        (size_t)(TQ_SEGS_NSEGS_SLOT + 1) * sizeof(int),
-                        cudaMemcpyHostToDevice, g_qwen.stream);
-    }
-    return 0;
-}
-
-static int run_spec_forward_n_graph_params(int N, int n_layers) {
-    if (g_qwen.spec_alloc_n < TQ_SPEC_MAX_N) {
-        int ret = ensure_spec_buffers();
-        if (ret != 0) return ret;
-    }
-    g_spec_state_skip_round = 0;   // graphs capture pointers; replay-commit not supported
-    g_spec_attn_mma_round = 0;     // graphs would freeze the base-threshold decision at
-                                   // capture -- C-graph rounds keep the legacy attention
-    int H = g_qwen.H, I = g_qwen.I;
-    int q_m = g_qwen.nh * g_qwen.hd * 2, kv_m = g_qwen.nkv * g_qwen.hd, attn_m = g_qwen.nh * g_qwen.hd;
-    int dim = g_qwen.linear_value_head_dim;
-    int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
-    int key_dim = key_heads * dim, value_dim = heads * dim;
-    int conv_dim = key_dim * 2 + value_dim;
-    int recur_f = spec_lin_recur_floats(), conv_f = spec_lin_conv_floats();
-    int n_alloc = TQ_SPEC_MAX_N;
-    int ret, lin_idx = 0, full_idx = 0;
-    int use_batch_recur = !getenv("TQ_SPEC_NOBATCH_RECUR");
-    int n_depths = spec_graph_n_depths;
-    int *grp_off = spec_graph_grp_off;
-    int *grp_cnt = spec_graph_grp_cnt;
-    const int *parent = spec_graph_parent;
-
-    for (int i = 0; i < N; i++)
-        k_tq_embed_lookup_arr<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
-            g_qwen.d_spec_h + (size_t)i * H, g_qwen.d_embed, g_qwen.d_spec_tokens, i, H);
-
-    #define TQ_PERSIST_ATTN_BASE (-1)
-    int use_persist = spec_persist_enabled() && use_batch_recur;
-    for (int L = 0; L < n_layers; L++) {
-        tq_layer_t *l = &g_qwen.layers[L];
-        ot_hook_after_layer(L - 1, g_qwen.d_spec_h, N);
-        if (use_persist && g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION &&
-            spec_persist_layer_ok(l)) {
-            if ((ret = ensure_spec_persist()) != 0) return ret;
-            if (spec_fuse_layer_enabled() && !spec_split_gemv_enabled()) {
-                if ((ret = run_spec_persist_fused(l, N, lin_idx, 0, n_depths)) != 0) return ret;
-                lin_idx++;
-                continue;
-            }
-            k_tq_qwen_rmsnorm_b_amax<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-                g_qwen.d_spec_norm, g_qwen.d_spec_h, l->d_input_ln, H, g_qwen.eps,
-                g_spec_persist_amax);
-            if ((ret = run_spec_persist_part(l, N, lin_idx, 0, n_depths)) != 0) return ret;
-            k_tq_add_rmsnorm_b_amax_red<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-                g_qwen.d_spec_post, g_qwen.d_spec_resid, g_qwen.d_spec_h,
-                g_spec_persist_out_partials, g_qwen.d_spec_nk_factors + TQ_SPEC_MAX_N,
-                g_spec_persist_out_ks, l->d_post_ln, H, g_qwen.eps, g_spec_persist_amax);
-            if (spec_split_gemv_enabled()) {
-                if ((ret = run_spec_mlp_split(l, N)) != 0) return ret;
-            } else {
-                if ((ret = run_spec_persist_part(l, N, lin_idx, 1, n_depths)) != 0) return ret;
-            }
-            lin_idx++;
-            continue;
-        }
-        if (use_persist && g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION &&
-            spec_tree_attn_enabled() && spec_persist_attn_ok(l)) {
-            if ((ret = ensure_spec_persist()) != 0) return ret;
-            if (spec_fuse_layer_enabled() && !spec_split_gemv_enabled()) {
-                if ((ret = run_spec_persist_fused(l, N, full_idx, 2, TQ_PERSIST_ATTN_BASE)) != 0) return ret;
-                full_idx++;
-                continue;
-            }
-            k_tq_qwen_rmsnorm_b_amax<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-                g_qwen.d_spec_norm, g_qwen.d_spec_h, l->d_input_ln, H, g_qwen.eps,
-                g_spec_persist_amax);
-            if ((ret = run_spec_persist_part(l, N, full_idx, 2, TQ_PERSIST_ATTN_BASE)) != 0) return ret;
-            k_tq_add_rmsnorm_b_amax_red<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-                g_qwen.d_spec_post, g_qwen.d_spec_resid, g_qwen.d_spec_h,
-                g_spec_persist_out_partials, g_qwen.d_spec_nk_factors + TQ_SPEC_MAX_N,
-                g_spec_persist_out_ks, l->d_post_ln, H, g_qwen.eps, g_spec_persist_amax);
-            if (spec_split_gemv_enabled()) {
-                if ((ret = run_spec_mlp_split(l, N)) != 0) return ret;
-            } else {
-                if ((ret = run_spec_persist_part(l, N, full_idx, 1, n_depths)) != 0) return ret;
-            }
-            full_idx++;
-            continue;
-        }
-        k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-            g_qwen.d_spec_norm, g_qwen.d_spec_h, l->d_input_ln, H, g_qwen.eps);
-
-        if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) {
-            spec_pack(g_qwen.d_spec_norm, H, N);
-            if ((ret = spec_gemv(&l->linear_in_qkv, g_qwen.d_spec_qkv, N)) != 0) return ret;
-            if ((ret = spec_gemv(&l->linear_in_z, g_qwen.d_spec_z, N)) != 0) return ret;
-            if ((ret = spec_gemv(&l->linear_in_b, g_qwen.d_spec_bp, N)) != 0) return ret;
-            if ((ret = spec_gemv(&l->linear_in_a, g_qwen.d_spec_ap, N)) != 0) return ret;
-            if (spec_pf_stream_enabled()) {   // overlap DeltaNet with downstream weight prefetch
-                const tq_qmma_weight_t *pf_ws[3] = {&l->linear_out, &l->mlp_gate, &l->mlp_up};
-                spec_pf_stream_launch(pf_ws, 3);
-            }
-            float *recur_base = g_qwen.d_spec_recur + ((size_t)lin_idx * n_alloc + g_spec_slot_base) * recur_f;
-            float *conv_base  = g_qwen.d_spec_conv  + ((size_t)lin_idx * n_alloc + g_spec_slot_base) * conv_f;
-            if (spec_recur_bf16()) return -90;   // bf16 archive requires the persistent path
-            g_spec_state_skip_round = 0;         // legacy path writes all slabs, no dnprep archive
-            if (use_batch_recur && spec_fused_delta_enabled()) {
-                cudaMemsetAsync(g_qwen.d_spec_depth_done, 0, sizeof(int), g_qwen.stream);
-                if (spec_linear_deltanet_fused(l, g_qwen.d_spec_core, recur_base,
-                                              conv_base, g_qwen.d_spec_qkv,
-                                              g_qwen.d_spec_bp, g_qwen.d_spec_ap,
-                                              g_qwen.d_spec_group_ids, g_qwen.d_spec_parent, N,
-                                              recur_f, conv_dim, value_dim, conv_f,
-                                              l->d_linear_recurrent_state,
-                                              l->d_linear_conv_state,
-                                              g_qwen.d_spec_depth_offsets, n_depths,
-                                              g_qwen.d_spec_depth_done) != 0) return -89;
-                {
-                    size_t shB = (size_t)dim * sizeof(float);
-                    k_tq_linear_decode_gated_norm_b<<<dim3(heads, N), dim, shB, g_qwen.stream>>>(
-                        g_qwen.d_spec_core, g_qwen.d_spec_z, l->d_linear_norm, heads, dim, g_qwen.eps,
-                        g_qwen.d_spec_group_ids, value_dim);
-                }
-            } else if (use_batch_recur) {
-                cudaMemsetAsync(g_qwen.d_spec_depth_done, 0, 2 * sizeof(int), g_qwen.stream);
-                k_tq_linear_conv_update_fused_tree<<<dim3((conv_dim + 255) / 256, N), 256, 0, g_qwen.stream>>>(
-                    g_qwen.d_spec_qkv, conv_base, g_qwen.d_spec_qkv, l->d_linear_conv1d,
-                    conv_dim, g_qwen.linear_conv_kernel_dim, g_qwen.d_spec_group_ids, g_qwen.d_spec_parent,
-                    conv_f, l->d_linear_conv_state,
-                    g_qwen.d_spec_depth_offsets, n_depths, g_qwen.d_spec_depth_done);
-                if (spec_linear_core_fused_tree(l, g_qwen.d_spec_core, recur_base, g_qwen.d_spec_qkv,
-                                                g_qwen.d_spec_bp, g_qwen.d_spec_ap,
-                                                g_qwen.d_spec_group_ids, g_qwen.d_spec_parent, N,
-                                                recur_f, conv_dim, value_dim,
-                                                l->d_linear_recurrent_state,
-                                                g_qwen.d_spec_depth_offsets, n_depths,
-                                                g_qwen.d_spec_depth_done + 1) != 0) return -88;
-                {
-                    size_t shB = (size_t)dim * sizeof(float);
-                    k_tq_linear_decode_gated_norm_b<<<dim3(heads, N), dim, shB, g_qwen.stream>>>(
-                        g_qwen.d_spec_core, g_qwen.d_spec_z, l->d_linear_norm, heads, dim, g_qwen.eps,
-                        g_qwen.d_spec_group_ids, value_dim);
-                }
-            } else {
-                for (int i = 0; i < N; i++) {
-                    float *r_dst = recur_base + (size_t)i * recur_f, *c_dst = conv_base + (size_t)i * conv_f;
-                    const float *r_src = (parent[i] >= 0) ? recur_base + (size_t)parent[i] * recur_f
-                                                          : l->d_linear_recurrent_state;
-                    const float *c_src = (parent[i] >= 0) ? conv_base + (size_t)parent[i] * conv_f
-                                                          : l->d_linear_conv_state;
-                    cudaMemcpyAsync(l->d_linear_recurrent_state, r_src, (size_t)recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    cudaMemcpyAsync(l->d_linear_conv_state, c_src, (size_t)conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    float *qkv_i = g_qwen.d_spec_qkv + (size_t)i * conv_dim;
-                    k_tq_linear_conv_update<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
-                        qkv_i, l->d_linear_conv_state, qkv_i, l->d_linear_conv1d, conv_dim, g_qwen.linear_conv_kernel_dim);
-                    spec_linear_core(l, g_qwen.d_spec_core + (size_t)i * value_dim, qkv_i,
-                                     g_qwen.d_spec_z + (size_t)i * value_dim,
-                                     g_qwen.d_spec_bp + (size_t)i * heads, g_qwen.d_spec_ap + (size_t)i * heads);
-                    cudaMemcpyAsync(r_dst, l->d_linear_recurrent_state, (size_t)recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    cudaMemcpyAsync(c_dst, l->d_linear_conv_state, (size_t)conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                }
-            }
-            spec_pack(g_qwen.d_spec_core, value_dim, N);
-            if ((ret = spec_gemv(&l->linear_out, g_qwen.d_spec_lo, N)) != 0) return ret;
-            lin_idx++;
-        } else {
-            spec_pack(g_qwen.d_spec_norm, H, N);
-            if ((ret = spec_gemv(&l->q_proj, g_qwen.d_spec_qkv, N)) != 0) return ret;
-            if ((ret = spec_gemv(&l->k_proj, g_qwen.d_spec_kbuf, N)) != 0) return ret;
-            if ((ret = spec_gemv(&l->v_proj, g_qwen.d_spec_z, N)) != 0) return ret;
-            float *k_arch = g_qwen.d_spec_k_arch + (size_t)full_idx * n_alloc * kv_m;
-            float *v_arch = g_qwen.d_spec_v_arch + (size_t)full_idx * n_alloc * kv_m;
-            if (spec_tree_attn_enabled()) {
-                k_tq_spec_attn_kv_prep<<<dim3(g_qwen.nkv, N), g_qwen.hd, 0, g_qwen.stream>>>(
-                    k_arch, v_arch, g_qwen.d_spec_kbuf, g_qwen.d_spec_z,
-                    l->d_k_norm, g_qwen.d_spec_positions, g_qwen.nkv, g_qwen.hd, kv_m,
-                    g_qwen.eps, g_qwen.rope_theta, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, g_qwen.kv_q4);
-                if (g_spec_attn_mma_round) {
-                    launch_attn_tree_mma(g_qwen.d_spec_core, g_qwen.d_spec_qkv, l->d_q_norm,
-                        l->d_k_cache, l->d_v_cache,
-                        l->d_k_cache8, l->d_k_scale, l->d_v_cache8, l->d_v_scale,
-                        l->d_k_cache4, l->d_k_q4s,
-                        k_arch, v_arch, g_qwen.d_spec_positions, g_qwen.d_spec_anc,
-                        N, q_m, attn_m, -1, g_spec_attn_base_host, g_spec_attn_mma_round);
-                } else {
-                if (ensure_attn_scores() != 0) return -97;
-    k_tq_spec_attn_tree<<<dim3(g_qwen.nh, N), g_qwen.hd, 0, g_qwen.stream>>>(
-                    g_qwen.d_spec_core, g_qwen.d_spec_qkv, l->d_q_norm,
-                    l->d_k_cache, l->d_v_cache,
-                    l->d_k_cache8, l->d_k_scale, l->d_v_cache8, l->d_v_scale,
-                    l->d_k_cache4, l->d_k_q4s,
-                    k_arch, v_arch,
-                    g_qwen.d_spec_positions, g_qwen.d_spec_anc,
-                    g_qwen.nh, g_qwen.nkv, g_qwen.hd, kv_m, q_m, attn_m,
-                    g_qwen.eps, g_qwen.rope_theta, -1,
-        g_qwen.d_attn_scores, g_qwen.max_seq);
-                }
-            } else {
-            for (int i = 0; i < N; i++) {
-                if (ensure_attn_scores() != 0) return -97;
-    k_tq_full_attn_decode_arr<<<g_qwen.nh, g_qwen.hd, 0, g_qwen.stream>>>(
-                    g_qwen.d_spec_core + (size_t)i * attn_m, g_qwen.d_spec_qkv + (size_t)i * q_m,
-                    g_qwen.d_spec_kbuf + (size_t)i * kv_m, g_qwen.d_spec_z + (size_t)i * kv_m,
-                    l->d_q_norm, l->d_k_norm, l->d_k_cache, l->d_v_cache,
-                    l->d_k_cache8, l->d_k_scale, l->d_v_cache8, l->d_v_scale,
-                    l->d_k_cache4, l->d_k_q4s,
-                    g_qwen.d_spec_positions, i, g_qwen.nh, g_qwen.nkv, g_qwen.hd, g_qwen.eps, g_qwen.rope_theta,
-        g_qwen.d_attn_scores, g_qwen.max_seq);
-                k_tq_spec_archive_kv<<<(kv_m + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    k_arch + (size_t)i * kv_m, l->d_k_cache, g_qwen.d_spec_positions, i, kv_m,
-                    l->d_k_cache8, l->d_k_scale, g_qwen.nkv, g_qwen.hd,
-                    l->d_k_cache4, l->d_k_q4s);
-                k_tq_spec_archive_kv<<<(kv_m + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    v_arch + (size_t)i * kv_m, l->d_v_cache, g_qwen.d_spec_positions, i, kv_m,
-                    l->d_v_cache8, l->d_v_scale, g_qwen.nkv, g_qwen.hd,
-                    NULL, NULL);
-            }
-            }
-            spec_pack(g_qwen.d_spec_core, attn_m, N);
-            if ((ret = spec_gemv(&l->o_proj, g_qwen.d_spec_lo, N)) != 0) return ret;
-            full_idx++;
-            if (use_persist && spec_persist_mlp_ok(l)) {
-                // full-attn layer MLP half through the persistent kernel
-                if ((ret = ensure_spec_persist()) != 0) return ret;
-                k_tq_add_rmsnorm_b_amax<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-                    g_qwen.d_spec_post, g_qwen.d_spec_resid, g_qwen.d_spec_h, g_qwen.d_spec_lo,
-                    l->d_post_ln, H, g_qwen.eps, g_spec_persist_amax);
-                if ((ret = run_spec_persist_part(l, N, 0, 1, n_depths)) != 0) return ret;
-                continue;
-            }
-        }
-        k_tq_add_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-            g_qwen.d_spec_post, g_qwen.d_spec_resid, g_qwen.d_spec_h, g_qwen.d_spec_lo,
-            l->d_post_ln, H, g_qwen.eps);
-        spec_pack(g_qwen.d_spec_post, H, N);
-        if ((ret = spec_gemv(&l->mlp_gate, g_qwen.d_spec_gate, N)) != 0) return ret;
-        if ((ret = spec_gemv(&l->mlp_up, g_qwen.d_spec_up, N)) != 0) return ret;
-        k_tq_silu_mul_b<<<dim3((I + 255) / 256, N), 256, 0, g_qwen.stream>>>(
-            g_qwen.d_spec_mlp, g_qwen.d_spec_gate, g_qwen.d_spec_up, I);
-        spec_pack(g_qwen.d_spec_mlp, I, N);
-        if ((ret = spec_gemv(&l->mlp_down, g_qwen.d_spec_lo, N)) != 0) return ret;
-        k_tq_add_vec_b<<<dim3((H + 255) / 256, N), 256, 0, g_qwen.stream>>>(
-            g_qwen.d_spec_h, g_qwen.d_spec_resid, g_qwen.d_spec_lo, H);
-    }
-#undef TQ_PERSIST_ATTN_BASE
-    ot_hook_after_layer(n_layers - 1, g_qwen.d_spec_h, N);
-    k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
-        g_qwen.d_spec_norm, g_qwen.d_spec_h, g_qwen.d_norm, H, g_qwen.eps);
-    if (g_qwen.tie_word_embeddings) {
-        for (int i = 0; i < N; i++)
-            k_tq_lm_head_bf16<<<g_qwen.V, 256, 0, g_qwen.stream>>>(
-                g_qwen.d_spec_logits + (size_t)i * g_qwen.V, g_qwen.d_spec_norm + (size_t)i * H,
-                g_qwen.d_embed, H, g_qwen.V);
-    } else {
-        spec_pack(g_qwen.d_spec_norm, H, N);
-        if ((ret = spec_gemv(&g_qwen.lm_head, g_qwen.d_spec_logits, N)) != 0) return ret;
-    }
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) { fprintf(stderr, "spec forward graph params launch failed: %s\n", cudaGetErrorString(err)); return -78; }
     return 0;
 }
 
@@ -27107,7 +26672,7 @@ static int paged_ensure_blocks(int slot, int pos) {
 
 // ===== TQ_KV_T4 host side: encoded length per slot, column encoder, bookkeeping =====
 // Positions < h_slot_encl[slot] of a slot are trellis codes in its pool blocks; the columns of the wave / step in
-// flight are FP4 + fp16 in staging page 2*slot + (lb & 1) until paged_t4_encode_cols moves them into the pool
+// flight are FP4 + fp16 in staging page 2*slot + (lb & 1) until paged_t4_encode_ranges moves them into the pool
 // (prefill: per layer before the layer's attention -> every key the attention sees is trellis, exactly the
 // simulation; decode / verify: after the step / at commit -> the step's own columns are attended as FP4 once).
 
@@ -27181,11 +26746,6 @@ static int paged_t4_add_cols(tq_t4_ranges &rg, int slot, int p0, int p1, int onl
         p0 += n;
     }
     return 0;
-}
-static int paged_t4_encode_cols(int slot, int p0, int p1, int only_layer) {
-    tq_t4_ranges rg; rg.nr = 0;
-    int rc = paged_t4_add_cols(rg, slot, p0, p1, only_layer);
-    return rc != 0 ? rc : paged_t4_encode_ranges(rg, only_layer);
 }
 // Prefill waves: before layer L's attention, move the wave's columns (positions encl.. last) of every segment
 // into the pool for that layer, so every key the attention reads is trellis (the simulation's semantics).
