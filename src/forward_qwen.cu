@@ -27312,18 +27312,24 @@ static void paged_t4_free(void) {
     g_t4_stg_rows = 0; g_pg_t4 = 0;
 }
 
-// Codebook: TQ_KV_T4_CODEBOOK = path of 4096 raw little-endian fp32 (the analysis-side order, e.g.
-// analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32). The fp16 dequant table permutes the nibble
+#include "kv_t4_codebook.inc"
+
+// Codebook: 4096 fp32 in the analysis-side order -- the built-in Lloyd-trained lloyd_kv12a (src/kv_t4_codebook.inc), or
+// TQ_KV_T4_CODEBOOK = path of 4096 raw little-endian fp32. The fp16 dequant table permutes the nibble
 // order (table[e] = cb[swap nibbles 0 and 2 of e]).
 static int paged_t4_load_codebook(void) {
     const char *path = getenv("TQ_KV_T4_CODEBOOK");
-    if (!path || !*path) path = "/mnt/nvme/qwen256k/analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32";
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[paged] TQ_KV_T4: cannot open codebook %s\n", path); return -1; }
     float *cb = (float *)malloc(4096 * sizeof(float));
-    size_t got = fread(cb, sizeof(float), 4096, f);
-    fclose(f);
-    if (got != 4096) { free(cb); fprintf(stderr, "[paged] TQ_KV_T4: codebook %s has %zu floats, want 4096\n", path, got); return -2; }
+    if (!path || !*path) {
+        memcpy(cb, k_t4_codebook_lloyd_kv12a, sizeof(k_t4_codebook_lloyd_kv12a));
+        path = "built-in lloyd_kv12a";
+    } else {
+        FILE *f = fopen(path, "rb");
+        if (!f) { free(cb); fprintf(stderr, "[paged] TQ_KV_T4: cannot open codebook %s\n", path); return -1; }
+        size_t got = fread(cb, sizeof(float), 4096, f);
+        fclose(f);
+        if (got != 4096) { free(cb); fprintf(stderr, "[paged] TQ_KV_T4: codebook %s has %zu floats, want 4096\n", path, got); return -2; }
+    }
     uint16_t *tab = (uint16_t *)malloc(4096 * sizeof(uint16_t));
     for (int e = 0; e < 4096; e++) {
         int s = ((e & 15) << 8) | (e & 0xF0) | (e >> 8);

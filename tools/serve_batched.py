@@ -109,23 +109,6 @@ def tqf_has_exl3_mtp(path):
         return None
 
 
-def default_t4_codebook():
-    """The trellis-KV codebook for --kv-t4: 4096 raw little-endian fp32 entries (the Lloyd-trained 12-bit-state codebook
-    `lloyd_kv12a`, 16 KB). Looked up, in order: the copy shipped with the repo (tools/codebooks/lloyd_kv12a.f32, next to
-    this file), then the research project's analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this
-    checkout (<repo>/../analysis or <repo>/analysis), else that project's absolute path (the historical default)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    shipped = os.path.join(here, "codebooks", "lloyd_kv12a.f32")
-    if os.path.exists(shipped):
-        return shipped
-    rel = os.path.join("analysis", "kv_trellis_cuda", "codebooks", "lloyd_kv12a.f32")
-    for base in (os.path.join(here, ".."), os.path.join(here, "..", "..")):
-        p = os.path.normpath(os.path.join(base, rel))
-        if os.path.exists(p):
-            return p
-    return os.path.join("/mnt/nvme/qwen256k", rel)
-
-
 def attn_st_summary(L):
     """'decode attention TQ_PAGED_ATTN_ST=<n> (...)' for the startup line: the engine's effective value when the library
     exports qwn_paged_attn_st (>= the 10-16 defaults commit), else the environment with the engine's default rule."""
@@ -1384,10 +1367,10 @@ def main():
                          "FP8 quality end to end; 12 slots: --num-blocks 4600 = 589K tokens, 4100 = 525K with --spec); "
                          "--no-kv-t4 reverts to FP4 K+V (size with analysis/pool_size.py).")
     ap.add_argument("--no-kv-t4", dest="kv_t4", action="store_false")
-    ap.add_argument("--kv-t4-codebook", default=default_t4_codebook(),
-                    help="4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK); default: the shipped "
-                         "tools/codebooks/lloyd_kv12a.f32 (the Lloyd-trained 12-bit-state codebook), else "
-                         "analysis/kv_trellis_cuda/codebooks/lloyd_kv12a.f32 resolved relative to this checkout")
+    ap.add_argument("--kv-t4-codebook", default=None,
+                    help="a file of 4096 raw fp32 codebook entries for --kv-t4 (TQ_KV_T4_CODEBOOK); default: the "
+                         "engine's built-in Lloyd-trained 12-bit-state codebook lloyd_kv12a "
+                         "(= tools/codebooks/lloyd_kv12a.f32)")
     ap.add_argument("--pdl", dest="pdl", action="store_true", default=True,
                     help="programmatic dependent launch in the decode step (TQ_PDL=1, default): each EXL3 GEMM and "
                          "its bfrag launch while the predecessor drains and wait on the device; bit-identical outputs, "
@@ -1451,12 +1434,14 @@ def main():
     os.environ.setdefault("TQ_KV_V4", "1" if args.kv_v4 else "0")
     os.environ.setdefault("TQ_KV_T4", "1" if args.kv_t4 else "0")
     if os.environ.get("TQ_KV_T4", "0") not in ("", "0"):
-        os.environ.setdefault("TQ_KV_T4_CODEBOOK", args.kv_t4_codebook)
+        if args.kv_t4_codebook:
+            os.environ.setdefault("TQ_KV_T4_CODEBOOK", args.kv_t4_codebook)
         if os.environ.get("TQ_KV_V4", "0") in ("", "0"):
             sys.exit("--kv-t4 needs --kv-v4 (the open page is staged as int4 K + V)")
-        if not os.path.exists(os.environ["TQ_KV_T4_CODEBOOK"]):
-            sys.exit(f"--kv-t4: codebook {os.environ['TQ_KV_T4_CODEBOOK']} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
-                     f"the repo ships it as tools/codebooks/lloyd_kv12a.f32)")
+        cb = os.environ.get("TQ_KV_T4_CODEBOOK", "")
+        if cb and not os.path.exists(cb):
+            sys.exit(f"--kv-t4: codebook {cb} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
+                     f"unset = the engine's built-in lloyd_kv12a)")
     os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
     os.environ.setdefault("TQ_DSTATE_BF16", str(args.dstate))
     os.environ.setdefault("TQ_GDN_PREFILL", "1" if args.gdn_prefill else "0")

@@ -112,8 +112,8 @@ python3 tools/spec_server_ab.py --base http://127.0.0.1:8100 --prompts 10 --toke
 
 # spec exactness ALL PASS (bare engine): every verify column's logits == the sequential decode steps', partial /
 # zero commits, wrong drafts, parking; --no-pin = the production split pickers (bitwise thanks to the per-column
-# key splits). The served env in front (the bare-engine tools default TQ_KV_T4_CODEBOOK to the shipped codebook;
-# the engine's own fallback is the research project's path); ~2 min for both lengths.
+# key splits). The served env in front (the trellis pool uses the engine's built-in codebook unless
+# TQ_KV_T4_CODEBOOK names a file); ~2 min for both lengths.
 TQ_KV_V4=1 TQ_KV_T4=1 python3 tools/spec_paged_check.py --lib build-qwen/libforward_qwen.so \
     --tqf /path/to/qwen3_8-27b-exl3-opt5.75-mtp.tqf --model-dir /path/to/Qwen3.8-27B --ctx 4096 --n 1,3,8 --no-pin
 TQ_KV_V4=1 TQ_KV_T4=1 python3 tools/spec_paged_check.py ... --ctx 32768 --n 1,3,8 --distinct 3 --no-pin

@@ -156,7 +156,7 @@ python3 tools/exl3_diff.py --ref $REF --model /models/Qwen3.8-27B-exl3-opt5.75 -
 #     TQ_KV_V4=1 TQ_KV_T4=1 TQ_PDL=1 TQ_EMBED_HOST=0 TQ_EMBED_FP8=1 (docs/evidence/scripts/final-e2e.sh).
 python3 tools/qwentin_e2e.py ref --ref-dir $REF --corpus $CORPUS --out-dir $OUT --seq 4096                    # ~3 min, 2 GB .pt
 python3 tools/qwentin_e2e.py ref --ref-dir $REF --corpus $CORPUS --out-dir $OUT --seq 32768 --states-on-cpu
-export TQ_KV_V4=1 TQ_KV_T4=1 TQ_PDL=1 TQ_EMBED_HOST=0 TQ_EMBED_FP8=1 TQ_KV_T4_CODEBOOK=tools/codebooks/lloyd_kv12a.f32
+export TQ_KV_V4=1 TQ_KV_T4=1 TQ_PDL=1 TQ_EMBED_HOST=0 TQ_EMBED_FP8=1
 E="--ref-dir $REF --corpus $CORPUS --out-dir $OUT --tqf /models/qwen3_8-27b-exl3-opt5.75-mtp.tqf --lib build-qwen/libforward_qwen.so"
 python3 tools/qwentin_e2e.py score $E --seq 4096  --decode-from 4096  --tag opt575_4k_prefill    # 48 rows, ~2 min
 python3 tools/qwentin_e2e.py score $E --seq 4096  --decode-from 0 --batch 8 --tag opt575_4k_dec8 # decode path, 8 rows lockstep (~2 min; all 48 rows: ~12 min)

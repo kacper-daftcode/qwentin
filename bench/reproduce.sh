@@ -176,7 +176,7 @@ trap - EXIT
 # ---------------------------------------------------------------- 9. optional quality yardstick (docs/QUALITY.md)
 if [ $QUALITY -eq 1 ]; then
   log "quality: tools/qwentin_e2e.py 4K + 32K prefill cells vs the FP8 rows in $E2E_DIR"
-  QENV=(CUDA_VISIBLE_DEVICES="$GPU" TQ_KV_V4=1 TQ_KV_T4=1 TQ_PDL=1 TQ_EMBED_HOST=0 TQ_EMBED_FP8=1 TQ_KV_T4_CODEBOOK="$HERE/tools/codebooks/lloyd_kv12a.f32")
+  QENV=(CUDA_VISIBLE_DEVICES="$GPU" TQ_KV_V4=1 TQ_KV_T4=1 TQ_PDL=1 TQ_EMBED_HOST=0 TQ_EMBED_FP8=1)
   QARGS=(--ref-dir "$REF_DIR" --corpus "$CORPUS" --out-dir "$E2E_DIR" --tqf "$TQF" --lib "$LIB")
   run env "${QENV[@]}" "$PYTHON" tools/qwentin_e2e.py score "${QARGS[@]}" --seq 4096 --decode-from 4096 --tag "repro-$TAG-4k-prefill" --force 2>&1 | tee "$WORK/e2e-4k.log" | grep -E "^   KL|^\+|wrote|rows .* done" || true
   run env "${QENV[@]}" "$PYTHON" tools/qwentin_e2e.py score "${QARGS[@]}" --seq 32768 --decode-from 32768 --tag "repro-$TAG-32k-prefill" --force 2>&1 | tee "$WORK/e2e-32k.log" | grep -E "^   KL|^\+|wrote|rows .* done" || true

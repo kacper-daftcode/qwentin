@@ -10,9 +10,7 @@ import argparse, ctypes, os, sys
 import torch
 
 for k, v in {"TQ_CTX": "262144", "TQ_KV_Q4": "1", "TQ_EMBED_FP8": "2", "TQ_PAGED_ATTN_MMA": "1",
-             "TQ_WIDE_ATTN_MMA": "1", "TQ_EMBED_HOST": "1", "TQ_NO_MTP": "1",
-             # the trellis pool (TQ_KV_V4=1 TQ_KV_T4=1 in the env) reads its codebook from here; the repo ships it
-             "TQ_KV_T4_CODEBOOK": os.path.join(os.path.dirname(os.path.abspath(__file__)), "codebooks", "lloyd_kv12a.f32")}.items():
+             "TQ_WIDE_ATTN_MMA": "1", "TQ_EMBED_HOST": "1", "TQ_NO_MTP": "1"}.items():
     os.environ.setdefault(k, v)
 ap = argparse.ArgumentParser()
 ap.add_argument("lib")
