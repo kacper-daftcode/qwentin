@@ -75,6 +75,7 @@ moved out of this repository together with the steering maps it was measured for
 | change | file | what the gate proved |
 |---|---|---|
 | `TQ_PATTN_GQA=1` default — the GQA-grouped prefill attention on the trellis pool (main `9c0a046`, library md5 `c40173fefe9a`) | `cand9-all.log` (2026-10-17 17:19–18:06 UTC; `scripts/cand9-all.sh`) | gate 1: `TQ_PATTN_GQA=0` bitwise = the v0.10 library (N = 3 / 8, max \|d\| 0); gate 2: the e2e prefill rows within the 95 % CI at 4K and 32K (dKL −0.00000 … +0.00003, top-1 CIs across 0, also on positions ≥ 16K / 24K); gate 3: spec exactness 4K + 32K ALL PASS; gate 4: the served line, 29 894 MiB, needle 6/6 with **TTFT 11.8 s @32K / 60.4 s @128K**, A/B 10/10, 175 / 79 tok/s at N = 1 / 8 |
+| the trellis-KV codebook compiled into the engine (`src/kv_t4_codebook.inc`; `TQ_KV_T4_CODEBOOK` only overrides it; engine `81b8453`, library md5 `5734b39678c6`) | `cand10-all.log` (2026-10-18 08:56–09:06 UTC; `scripts/cand10-all.sh`) | gate 0: `--kv-t4-codebook` with a missing file is refused; gate 1: the built-in table and the shipped file each bitwise = the `9c0a046` library reading the measurement box's file (N = 3 / 8, max \|d\| 0), and `TQ_KV_T4_CODEBOOK=random12.f32` is still read (= the old library's rows, ≠ the lloyd_kv12a rows); gate 2: spec exactness 4K + 32K ALL PASS; gate 3: the served line with no codebook flag — `codebook built-in lloyd_kv12a`, 576 000 pooled tokens, 29 894 MiB, needle 6/6 (TTFT 11.8 / 60.4 s), A/B 10/10, 176 / 78 tok/s at N = 1 / 8 |
 
 ## Reading the logs
 
