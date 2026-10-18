@@ -34,7 +34,7 @@ def load_lib(path):
     L.qwn_paged_stats.argtypes = [ctypes.POINTER(ctypes.c_int)] * 4; L.qwn_paged_stats.restype = ctypes.c_int
     L.qwn_paged_prefill_batch.argtypes = [ctypes.POINTER(ctypes.c_int)] * 7 + [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     L.qwn_paged_prefill_batch.restype = ctypes.c_int
-    L.qwn_free.restype = ctypes.c_int
+    L.qwn_free.restype = None
     return L
 
 

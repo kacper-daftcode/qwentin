@@ -39,7 +39,7 @@ def load_lib(path):
     L.qwn_batched_decode_step.restype = ctypes.c_int
     L.qwn_batched_logits.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
     L.qwn_batched_logits.restype = ctypes.c_int
-    L.qwn_free.restype = ctypes.c_int
+    L.qwn_free.restype = None
     return L
 
 

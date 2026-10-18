@@ -1,4 +1,4 @@
-"""src/forward_qwen.cu is a unity build: it includes every src/engine/*.cuh part exactly once and holds no code itself."""
+"""src/forward_qwen.cu is a unity build: it includes qwentin.h and every src/engine/*.cuh part exactly once, no code."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def test_every_part_included_once():
 def test_unity_file_holds_only_includes():
     with open(os.path.join(ROOT, "src", "forward_qwen.cu")) as f:
         body = re.sub(r"/\*.*?\*/", "", f.read(), flags=re.S)
-    code = [ln for ln in body.splitlines() if ln.strip() and not ln.startswith('#include "engine/')]
+    code = [ln for ln in body.splitlines() if ln.strip() and not ln.startswith('#include "engine/') and ln != '#include "qwentin.h"']
     assert code == []
 
 

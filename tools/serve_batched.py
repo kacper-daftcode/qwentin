@@ -63,7 +63,7 @@ def load_lib(path):
     L.qwn_paged_prefill_batch.restype = ctypes.c_int
     L.qwn_prefill_chunk.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     L.qwn_prefill_chunk.restype = ctypes.c_int
-    L.qwn_free.restype = ctypes.c_int
+    L.qwn_free.restype = None
     # session parking (slot KV blocks + DeltaNet state <-> host buffer); older builds lack these
     try:
         L.qwn_paged_slot_bytes.argtypes = [ctypes.c_int]; L.qwn_paged_slot_bytes.restype = ctypes.c_size_t

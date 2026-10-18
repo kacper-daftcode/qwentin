@@ -5,6 +5,7 @@
  * tools/serve_batched.py (paged KV pool, continuous batching, speculative decoding) and the legacy single-stream
  * tools/serve_openai.py. How it works: docs/ARCHITECTURE.md; environment flags: docs/FLAGS.md.
  */
+#include "qwentin.h"
 #include "engine/base.cuh"
 #include "engine/kv_cache.cuh"
 #include "engine/t4_kv.cuh"
