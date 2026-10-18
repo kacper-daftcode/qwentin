@@ -13,6 +13,9 @@ jobs:
     # The newest 13.1.x devel image on Docker Hub (the served build used CUDA 13.1 / nvcc V13.1.115 =
     # cuda_13.1.r13.1/compiler.37061995_0; 13.1.2 is the same minor). A `-c` compile needs no GPU and no driver.
     container: nvidia/cuda:13.1.2-devel-ubuntu24.04
+    defaults:
+      run:
+        shell: bash   # run steps in a container default to the image's sh = dash 0.5.12, which rejects `set -o pipefail`
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
