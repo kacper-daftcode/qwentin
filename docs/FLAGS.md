@@ -1,9 +1,10 @@
 # Flags — the engine's environment variables and the server's arguments (full reference)
 
-The README keeps the dozen flags that matter at the current tag; this is the full reference as of engine `b2e7a3f`
-(library md5 `484bdb825c36`, the v0.10 served line), moved from the 2026-10-17 README with one addition
-(`TQ_GDN_PREFILL` / `--gdn-prefill`). Also here: the server's request-side behaviour (thinking, per-request stats,
-logging), the exposure guards, and the off-switches that restore each previous served line bit for bit.
+The full reference. Every default is the served line (the README's "Quick start" runs it with no flags). Current as of
+`main`: the v0.10 served line (engine `b2e7a3f`, library md5 `484bdb825c36`) plus the changes under "Unreleased" in
+[`CHANGELOG.md`](../CHANGELOG.md) (`TQ_PATTN_GQA`, the built-in trellis-KV codebook). Also here: the server's endpoints
+and request-side behaviour (thinking, per-request stats, logging), the exposure guards, and the off-switches that
+restore each previous served line bit for bit.
 
 ## Engine environment flags
 
@@ -25,6 +26,7 @@ from its arguments unless they are already in the environment):
 | `TQ_EXL3_WIDE_NG16` | 1 | 128-token EXL3 GEMM units at one block per SM for every Linear with ≥ 32 of them (k/v_proj keep 32-token units): −5.1 % per 32K prefill wave, −2.6 % at 128K, bitwise; 0 = 64-token units |
 | `TQ_EXL3_BF16_R4` | 1 | the bf16 DeltaNet `in_proj_b/a` at prefill N: 4 rows per block, shuffle tree (same partial sums → bitwise), −1.1 % per wave; 0 = the one-row kernel |
 | `TQ_GDN_PREFILL` | 1 | the 48 gated-DeltaNet layers of a paged prefill wave through a hoisted prep kernel + a register-resident chunk kernel (`--gdn-prefill`; engine `b2e7a3f`, session 11): the state-independent work once per wave instead of per sub-chunk, the recurrent state in registers across the 16 sub-chunks, same FMA chains / contractions / SR seeds → bitwise with the 10-16 kernels on every gate. DeltaNet 14.95 → 2.76 ms per 128-column wave, the wave 65.7 → 55.0 ms at 32K and 116.5 → 106.0 ms at 128K; served-line TTFT 15.9 → 13.3 s @32K, 86.6 → 77.0 s @128K (`docs/evidence/cand8-all.log`); decode / verify / commit untouched. 0 = the 10-16 kernels (`--no-gdn-prefill`); 2 / 3 = the 8-warp / 2-warp variants (bitwise, slower) |
+| `TQ_PATTN_GQA` | 1 | the trellis pool's paged prefill attention as one GQA-grouped tensor-core kernel with fp32 accumulation (since v0.10, main `9c0a046`): attention 17.0 → 9.3 ms per 128-column wave at 32K, 67.6 → 34.2 ms at 128K; served-line TTFT 13.3 → 11.8 s @32K, 77.0 → 60.4 s @128K. Not bitwise (a different tiling of the same fp32 online softmax): e2e within the 95 % CI at 4K and 32K, spec exactness ALL PASS, needle 6/6 (`docs/evidence/cand9-all.log`). 0 = the per-head bf16 kernel of v0.10 bit for bit; 3 / 4 / 5 = fp16-accumulate variants (opt-in, +0.00005 KL at ≥ 24K); 2 = instrumentation |
 | `TQ_WAVE_MAX` | 128 | prefill wave column cap (≤ 256, EXL3 only, for the 256-column A/B; not bitwise by design — half the k-splits). The trellis pool keeps one in-flight staging page per slot, so it stays ≤ 128 there |
 | `TQ_PDL` | server: 1 | programmatic dependent launch of the fragment build + EXL3 GEMM in the decode step (`--pdl`; bitwise, −0.55…−0.61 ms/step); 2 = also the step's other kernels (measured slower at 32K) |
 | `TQ_EMBED_HOST` | server: 1 | the bf16 embedding table in pinned host RAM, rows read over PCIe (`--embed-host`; no device copy, no quantization error). Overrides `TQ_EMBED_FP8` |
@@ -43,7 +45,7 @@ from its arguments unless they are already in the environment):
 | Argument | Default | Meaning |
 |----------|---------|---------|
 | `--max-slots N` | 12 | concurrent sessions resident on the GPU (DeltaNet state per slot: 80 MiB with `--dstate fp16sr`) |
-| `--num-blocks N` / `--page P` | 1024 / 128 | the shared paged KV pool: N pages of P tokens. Served line 4500 × 128 = 576K tokens (29 894 MiB with 12 slots and spec); 5000 without spec; 400 (2 slots) for the 16 GB model; size another configuration from the startup line's memory |
+| `--num-blocks N` / `--page P` | 1024 / 128 | the shared paged KV pool: N pages of P tokens. Served line 4500 × 128 = 576K tokens (29 894 MiB with 12 slots and spec); 5000 without spec (≈ 640K tokens; memory model, not a gated run); 400 (2 slots) for the 16 GB model; size another configuration from the startup line's memory |
 | `--kv-v4` / `--no-kv-v4` | on | int4 V (`TQ_KV_V4`); `--no-kv-v4` = E4M3 V (26.2 KiB/token), incompatible with `--kv-t4` |
 | `--kv-t4` / `--no-kv-t4`, `--kv-t4-codebook FILE` | on, built-in | the trellis-coded KV (`TQ_KV_T4`); `--kv-t4-codebook` sets `TQ_KV_T4_CODEBOOK` (default: the engine's built-in codebook); `--no-kv-t4` = FP4 K+V, the pre-2026-10 format |
 | `--spec` / `--no-spec`, `--spec-k auto\|1..16` | on, auto | speculative decoding with the paged MTP drafter in decode-only phases; needs a `--mtp-exl3` tqf (else a warning and plain decode); auto = K 4 at ≤ 2 active slots, 3 at ≤ 8, 2 above (measured through the server: K = 6 ties 4 at N = 1 and loses at N = 2; 3 beats 2 and 4 at N = 4). The drafter's KV rows and the EXL3 head take ~11 % of the pool (4500 vs 5000 blocks) |
@@ -63,7 +65,13 @@ from its arguments unless they are already in the environment):
 <sub>Provenance: `tools/serve_batched.py` at this tag (`--help` is authoritative); the defaults are the ones served on 2026-10-17 with engine `b2e7a3f` / library md5 `484bdb825c36` (CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0) and gated in `docs/evidence/cand8-all.log` (every default but `--gdn-prefill` already in `cand7-all.log`).</sub>
 
 
-## Server behaviour: thinking, per-request stats, logging
+## Server behaviour: endpoints, thinking, per-request stats, logging
+
+Endpoints: `/v1/chat/completions` and `/v1/completions` (the OpenAI API, SSE streaming), `/health` (free / total
+blocks, active, queued, parked, prefilling, prefix-cache hits, spec rounds / tokens per round / ms per round /
+fallbacks, parking-tier stats) and `/spec?on=0|1&k=N` (switches speculative decoding at run time; `k` = the draft
+depth). The startup line prints the KV format and the pooled tokens (`576000` on the served line), the DeltaNet state
+format and the spec / attention settings.
 
 Thinking is off unless the request body carries `"enable_thinking": true` (top level; the agents'
 harness sends it off explicitly). Per-request stats are returned under `x_qwentin`

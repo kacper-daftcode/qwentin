@@ -14,7 +14,7 @@
 #  10. collect        everything into one JSON with the environment block (commit, library md5, driver, nvcc, torch, ...)
 #
 # Paths are environment variables or options -- there are no box defaults:
-#   TQF=/path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf   required   the converted model (README "Convert")
+#   TQF=/path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf   required   the converted model (README "Quick start")
 #   MODEL_DIR=/path/to/Qwen3.8-27B                   required   HF dir: tokenizer + chat template (bf16 or FP8 dir)
 #   LIB=/path/to/libforward_qwen.so                  optional   default: the library built in step 1 (build-qwen-repro/)
 #   NVCC=/usr/local/cuda-13.1/bin/nvcc               optional   default: /usr/local/cuda-13.1/bin/nvcc if present, else `nvcc` on PATH

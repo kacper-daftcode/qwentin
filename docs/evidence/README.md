@@ -31,6 +31,9 @@ measured on `2cf671c` carry over to v0.10 unchanged. The TTFT rows are the one t
 | held-out corpus | the `vllm/` package directory of a vLLM checkout — see `docs/QUALITY.md` for the exact commit and the caveat |
 | date | 2026-10-17 (UTC times in the logs); the vLLM baselines 07:51–08:50 UTC the same day |
 
+Builds are code-reproducible, not byte-reproducible: nvcc embeds per-build-directory metadata, so a rebuild of the
+same commit gets a different md5 with identical SASS; the md5s here identify the binaries the gates ran.
+
 Earlier libraries that appear in the logs (all on `main`, each the gated predecessor of the next):
 
 | md5 (12) | commit | what |
@@ -67,6 +70,12 @@ driver 595), the RTX PRO 6000 rows and the 2026-06 batched-server rows — they 
 unchanged and are labelled as such in their footers. (The 2026-08 scale sweep of the residual-stream steering hook
 moved out of this repository together with the steering maps it was measured for.)
 
+## Since v0.10 (CHANGELOG "Unreleased")
+
+| change | file | what the gate proved |
+|---|---|---|
+| `TQ_PATTN_GQA=1` default — the GQA-grouped prefill attention on the trellis pool (main `9c0a046`, library md5 `c40173fefe9a`) | `cand9-all.log` (2026-10-17 17:19–18:06 UTC; `scripts/cand9-all.sh`) | gate 1: `TQ_PATTN_GQA=0` bitwise = the v0.10 library (N = 3 / 8, max \|d\| 0); gate 2: the e2e prefill rows within the 95 % CI at 4K and 32K (dKL −0.00000 … +0.00003, top-1 CIs across 0, also on positions ≥ 16K / 24K); gate 3: spec exactness 4K + 32K ALL PASS; gate 4: the served line, 29 894 MiB, needle 6/6 with **TTFT 11.8 s @32K / 60.4 s @128K**, A/B 10/10, 175 / 79 tok/s at N = 1 / 8 |
+
 ## Reading the logs
 
 - `[plab] ... bitwise identical ... True (max |d| 0)` — `tools/paged_logit_ab.py` dumped 25 paged-decode steps of raw
@@ -89,8 +98,12 @@ moved out of this repository together with the steering maps it was measured for
 
 ## Re-running each gate by hand
 
-`bench/reproduce.sh` (README "Verify") runs the served line's gates in one go. The individual commands behind each
-log line — moved here from the 2026-10-17 README's "Verify" section. Which tool reproduces which number (the HTTP tools take `--base`/`--base-url` of a running
+`bench/reproduce.sh` (README "Quick start") runs the served line's gates in one go: build → `.tqf` check → the served
+line → needle (32K × 3 depths; TTFT = the cold prefill) → spec A/B (10 prompts, identical outputs expected) →
+per-stream speed (32K, N = 1 / 8, spec on / off) → `bench/results-<date>-<commit>.json` with the environment block
+(commit, library md5, driver, nvcc, torch). `--quality` adds the 4K / 32K KL / top-1 cells against the bf16 original
+([`docs/QUALITY.md`](../QUALITY.md)), `--dry-run` prints every command, `CORPUS=<a vllm checkout>` gives like-for-like
+spec-on speed. The individual commands behind each log line — moved here from the 2026-10-17 README's "Verify" section. Which tool reproduces which number (the HTTP tools take `--base`/`--base-url` of a running
 `serve_batched.py`, the engine tools the same `--tqf` / `--model-dir` / `--lib` as the server;
 GPU work, so prefix `CUDA_VISIBLE_DEVICES=x` and the served env):
 

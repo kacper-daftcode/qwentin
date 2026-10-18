@@ -68,7 +68,7 @@ text-tower layout and runs identically on the FP6 path (the EXL3 path was measur
 
 > Research engine. SM120-only, wired for the Qwen3.6/3.8-27B layout (64 layers, 5120 hidden,
 > 16 full-attn / 48 gated-DeltaNet). Every 2026-10 number here was measured on one RTX 5090 at a
-> 550 W power cap with the exact line in the README's "Serve"; the 16 GB and 24 GB variants were emulated on
+> 550 W power cap with the exact line in the README's "Quick start"; the 16 GB and 24 GB variants were emulated on
 > the same card with a capped KV pool and a process-memory budget, not on those cards ([`VARIANTS.md`](VARIANTS.md)).
 
 ## How it works
@@ -127,7 +127,7 @@ EXL3 checkpoint ──convert_qwen_tqf.py --mtp-exl3──▶  model-mtp4.tqf  (
 
 ## Converting a model — the annotated recipe (EXL3, the served format)
 
-The README's "Convert" section is the short form of this; the FP6 E2M3 format of the single-stream path is in
+The README's "Quick start" has the short form of this; the FP6 E2M3 format of the single-stream path is in
 [`legacy-fp6.md`](legacy-fp6.md). The quantizer is stock upstream
 [exllamav3](https://github.com/turboderp-org/exllamav3) at commit `02aef45` or newer (it carries `convert.py -rcp`
 and the `sc_measure.py` / `sc_optimize.py` sensitivity pipeline); its input must be the **original bf16**

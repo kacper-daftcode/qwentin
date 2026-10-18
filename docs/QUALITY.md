@@ -152,7 +152,7 @@ python3 tools/exl3_diff.py --ref $REF --model /models/Qwen3.8-27B-exl3-opt5.75 -
     --out $OUT/opt575_w_4k.json --per-token-out $OUT/opt575_w_4k.pt
 
 # (c) the engine end to end: the reference final-norm states once per (seq, seed), then score the engine.
-#     The env is the served one (see the README's "Serve"); the published rows used the opt-5.75 -mtp.tqf with
+#     The env is the served one (see the README's "Quick start"); the published rows used the opt-5.75 -mtp.tqf with
 #     TQ_KV_V4=1 TQ_KV_T4=1 TQ_PDL=1 TQ_EMBED_HOST=0 TQ_EMBED_FP8=1 (docs/evidence/scripts/final-e2e.sh).
 python3 tools/qwentin_e2e.py ref --ref-dir $REF --corpus $CORPUS --out-dir $OUT --seq 4096                    # ~3 min, 2 GB .pt
 python3 tools/qwentin_e2e.py ref --ref-dir $REF --corpus $CORPUS --out-dir $OUT --seq 32768 --states-on-cpu
@@ -232,4 +232,5 @@ the KL table with the same provenance footer. Until then the README does not cla
 The needle matrix (`tools/code_needle.py`), the spec A/B (`tools/spec_server_ab.py`), the per-stream speed table
 (`tools/spec_speed.py`) and the bitwise checks (`tools/paged_logit_ab.py`, `tools/spec_paged_check.py`) are not
 quality yardsticks in the sense above — the needle is a retrieval probe that passed 6/6 even for a damaged NVFP4
-export (`docs/evidence/baselines-vllm-20261017.md`, § 3) — and are documented in the README's "Verify" section.
+export (`docs/evidence/baselines-vllm-20261017.md`, § 3) — and are documented in
+[`docs/evidence/README.md`](evidence/README.md), "Re-running each gate by hand".

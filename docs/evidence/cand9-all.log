@@ -1,0 +1,54 @@
+[cand9-all] start 17:19:23; cand c40173fefe9a = b2bdd08 TQ_PATTN_GQA default 1 (session 11, prefil; served 484bdb825c36 = 50b7e3d tests: the hardening defaults te
+== gate 1: off-switch bitwise (plab N=3/8, TQ_PATTN_GQA=0 vs served)   17:19:23
+[plab] N=3: new + TQ_PATTN_GQA=0 == served: True (max |d| 0)
+[plab] N=8: new + TQ_PATTN_GQA=0 == served: True (max |d| 0)
+[gate1] PASS
+== gate 2: e2e prefill rows, bare new defaults, vs the served rows   17:32:59
+== qw-cand1102_4k_prefill on GPU 2 17:36:28
+   KL 0.00235  top1 0.9897  ppl x1.0012  kl16 0.00235
+   exit 0 17:38:05
+== qw-cand1102_32k_prefill on GPU 2 17:41:30
+   KL 0.00219  top1 0.9905  ppl x1.0010  kl16 0.00219
+   exit 0 17:43:11
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+qw-final-def_4k_prefill          4096  0.00235                                  98.98                                            
+qw-cand1102_4k_prefill           4096  0.00235   -0.00000 [-0.00003,+0.00002]   98.97      -0.01 [-0.04,+0.02]                   
+qw-final-def_32k_prefill        32768  0.00220                                  99.08                                            
+qw-cand1102_32k_prefill         32768  0.00219   -0.00001 [-0.00006,+0.00004]   99.05      -0.03 [-0.06,+0.00]                   
+qw-final-def_32k_prefill        32768  0.00215                                  99.08                                            
+qw-cand1102_32k_prefill         32768  0.00215   +0.00001 [-0.00004,+0.00005]   99.06      -0.02 [-0.06,+0.03]                   
+qw-final-def_32k_prefill        32768  0.00196                                  99.15                                            
+qw-cand1102_32k_prefill         32768  0.00199   +0.00003 [-0.00002,+0.00008]   99.14      -0.01 [-0.08,+0.05]                   
+[gate2] qw-cand1102_4k_prefill: dKL -0.00000 [-0.00003,+0.00002] ok; dtop1 -0.01 [-0.04,+0.02] ok
+[gate2] qw-cand1102_32k_prefill: dKL -0.00001 [-0.00006,+0.00004] ok; dtop1 -0.03 [-0.06,+0.00] ok
+[gate2] qw-cand1102_32k_prefill: dKL +0.00001 [-0.00004,+0.00005] ok; dtop1 -0.02 [-0.06,+0.03] ok
+[gate2] qw-cand1102_32k_prefill: dKL +0.00003 [-0.00002,+0.00008] ok; dtop1 -0.01 [-0.08,+0.05] ok
+[gate2] PASS
+== gate 3: spec exactness, bare defaults, 4K + 32K   17:43:15
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate3] PASS
+== gate 4: THE SERVED LINE, pure defaults   17:54:47
+   server up after 10 s, pid 2177985, 29894 MiB
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.79s e2e=11.835s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.77s e2e=11.813s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.773s e2e=11.838s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=60.411s e2e=60.462s ans='HE-215844-MW' exp=['HE-215844-MW'] 
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.442s e2e=60.493s ans='AB-416549-JJ' exp=['AB-416549-JJ'] 
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.515s e2e=60.566s ans='ND-297860-GH' exp=['ND-297860-GH'] 
+wall 217.4s, 6 probes
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2647 tokens in 20.9s = 126.7 tok/s (concurrency 1); per-request mean 126.3 tok/s; rounds 779, tokens/round 3.39
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2647 tokens in 43.9s = 60.2 tok/s (concurrency 1); per-request mean 59.9 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 175.4 (min 175.4, max 175.4), aggregate 175.4; 300 tokens in 1.8s; rounds 79 s
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 79.4 (min 72.8, max 89.2), aggregate 635.6; 2400 tokens in 4.7s; rounds 137 st
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1; speed rc 0
+[gate4] PASS
+== ALL PASS -> landing cand-1102 on main   18:06:39
+patches/0092-paged-prefill-attention-GQA-grouped-tensor-core-kern.patch
+patches/0093-pattn-fp16-accumulate-variants-conflict-free-decode-.patch
+patches/0094-TQ_PATTN_GQA-default-1-session-11-prefill-attention-.patch
+[cand9-all] LANDED 18:06:39: build-qwen/libforward_qwen.so = c40173fefe9a (old .50b7e3d); main = 9c0a046 TQ_PATTN_GQA default 1 (session 11, prefill attentio
+[cand9-all] rollback: cp /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.50b7e3d /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && git -C /mnt/nvme/qwen256k/qwentin reset --hard 50b7e3d

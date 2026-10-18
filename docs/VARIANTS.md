@@ -2,7 +2,7 @@
 
 Both variants were **emulated on an RTX 5090** with a capped KV pool and a process-memory budget — not measured on a
 physical 16 GB or 24 GB card; on a real card the process budget is the card's free memory. The 16 GB model is the
-4.25 bpw EXL3 checkpoint (`tools/recipes/qwen3_8-27b-exl3-t45-s425.yaml`, converted as in the README's "Convert"
+4.25 bpw EXL3 checkpoint (`tools/recipes/qwen3_8-27b-exl3-t45-s425.yaml`, converted as in the README's "Quick start"
 with `-b 4.25`); the 24 GB card runs the served opt-5.75 model with one slot. Moved from the 2026-10-17 README at
 v0.10, numbers unchanged (the DeltaNet prefill lever of `b2e7a3f` shortens their TTFT too but was not re-measured on
 these configurations). Provenance of every cell: [`evidence/README.md`](evidence/README.md).

@@ -151,7 +151,7 @@ are bitwise plain decode's at the same client count (`tools/spec_paged_check.py`
 ## Performance of the served stack (2026-10-17, main `2cf671c`, CUDA 13.1, driver 610, RTX 5090 at 550 W)
 
 Per-stream decode tok/s (p50 over N streams, 300 tokens each, code prompts, spec on / off),
-through the HTTP server with the exact line in the README's "Serve" (`tools/spec_speed.py`;
+through the HTTP server with the exact line in the README's "Quick start" (`tools/spec_speed.py`;
 `logs/final-speed.log` rows "(R)", `logs/cand7-all.log` gate 3):
 
 | Context | N = 1 | N = 2 | N = 4 | N = 8 | aggregate @N = 8 |
