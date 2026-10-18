@@ -304,8 +304,8 @@ if args.dogs:
     LIB.qwn_spec_persist_dump.restype = ctypes.c_int
     LIB.qwn_spec_persist_dump.argtypes = [ctypes.POINTER(ctypes.c_int)]
 # Residual-stream steering hook: one affine map per hooked layer, armed once at
-# startup through the engine's hook ABI (symbols still named qwn_ot_*; rename
-# deferred). RMAP is None when the server runs the plain tower.
+# startup through the engine's hook ABI (qwn_rmap_*). RMAP is None when the server
+# runs the plain tower.
 RMAP = None
 DEF_SCHED = None
 if args.residual_map:
@@ -315,8 +315,8 @@ if args.residual_map:
         _armed = arm_residual_map(LIB, _rm)
     except (OSError, ValueError, RuntimeError) as _e:
         sys.exit(f"--residual-map: {_e}")
-    LIB.qwn_ot_hook_count.restype = ctypes.c_int
-    assert int(LIB.qwn_ot_hook_count()) == len(_armed)
+    LIB.qwn_rmap_hook_count.restype = ctypes.c_int
+    assert int(LIB.qwn_rmap_hook_count()) == len(_armed)
     RMAP = {"layers": _armed, "scale": _rm["scale"], "maps": os.path.basename(args.residual_map)}
     print(f"[residual-map] armed on layers {_armed}, scale={_rm['scale']:g} ({args.residual_map})", flush=True)
     try:
@@ -326,8 +326,8 @@ if args.residual_map:
     if DEF_SCHED is not None:
         print(f"[residual-map] default schedule -> {DEF_SCHED}", flush=True)
     if args.residual_map_sched_api or DEF_SCHED is not None:
-        LIB.qwn_ot_set_scale.restype = ctypes.c_int
-        LIB.qwn_ot_set_scale.argtypes = [ctypes.c_int, ctypes.c_float]
+        LIB.qwn_rmap_set_scale.restype = ctypes.c_int
+        LIB.qwn_rmap_set_scale.argtypes = [ctypes.c_int, ctypes.c_float]
     if args.residual_map_sched_api:
         print("[residual-map] schedule API on: per-request residual_map_decay overrides accepted", flush=True)
 elif args.residual_map_decay or args.residual_map_sched_api or args.residual_map_layers or args.residual_map_scale is not None:
@@ -421,7 +421,7 @@ def _rmap_step(sched, n_out):
     s = sched["s0"] + (sched["s1"] - sched["s0"]) * f
     if s != sched["applied"]:
         for ln in RMAP["layers"]:
-            LIB.qwn_ot_set_scale(ln, ctypes.c_float(s))
+            LIB.qwn_rmap_set_scale(ln, ctypes.c_float(s))
         sched["applied"] = s
 
 
@@ -602,7 +602,7 @@ def generate(prompt_ids, max_new, temp, seed, on_tokens, no_cache=False, dbg=Fal
         finally:
             if sched is not None and sched["applied"] is not None:
                 for ln in RMAP["layers"]:
-                    LIB.qwn_ot_set_scale(ln, ctypes.c_float(RMAP["scale"]))
+                    LIB.qwn_rmap_set_scale(ln, ctypes.c_float(RMAP["scale"]))
         dt = time.time() - t1
         if finish != "error":
             _pc_store(prompt_ids, anchor_in_slot, eng_extra, temp, rounds)

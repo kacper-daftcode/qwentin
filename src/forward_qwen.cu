@@ -11961,40 +11961,34 @@ static void free_qmma(tq_qmma_weight_t *w) {
     memset(w, 0, sizeof(*w));
 }
 
-// ================== Reservoir Dogs: engine-side LLobotomy bark ==================
-// The lab tool (LLobotomy) intervenes on the residual stream with a rank-2
-// Gaussian-OT map, applied as a PyTorch forward hook after specific decoder
-// layers (auto-tuned for Qwen3.8-27B: layers 37/38, scale 0.21). This block
-// ports the intervention into the engine so the production tower barks all
-// day: identical math, fp32, on the engine's own residual buffers, at the
-// loop-top seam of every forward path (per-node spec verify, wide prefill,
-// dense/graph decode). Iteration L first applies layer L-1's hook -- exactly
-// the PyTorch post-module seam -- plus one last call after the final layer.
-//
-// Torch reference (llobotomy.py make_hook), fp32:
-//   y  = P^T (x - mu_H)                    (k=2 latent; P is H x 2 row-major)
-//   z  = (A_k - I)^T y                     (z_j = sum_c y_c * A[j][c])
-//   x += scale * (mean_shift + P z)
-#define TQ_OT_MAX_HOOKS 16
+// ================== Residual-stream steering hook ==================
+// One rank-2 affine map per hooked decoder layer on the residual stream (tools/residual_map.py loads a maps file and
+// arms it; serve_openai.py --residual-map). Applied in fp32 on the engine's own residual buffers at the loop-top seam of
+// every forward path (per-node spec verify, wide prefill, dense/graph decode): iteration L first applies layer L-1's
+// map -- the post-layer seam -- plus one last call after the final layer.
+//   y  = P^T (x - mu)                      (rank-2 latent; P is H x 2 row-major)
+//   z  = (A - I)^T y                       (z_j = sum_c y_c * A_minus_I[j][c])
+//   x += scale * (shift + P z)
+#define TQ_RMAP_MAX_HOOKS 16
 static struct {
     int layer;
     float scale, a00, a01, a10, a11;
     float *d_P, *d_mu, *d_ms;
-} g_ot_hooks[TQ_OT_MAX_HOOKS];
-static int g_ot_nhooks = 0;
+} g_rmap_hooks[TQ_RMAP_MAX_HOOKS];
+static int g_rmap_nhooks = 0;
 
 // One block per residual row. Phase 1: block-reduce the two 1xH dot products.
 // Phase 2: in-place rank-2 update. ~25k FLOPs/token/layer -- immeasurable.
-__global__ void k_tq_ot_hook2(float *x, int H,
-                              const float *P, const float *mu_H, const float *mean_shift,
-                              float a00, float a01, float a10, float a11, float scale) {
+__global__ void k_tq_rmap_hook2(float *x, int H,
+                                const float *P, const float *mu, const float *shift,
+                                float a00, float a01, float a10, float a11, float scale) {
     __shared__ float red[2 * 256];
     __shared__ float z0s, z1s;
     int tid = threadIdx.x;
     x += (size_t)blockIdx.x * H;
     float y0 = 0.0f, y1 = 0.0f;
     for (int i = tid; i < H; i += 256) {
-        float c = x[i] - mu_H[i];
+        float c = x[i] - mu[i];
         y0 += c * P[2 * i];
         y1 += c * P[2 * i + 1];
     }
@@ -12015,44 +12009,43 @@ __global__ void k_tq_ot_hook2(float *x, int H,
     __syncthreads();
     float z0 = z0s, z1 = z1s;
     for (int i = tid; i < H; i += 256)
-        x[i] += scale * (mean_shift[i] + z0 * P[2 * i] + z1 * P[2 * i + 1]);
+        x[i] += scale * (shift[i] + z0 * P[2 * i] + z1 * P[2 * i + 1]);
 }
 
-extern "C" int qwn_ot_hook_add(int layer, float scale, const float *P,
-                               const float *A_k_minus_I,
-                               const float *mu_H, const float *mean_shift) {
+extern "C" int qwn_rmap_hook_add(int layer, float scale, const float *P, const float *A_minus_I,
+                                 const float *mu, const float *shift) {
     if (!g_qwen.initialized) return -1;
     if (layer < 0 || layer >= g_qwen.L) return -2;
-    if (g_ot_nhooks >= TQ_OT_MAX_HOOKS) return -3;
-    for (int s = 0; s < g_ot_nhooks; s++)
-        if (g_ot_hooks[s].layer == layer) return -4;
-    int sl = g_ot_nhooks;
+    if (g_rmap_nhooks >= TQ_RMAP_MAX_HOOKS) return -3;
+    for (int s = 0; s < g_rmap_nhooks; s++)
+        if (g_rmap_hooks[s].layer == layer) return -4;
+    int sl = g_rmap_nhooks;
     size_t hsz = (size_t)g_qwen.H * sizeof(float);
-    if (cudaMalloc(&g_ot_hooks[sl].d_P, 2 * hsz) != cudaSuccess) return -5;
-    if (cudaMalloc(&g_ot_hooks[sl].d_mu, hsz) != cudaSuccess) return -6;
-    if (cudaMalloc(&g_ot_hooks[sl].d_ms, hsz) != cudaSuccess) return -7;
-    cudaMemcpy(g_ot_hooks[sl].d_P, P, 2 * hsz, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_ot_hooks[sl].d_mu, mu_H, hsz, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_ot_hooks[sl].d_ms, mean_shift, hsz, cudaMemcpyHostToDevice);
-    g_ot_hooks[sl].layer = layer;
-    g_ot_hooks[sl].scale = scale;
-    g_ot_hooks[sl].a00 = A_k_minus_I[0];
-    g_ot_hooks[sl].a01 = A_k_minus_I[1];
-    g_ot_hooks[sl].a10 = A_k_minus_I[2];
-    g_ot_hooks[sl].a11 = A_k_minus_I[3];
+    if (cudaMalloc(&g_rmap_hooks[sl].d_P, 2 * hsz) != cudaSuccess) return -5;
+    if (cudaMalloc(&g_rmap_hooks[sl].d_mu, hsz) != cudaSuccess) return -6;
+    if (cudaMalloc(&g_rmap_hooks[sl].d_ms, hsz) != cudaSuccess) return -7;
+    cudaMemcpy(g_rmap_hooks[sl].d_P, P, 2 * hsz, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_rmap_hooks[sl].d_mu, mu, hsz, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_rmap_hooks[sl].d_ms, shift, hsz, cudaMemcpyHostToDevice);
+    g_rmap_hooks[sl].layer = layer;
+    g_rmap_hooks[sl].scale = scale;
+    g_rmap_hooks[sl].a00 = A_minus_I[0];
+    g_rmap_hooks[sl].a01 = A_minus_I[1];
+    g_rmap_hooks[sl].a10 = A_minus_I[2];
+    g_rmap_hooks[sl].a11 = A_minus_I[3];
     g_qwen.device_bytes += 4 * hsz;
-    g_ot_nhooks++;
+    g_rmap_nhooks++;
     return 0;
 }
 
-extern "C" int qwn_ot_hook_count(void) { return g_ot_nhooks; }
+extern "C" int qwn_rmap_hook_count(void) { return g_rmap_nhooks; }
 
 // Retune without re-arming: scale rides as a kernel argument, so this is a
-// host-only slot update taking effect at the next launch (auto-tune sweeps).
-extern "C" int qwn_ot_set_scale(int layer, float scale) {
-    for (int s = 0; s < g_ot_nhooks; s++) {
-        if (g_ot_hooks[s].layer != layer) continue;
-        g_ot_hooks[s].scale = scale;
+// host-only slot update taking effect at the next launch (schedules / sweeps).
+extern "C" int qwn_rmap_set_scale(int layer, float scale) {
+    for (int s = 0; s < g_rmap_nhooks; s++) {
+        if (g_rmap_hooks[s].layer != layer) continue;
+        g_rmap_hooks[s].scale = scale;
         return 0;
     }
     return -1;
@@ -12061,32 +12054,32 @@ extern "C" int qwn_ot_set_scale(int layer, float scale) {
 // Fire the hook armed for `layer` on a [rows x H] fp32 residual buffer. Returns
 // how many kernels launched (forward-path callers ignore it). No-op when
 // unarmed -- zero cost in the default config.
-static int ot_hook_after_layer(int layer, float *x_rows, int rows) {
+static int rmap_hook_after_layer(int layer, float *x_rows, int rows) {
     int n = 0;
     if (layer < 0 || rows <= 0) return 0;
-    for (int s = 0; s < g_ot_nhooks; s++) {
-        if (g_ot_hooks[s].layer != layer) continue;
-        k_tq_ot_hook2<<<rows, 256, 0, g_qwen.stream>>>(
-            x_rows, g_qwen.H, g_ot_hooks[s].d_P, g_ot_hooks[s].d_mu, g_ot_hooks[s].d_ms,
-            g_ot_hooks[s].a00, g_ot_hooks[s].a01, g_ot_hooks[s].a10, g_ot_hooks[s].a11,
-            g_ot_hooks[s].scale);
+    for (int s = 0; s < g_rmap_nhooks; s++) {
+        if (g_rmap_hooks[s].layer != layer) continue;
+        k_tq_rmap_hook2<<<rows, 256, 0, g_qwen.stream>>>(
+            x_rows, g_qwen.H, g_rmap_hooks[s].d_P, g_rmap_hooks[s].d_mu, g_rmap_hooks[s].d_ms,
+            g_rmap_hooks[s].a00, g_rmap_hooks[s].a01, g_rmap_hooks[s].a10, g_rmap_hooks[s].a11,
+            g_rmap_hooks[s].scale);
         n++;
     }
     return n;
 }
 
-static void ot_hooks_free(void) {
-    for (int s = 0; s < g_ot_nhooks; s++) {
-        cudaFree(g_ot_hooks[s].d_P);
-        cudaFree(g_ot_hooks[s].d_mu);
-        cudaFree(g_ot_hooks[s].d_ms);
+static void rmap_hooks_free(void) {
+    for (int s = 0; s < g_rmap_nhooks; s++) {
+        cudaFree(g_rmap_hooks[s].d_P);
+        cudaFree(g_rmap_hooks[s].d_mu);
+        cudaFree(g_rmap_hooks[s].d_ms);
     }
-    g_ot_nhooks = 0;
+    g_rmap_nhooks = 0;
 }
 
-// tools/ot_hook_check.py driving surface: run the armed hook on host-supplied
+// tools/residual_map_check.py driving surface: run the armed hook on host-supplied
 // rows and read them back (kernel-vs-numpy fp32 parity gate).
-extern "C" int qwn_ot_apply_debug(int layer, int rows, float *io) {
+extern "C" int qwn_rmap_apply_debug(int layer, int rows, float *io) {
     if (!g_qwen.initialized) return -1;
     if (rows < 1 || rows > 512) return -2;
     static float *d_buf = NULL;
@@ -12103,14 +12096,24 @@ extern "C" int qwn_ot_apply_debug(int layer, int rows, float *io) {
     }
     size_t bytes = need * sizeof(float);
     if (cudaMemcpy(d_buf, io, bytes, cudaMemcpyHostToDevice) != cudaSuccess) return -4;
-    if (ot_hook_after_layer(layer, d_buf, rows) == 0) return -7;   // nothing armed here
+    if (rmap_hook_after_layer(layer, d_buf, rows) == 0) return -7;   // nothing armed here
     if (cudaDeviceSynchronize() != cudaSuccess) return -5;
     if (cudaMemcpy(io, d_buf, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return -6;
     return 0;
 }
 
+// The 2026-08 names of the entry points, kept as aliases for one release (removed together with the server's
+// --bark-all-day / --ot-* flag aliases).
+extern "C" int qwn_ot_hook_add(int layer, float scale, const float *P, const float *A_k_minus_I,
+                               const float *mu_H, const float *mean_shift) {
+    return qwn_rmap_hook_add(layer, scale, P, A_k_minus_I, mu_H, mean_shift);
+}
+extern "C" int qwn_ot_hook_count(void) { return qwn_rmap_hook_count(); }
+extern "C" int qwn_ot_set_scale(int layer, float scale) { return qwn_rmap_set_scale(layer, scale); }
+extern "C" int qwn_ot_apply_debug(int layer, int rows, float *io) { return qwn_rmap_apply_debug(layer, rows, io); }
+
 extern "C" void qwn_free(void) {
-    ot_hooks_free();
+    rmap_hooks_free();
     destroy_forward_graph();
     destroy_decode_graph();
     destroy_spec_graph();
@@ -15495,7 +15498,7 @@ static int run_decode_layers_to_debug_x(int token_id, int pos, int n_layers) {
         g_qwen.d_debug_x, g_qwen.d_embed, token_id, g_qwen.H);
     for (int layer = 0; layer < n_layers; layer++) {
         int ret;
-        ot_hook_after_layer(layer - 1, g_qwen.d_debug_x, 1);
+        rmap_hook_after_layer(layer - 1, g_qwen.d_debug_x, 1);
         if (g_qwen.layer_types[layer] == TQ_LAYER_LINEAR_ATTENTION) {
             ret = run_linear_layer_decode_from_current(layer);
         } else if (g_qwen.layer_types[layer] == TQ_LAYER_FULL_ATTENTION) {
@@ -15512,7 +15515,7 @@ static int run_decode_layers_to_debug_x(int token_id, int pos, int n_layers) {
                                           cudaMemcpyDeviceToDevice, g_qwen.stream);
         if (err != cudaSuccess) return -4;
     }
-    ot_hook_after_layer(n_layers - 1, g_qwen.d_debug_x, 1);
+    rmap_hook_after_layer(n_layers - 1, g_qwen.d_debug_x, 1);
     return 0;
 }
 
@@ -15590,7 +15593,7 @@ static int run_decode_layers_to_debug_x_graph_params(int n_layers) {
         g_qwen.d_debug_x, g_qwen.d_embed, g_qwen.d_decode_token, g_qwen.H);
     for (int layer = 0; layer < n_layers; layer++) {
         int ret;
-        ot_hook_after_layer(layer - 1, g_qwen.d_debug_x, 1);
+        rmap_hook_after_layer(layer - 1, g_qwen.d_debug_x, 1);
         if (g_qwen.layer_types[layer] == TQ_LAYER_LINEAR_ATTENTION) {
             ret = run_linear_layer_decode_from_current(layer);
         } else if (g_qwen.layer_types[layer] == TQ_LAYER_FULL_ATTENTION) {
@@ -15604,7 +15607,7 @@ static int run_decode_layers_to_debug_x_graph_params(int n_layers) {
                                           cudaMemcpyDeviceToDevice, g_qwen.stream);
         if (err != cudaSuccess) return -4;
     }
-    ot_hook_after_layer(n_layers - 1, g_qwen.d_debug_x, 1);
+    rmap_hook_after_layer(n_layers - 1, g_qwen.d_debug_x, 1);
     return 0;
 }
 
@@ -19526,7 +19529,7 @@ static int run_spec_forward_n(const int *tok, const int *parent, const int *dept
     int use_persist = spec_persist_enabled() && use_batch_recur;
     for (int L = 0; L < n_layers; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
-        ot_hook_after_layer(L - 1, g_qwen.d_spec_h, N);
+        rmap_hook_after_layer(L - 1, g_qwen.d_spec_h, N);
         if (use_persist && g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION &&
             spec_persist_layer_ok(l)) {
             if ((ret = ensure_spec_persist()) != 0) return ret;
@@ -19752,7 +19755,7 @@ static int run_spec_forward_n(const int *tok, const int *parent, const int *dept
             g_qwen.d_spec_h, g_qwen.d_spec_resid, g_qwen.d_spec_lo, H);
     }
 #undef TQ_PERSIST_ATTN_BASE
-    ot_hook_after_layer(n_layers - 1, g_qwen.d_spec_h, N);
+    rmap_hook_after_layer(n_layers - 1, g_qwen.d_spec_h, N);
     if (n_layers < g_qwen.L) {   // debug: stop early, leave pre-final-norm hidden in d_spec_h
         cudaError_t e = cudaStreamSynchronize(g_qwen.stream);
         return e == cudaSuccess ? 0 : -79;
@@ -22000,7 +22003,7 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             g_wide_h + (size_t)i * H, g_qwen.d_embed, tokens[i], H);
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
-        ot_hook_after_layer(L - 1, g_wide_h, n);
+        rmap_hook_after_layer(L - 1, g_wide_h, n);
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             // (a) batched rmsnorm + RAW q/k/v projections -> batched [token][proj].
             // WIDE path (k_tq_fp6_wide_gemm, one weight read for all n tokens) when the
@@ -22124,7 +22127,7 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             }
         }
     }
-    ot_hook_after_layer(g_qwen.L - 1, g_wide_h, n);
+    rmap_hook_after_layer(g_qwen.L - 1, g_wide_h, n);
     return cudaGetLastError() == cudaSuccess ? 0 : -61;
 }
 

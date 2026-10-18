@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Parity check of the engine-side residual-stream hook (qwn_ot_hook_add / k_tq_ot_hook2;
-the engine symbols keep their historical names until the deferred engine-side rename).
+"""Parity check of the engine-side residual-stream hook (qwn_rmap_hook_add / k_tq_rmap_hook2).
 
 Arms the maps file exactly like serve_openai.py --residual-map would, then drives
-qwn_ot_apply_debug with random residual rows and compares the device result against the
+qwn_rmap_apply_debug with random residual rows and compares the device result against the
 fp64 numpy reference of the same affine map (tools/residual_map.py apply_reference):
 
     y = P^T (x - mu);  z = (A - I)^T y;  x += scale * (shift + P z)
@@ -40,8 +39,8 @@ H = int(LIB.qwn_hidden_size())
 
 rm = load_residual_map(args.residual_map, layers=args.layers, scale=args.scale, hidden_size=H)
 armed = arm_residual_map(LIB, rm)
-LIB.qwn_ot_apply_debug.restype = ctypes.c_int
-LIB.qwn_ot_apply_debug.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
+LIB.qwn_rmap_apply_debug.restype = ctypes.c_int
+LIB.qwn_rmap_apply_debug.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 
 rng = np.random.default_rng(args.seed)
 ok = True
@@ -51,7 +50,7 @@ for ln in armed:
     x = (rng.standard_normal((args.rows, H)) * 2.0).astype(np.float32)
     ref = apply_reference(x, rm["maps"][ln], rm["scale"])
     got = x.copy()
-    ck(LIB.qwn_ot_apply_debug(ln, args.rows, got.ctypes.data_as(ctypes.POINTER(ctypes.c_float))), f"apply_debug {ln}")
+    ck(LIB.qwn_rmap_apply_debug(ln, args.rows, got.ctypes.data_as(ctypes.POINTER(ctypes.c_float))), f"apply_debug {ln}")
 
     d = np.abs(got.astype(np.float64) - ref)
     denom = np.abs(ref).max()

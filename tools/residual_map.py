@@ -12,8 +12,8 @@ P is H x 2 (the kernel is rank-2: the map acts in a 2-dimensional subspace of th
 stream), A - I is 2 x 2, mu and shift are H-vectors, H the hidden size (5120 on the 27B).
 Any steering method that produces such a map -- a mean-difference direction with a
 projection, a fitted affine transport map, a learned 2-d steering subspace -- can be served
-this way. The engine entry points keep their historical names for now (qwn_ot_hook_add,
-qwn_ot_hook_count, qwn_ot_set_scale, qwn_ot_apply_debug; the rename is deferred).
+this way. The engine entry points are qwn_rmap_hook_add, qwn_rmap_hook_count, qwn_rmap_set_scale and
+qwn_rmap_apply_debug (the 2026-08 qwn_ot_* names stay as aliases for one release).
 
 Maps file (JSON, `--residual-map PATH`):
 
@@ -232,13 +232,13 @@ def load_residual_map(path, layers=None, scale=None, hidden_size=None):
 
 def arm_residual_map(LIB, rm):
     """Install rm (from load_residual_map) through the engine's hook ABI; the scale armed is rm["scale"]
-    (retunable per layer with qwn_ot_set_scale). Returns the armed layers; raises RuntimeError on an
+    (retunable per layer with qwn_rmap_set_scale). Returns the armed layers; raises RuntimeError on an
     engine refusal (rc < 0: not initialized, layer out of range, slot table full, layer already armed,
     device allocation)."""
     import ctypes
     import numpy as np
-    LIB.qwn_ot_hook_add.restype = ctypes.c_int
-    LIB.qwn_ot_hook_add.argtypes = [ctypes.c_int, ctypes.c_float] + [ctypes.POINTER(ctypes.c_float)] * 4
+    LIB.qwn_rmap_hook_add.restype = ctypes.c_int
+    LIB.qwn_rmap_hook_add.argtypes = [ctypes.c_int, ctypes.c_float] + [ctypes.POINTER(ctypes.c_float)] * 4
 
     def f32p(a):
         return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
@@ -250,7 +250,7 @@ def arm_residual_map(LIB, rm):
         A = np.ascontiguousarray(np.asarray(m["A_minus_I"], dtype=np.float32)).reshape(4)
         mu = np.ascontiguousarray(np.asarray(m["mu"], dtype=np.float32))
         sh = np.ascontiguousarray(np.asarray(m["shift"], dtype=np.float32))
-        rc = LIB.qwn_ot_hook_add(int(ln), ctypes.c_float(rm["scale"]), f32p(P), f32p(A), f32p(mu), f32p(sh))
+        rc = LIB.qwn_rmap_hook_add(int(ln), ctypes.c_float(rm["scale"]), f32p(P), f32p(A), f32p(mu), f32p(sh))
         if rc != 0:
             raise RuntimeError(f"residual map: hook_add layer {ln} failed: {rc}")
         armed.append(int(ln))

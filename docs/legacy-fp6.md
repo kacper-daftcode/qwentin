@@ -196,8 +196,8 @@ python3 tools/residual_map_check.py --lib build-qwen/libforward_qwen.so --tqf /p
 ```
 
 The hook is single-stream only (`serve_openai.py`); the batched server serves the plain tower.
-The engine entry points are `qwn_ot_hook_add` / `qwn_ot_hook_count` / `qwn_ot_set_scale` /
-`qwn_ot_apply_debug` in `src/forward_qwen.cu` (historical names, rename pending). Maps,
+The engine entry points are `qwn_rmap_hook_add` / `qwn_rmap_hook_count` / `qwn_rmap_set_scale` /
+`qwn_rmap_apply_debug` in `src/forward_qwen.cu` (the 2026-08 `qwn_ot_*` names stay as aliases for one release). Maps,
 tuning tools and results for a specific steering method live outside this repository — the
 Optimal-Transport refusal-removal maps of
 [LLobotomy](https://github.com/kacper-daftcode/LLobotomy), for example, in
