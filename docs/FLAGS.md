@@ -34,9 +34,13 @@ from its arguments unless they are already in the environment):
 | `TQ_EMBED_HOST` | server: 1 | the bf16 embedding table in pinned host RAM, rows read over PCIe (`--embed-host`; no device copy, no quantization error). Overrides `TQ_EMBED_FP8` |
 | `TQ_NO_MTP` | server: 1 unless `--spec`/`--mtp` | skip the tqf's MTP section (the bf16 head is 0.85 GB; the EXL3 one 0.21 GB) |
 | `TQ_EMBED_FP8=2` | legacy | 6-bit (E2M3) embed table on the device, −1.5 GiB (needed for the full 256k on 32 GB on the single-stream path; irrelevant with `TQ_EMBED_HOST=1`) |
-| `TQ_WIDE_PREFILL=1`, `TQ_WIDE_ATTN_MMA=1`, `TQ_PAGED_ATTN_MMA=1` | server: on | wide / ragged tensor-core prefill paths (the single-stream server defaults both ON; the batched server sets `TQ_WIDE_ATTN_MMA=1` for `--page >= 128`) |
+| `TQ_WIDE_ATTN_MMA=1`, `TQ_PAGED_ATTN_MMA=1` | server: on | wide / ragged tensor-core prefill and decode attention (the batched server sets `TQ_WIDE_ATTN_MMA=1` for `--page >= 128`; `TQ_PAGED_ATTN_MMA=0` = the scalar decode kernel). `TQ_WIDE_PREFILL=1` (single-stream server, default on) is read by the tools' `prefill()` (tools/mtp_spec_smoke.py), not by the engine |
 | `TQ_ATTN_MMA=1`, `TQ_ATTN_MMA_PAIR=0`, `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN`, `TQ_ATTN_MMA_GROUP2=0`, `TQ_WIDE_CONV=0` | legacy | the single-stream path's attention / conv variants of the 2026-08 README (all default on; the =0 forms are bit-identical fallbacks) |
 | `TQ_PAGED_TOPK_PAGES` | 0 | Quest-style page top-k for the decode attention (built, measured to fail the FP8 gate below ~75 % of the pages; keep 0; not ported to the trellis pool) |
+
+Debug switches (off by default, diagnostics only): `TQ_PATTN_DEBUG` (non-finite check of the prefill-attention
+partials), `TQ_EXL3_DEBUG` (GEMM work-counter check), `TQ_GRAPH_DEBUG`, `TQ_PAGED_TOPK_DEBUG`. The legacy single-stream
+path reads further `TQ_*` tuning switches of its own (docs/legacy-fp6.md); they are not part of the served interface.
 
 <sub>Provenance: flag names and defaults are those of `src/forward_qwen.cu` at engine `b2e7a3f` (library md5 `484bdb825c36`; the kernels of `2cf671c` / `e454a29c3caf` plus the `TQ_GDN_PREFILL` default flip, CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04); the measured effects quoted per row come from the landing gates `docs/evidence/cand4-all.log` … `cand8-all.log` and `ASSUMPTIONS.md` (research repo), 2026-10-16/17, torch 2.14.0+cu130, transformers 5.17.0.</sub>
 

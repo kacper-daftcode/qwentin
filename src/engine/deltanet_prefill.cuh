@@ -1252,7 +1252,7 @@ static int run_spec_forward_n(const int *tok, const int *parent, const int *dept
     g_spec_attn_base_host = posv[0] - 1;
     // root (parent<0) forks from the COMMITTED state (slot 0) at EVERY layer, not the
     // stale live leftover of the previous layer's last node (that contaminates the seed
-    // and, through it, all branches). Default on; TQ_SPEC_NO_ROOTFIX restores old A/B.
+    // and, through it, all branches).
     // Depth-major node grouping for the batched recurrence: a node forks from its
     // parent's THIS-layer state, so depth groups 0,1,2,.. must run in order, but nodes
     // within a depth are independent and run batched (one launch over the siblings).
