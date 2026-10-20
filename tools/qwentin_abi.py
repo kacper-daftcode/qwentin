@@ -1,16 +1,98 @@
-"""The C ABI of libforward_qwen.so as ctypes signatures, generated from the engine source by
-tools/gen_qwentin_h.py -- do not edit. bind(lib) sets restype / argtypes of every qwn_* entry point the library
-exports; pointer parameters are c_void_p (pass ctypes pointers, arrays, c_void_p(addr) or None)."""
+"""The C ABI of libforward_qwen.so as ctypes types, generated from the engine source by tools/gen_qwentin_h.py --
+do not edit. Config is qwn_config (CONFIG_FIELDS maps each TQ_* name to its field); bind(lib) sets restype /
+argtypes of every qwn_* entry point the library exports; pointer parameters are c_void_p (pass ctypes pointers,
+arrays, ctypes.byref(config), c_void_p(addr) or None)."""
 
 import ctypes as C
 
+
+class Config(C.Structure):
+    _fields_ = [
+        ("ctx", C.c_int),
+        ("kv_q4", C.c_int),
+        ("kv_v4", C.c_int),
+        ("kv_t4", C.c_int),
+        ("dstate", C.c_int),
+        ("embed_host", C.c_int),
+        ("embed_fp8", C.c_int),
+        ("no_mtp", C.c_int),
+        ("verify_tqf", C.c_int),
+        ("pdl", C.c_int),
+        ("wide_attn_mma", C.c_int),
+        ("paged_attn_mma", C.c_int),
+        ("gdn_prefill", C.c_int),
+        ("t4_attn_f16", C.c_int),
+        ("paged_attn_st", C.c_int),
+        ("graph", C.c_int),
+        ("gemm_fork", C.c_int),
+        ("gemm_fork_maxn", C.c_int),
+        ("exl3_wide_ng16", C.c_int),
+        ("exl3_bf16_r4", C.c_int),
+        ("pattn_gqa", C.c_int),
+        ("wave_max", C.c_int),
+        ("wide_attn_qrows", C.c_int),
+        ("kv_t4_async", C.c_int),
+        ("paged_topk_pages", C.c_int),
+        ("paged_topk_min_ctx", C.c_int),
+        ("park_ring", C.c_int),
+        ("qmma_sf_k_split", C.c_int),
+        ("paged_gqa_split", C.c_int),
+        ("pattn_debug", C.c_int),
+        ("exl3_debug", C.c_int),
+        ("graph_debug", C.c_int),
+        ("paged_topk_debug", C.c_int),
+        ("kv_t4_codebook", C.c_char_p),
+    ]
+
+
+CONFIG_FIELDS = {
+    "TQ_CTX": "ctx",
+    "TQ_KV_Q4": "kv_q4",
+    "TQ_KV_V4": "kv_v4",
+    "TQ_KV_T4": "kv_t4",
+    "TQ_DSTATE_BF16": "dstate",
+    "TQ_EMBED_HOST": "embed_host",
+    "TQ_EMBED_FP8": "embed_fp8",
+    "TQ_NO_MTP": "no_mtp",
+    "TQ_VERIFY_TQF": "verify_tqf",
+    "TQ_PDL": "pdl",
+    "TQ_WIDE_ATTN_MMA": "wide_attn_mma",
+    "TQ_PAGED_ATTN_MMA": "paged_attn_mma",
+    "TQ_GDN_PREFILL": "gdn_prefill",
+    "TQ_T4_ATTN_F16": "t4_attn_f16",
+    "TQ_PAGED_ATTN_ST": "paged_attn_st",
+    "TQ_GRAPH": "graph",
+    "TQ_GEMM_FORK": "gemm_fork",
+    "TQ_GEMM_FORK_MAXN": "gemm_fork_maxn",
+    "TQ_EXL3_WIDE_NG16": "exl3_wide_ng16",
+    "TQ_EXL3_BF16_R4": "exl3_bf16_r4",
+    "TQ_PATTN_GQA": "pattn_gqa",
+    "TQ_WAVE_MAX": "wave_max",
+    "TQ_WIDE_ATTN_QROWS": "wide_attn_qrows",
+    "TQ_KV_T4_ASYNC": "kv_t4_async",
+    "TQ_PAGED_TOPK_PAGES": "paged_topk_pages",
+    "TQ_PAGED_TOPK_MIN_CTX": "paged_topk_min_ctx",
+    "TQ_PARK_RING": "park_ring",
+    "TQ_QMMA_SF_K_SPLIT": "qmma_sf_k_split",
+    "TQ_PAGED_GQA_SPLIT": "paged_gqa_split",
+    "TQ_PATTN_DEBUG": "pattn_debug",
+    "TQ_EXL3_DEBUG": "exl3_debug",
+    "TQ_GRAPH_DEBUG": "graph_debug",
+    "TQ_PAGED_TOPK_DEBUG": "paged_topk_debug",
+    "TQ_KV_T4_CODEBOOK": "kv_t4_codebook",
+}
+
 SIGNATURES = {
+    "qwn_config_defaults": (None, [C.c_void_p]),
+    "qwn_config_from_env": (None, [C.c_void_p]),
+    "qwn_config_get": (None, [C.c_void_p]),
     "qwn_quant_bfrag_check": (C.c_int, [C.c_int, C.c_int, C.c_void_p, C.c_void_p]),
     "qwn_quant_bfrag_bench": (C.c_int, [C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p]),
     "qwn_free": (None, []),
     "qwn_tqf_blake2b256": (C.c_int, [C.c_void_p, C.c_size_t, C.c_void_p]),
     "qwn_gpu_pack_e2m3_test": (C.c_int, [C.c_void_p, C.c_int, C.c_int, C.c_void_p, C.c_void_p]),
     "qwn_probe": (C.c_int, [C.c_char_p]),
+    "qwn_init_with": (C.c_int, [C.c_char_p, C.c_void_p]),
     "qwn_init": (C.c_int, [C.c_char_p]),
     "qwn_hidden_size": (C.c_int, []),
     "qwn_intermediate_size": (C.c_int, []),

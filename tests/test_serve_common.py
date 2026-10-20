@@ -152,6 +152,7 @@ class _FakeReq:
 
 
 class _FakeEng:
+    L = None   # no library: the server reports the environment's settings
     log_admits = False
     q, active, parked, prefills, host_parked = [], {}, {}, {}, {}
     cache_hits = cache_tokens = host_bytes = host_hits = host_saves = host_evict_lru = host_evict_ttl = 0

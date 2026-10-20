@@ -10,8 +10,8 @@ on demand out of the SAME pool. This test:
   CAPACITY : measure per-block and per-slot VRAM, then report how many clients fit at short
              ctx (DeltaNet-state-limited) vs @128k (KV-block-limited) for the free budget.
 
-Run (GPU7, prod Q4 config):
-    CUDA_VISIBLE_DEVICES=7 TQ_CTX=8192 TQ_KV_Q4=1 python3 -u tools/paged_smoke.py
+Run (an FP6 / FP8 tqf; the pool format and kernels the check compares are pinned below):
+    CUDA_VISIBLE_DEVICES=7 python3 -u tools/paged_smoke.py --tqf model.tqf --model-dir /path/to/Qwen3.8-27B
 """
 from __future__ import annotations
 import argparse, ctypes, os, subprocess
@@ -80,7 +80,11 @@ def main():
     ap.add_argument("--ncorr", type=int, default=8)
     args = ap.parse_args()
     P = args.prompt_tokens
-    assert os.environ.get("TQ_KV_Q4", "") not in ("", "0"), "set TQ_KV_Q4=1 (paged KV is Q4-only)"
+    # What the parity check compares (the engine's own defaults are the served line's): the int4-K / E4M3-V pool whose
+    # rows the single-stream decoder's cache shares, the scalar wave attention, an 8K context. Explicit env wins.
+    for k, v in {"TQ_CTX": "8192", "TQ_KV_Q4": "1", "TQ_KV_V4": "0", "TQ_KV_T4": "0", "TQ_PDL": "0",
+                 "TQ_EMBED_HOST": "0", "TQ_WIDE_ATTN_MMA": "0"}.items():
+        os.environ.setdefault(k, v)
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)

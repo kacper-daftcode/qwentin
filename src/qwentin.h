@@ -11,6 +11,54 @@
 extern "C" {
 #endif
 
+/* engine/config.cuh: the engine's configuration, one field per TQ_* switch (named in each comment; docs/FLAGS.md).
+ * qwn_config_from_env fills it the way qwn_init reads the environment; qwn_init_with takes it instead. */
+typedef struct qwn_config {
+    /* the configuration a deployment sets */
+    int ctx;                    /* TQ_CTX */
+    int kv_q4;                  /* TQ_KV_Q4 */
+    int kv_v4;                  /* TQ_KV_V4 */
+    int kv_t4;                  /* TQ_KV_T4 */
+    int dstate;                 /* TQ_DSTATE_BF16 */
+    int embed_host;             /* TQ_EMBED_HOST */
+    int embed_fp8;              /* TQ_EMBED_FP8 */
+    int no_mtp;                 /* TQ_NO_MTP */
+    int verify_tqf;             /* TQ_VERIFY_TQF */
+    int pdl;                    /* TQ_PDL */
+    int wide_attn_mma;          /* TQ_WIDE_ATTN_MMA */
+    int paged_attn_mma;         /* TQ_PAGED_ATTN_MMA */
+    int gdn_prefill;            /* TQ_GDN_PREFILL */
+    /* off-switches and opt-in experiments */
+    int t4_attn_f16;            /* TQ_T4_ATTN_F16 */
+    int paged_attn_st;          /* TQ_PAGED_ATTN_ST */
+    int graph;                  /* TQ_GRAPH */
+    int gemm_fork;              /* TQ_GEMM_FORK */
+    int gemm_fork_maxn;         /* TQ_GEMM_FORK_MAXN */
+    int exl3_wide_ng16;         /* TQ_EXL3_WIDE_NG16 */
+    int exl3_bf16_r4;           /* TQ_EXL3_BF16_R4 */
+    int pattn_gqa;              /* TQ_PATTN_GQA */
+    int wave_max;               /* TQ_WAVE_MAX */
+    int wide_attn_qrows;        /* TQ_WIDE_ATTN_QROWS */
+    int kv_t4_async;            /* TQ_KV_T4_ASYNC */
+    int paged_topk_pages;       /* TQ_PAGED_TOPK_PAGES */
+    int paged_topk_min_ctx;     /* TQ_PAGED_TOPK_MIN_CTX */
+    /* pins for tools and tests */
+    int park_ring;              /* TQ_PARK_RING */
+    int qmma_sf_k_split;        /* TQ_QMMA_SF_K_SPLIT */
+    int paged_gqa_split;        /* TQ_PAGED_GQA_SPLIT */
+    /* diagnostics */
+    int pattn_debug;            /* TQ_PATTN_DEBUG */
+    int exl3_debug;             /* TQ_EXL3_DEBUG */
+    int graph_debug;            /* TQ_GRAPH_DEBUG */
+    int paged_topk_debug;       /* TQ_PAGED_TOPK_DEBUG */
+    const char *kv_t4_codebook;   /* TQ_KV_T4_CODEBOOK: a file of 4096 fp32 entries; NULL = the built-in codebook */
+} qwn_config;
+
+/* engine/config.cuh */
+void qwn_config_defaults(qwn_config *c);
+void qwn_config_from_env(qwn_config *c);
+void qwn_config_get(qwn_config *c);
+
 /* engine/quant_bfrag.cuh */
 int qwn_quant_bfrag_check(int K, int N, float *max_abs_diff_bytes, float *max_abs_diff_scale);
 int qwn_quant_bfrag_bench(int K, int N, int iters, double *t_ref_ms, double *t_fast_ms, double *gbps_ref, double *gbps_fast);
@@ -20,6 +68,7 @@ void qwn_free(void);
 int qwn_tqf_blake2b256(const void *data, size_t n, uint8_t *out);
 int qwn_gpu_pack_e2m3_test(const uint16_t *h_bf16, int M, int K, uint8_t *h_out_dA, float *h_out_scale);
 int qwn_probe(const char *path);
+int qwn_init_with(const char *path, const qwn_config *cfg);
 int qwn_init(const char *path);
 int qwn_hidden_size(void);
 int qwn_intermediate_size(void);

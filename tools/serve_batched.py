@@ -20,9 +20,9 @@ Modes:
   --selftest     : staggered join/leave correctness vs single-stream + aggregate tok/s (no HTTP)
   (default)      : run the OpenAI server on --port
 
-Run (GPU7, prod Q4):
-  CUDA_VISIBLE_DEVICES=7 TQ_CTX=8192 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --selftest
-  CUDA_VISIBLE_DEVICES=7 TQ_CTX=131072 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --port 8100
+Run (GPU7; the engine's defaults are the served line's, so the server needs no TQ_* environment):
+  CUDA_VISIBLE_DEVICES=7 TQ_CTX=8192 python3 -u tools/serve_batched.py --selftest --tqf ... --model-dir ...
+  CUDA_VISIBLE_DEVICES=7 python3 -u tools/serve_batched.py --port 8100 --tqf ... --model-dir ...
 
 Defaults since 10-16 (owner, HANDOFF Decisions 16): --kv-v4 --kv-t4 (trellis-4 K+V, 16.5 KiB/token), --spec (the paged
 MTP drafter; needs the --mtp-exl3 tqf, e.g. qwen3_8-27b-exl3-opt5.75-mtp4.tqf, else it warns and runs plain decode) and
@@ -40,6 +40,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WAVE_MAX = 128   # prefill wave column cap = the fast activation quantizer's smem limit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qwentin_abi  # noqa: E402
 from serve_common import (BodyError, add_hardening_args, apply_socket_timeout, auth_ok, clamp_fields,  # noqa: E402
                           clamp_max_tokens, read_json_body, unauthorized_body)
 
@@ -87,7 +88,70 @@ def load_lib(path):
         L.has_spec = True
     except AttributeError:
         L.has_spec = False
+    # the configuration struct (qwn_config): qwn_init_with takes the server's settings directly; older builds lack it
+    try:
+        L.qwn_config_from_env.argtypes = [ctypes.c_void_p]; L.qwn_config_from_env.restype = None
+        L.qwn_config_get.argtypes = [ctypes.c_void_p]; L.qwn_config_get.restype = None
+        L.qwn_init_with.argtypes = [ctypes.c_char_p, ctypes.c_void_p]; L.qwn_init_with.restype = ctypes.c_int
+        L.has_config = True
+    except AttributeError:
+        L.has_config = False
     return L
+
+
+def config_overrides(args):
+    """The engine switches the server's arguments set, by TQ_* name (None = the engine's built-in codebook)."""
+    return {"TQ_WIDE_ATTN_MMA": int(args.wide_attn_mma and args.page >= 128), "TQ_EMBED_HOST": int(args.embed_host),
+            "TQ_NO_MTP": int(not args.mtp), "TQ_KV_V4": int(args.kv_v4), "TQ_KV_T4": int(args.kv_t4),
+            "TQ_KV_T4_CODEBOOK": args.kv_t4_codebook or None, "TQ_PDL": int(args.pdl), "TQ_DSTATE_BF16": args.dstate,
+            "TQ_GDN_PREFILL": int(args.gdn_prefill)}
+
+
+def engine_config(L, overrides):
+    """The qwn_config the server starts the engine with: the TQ_* environment as the engine reads it, then `overrides`
+    for every switch the environment leaves unset or empty (explicit environment overrides the arguments)."""
+    cfg = qwentin_abi.Config()
+    L.qwn_config_from_env(ctypes.byref(cfg))
+    for name, value in overrides.items():
+        if not os.environ.get(name, ""):
+            setattr(cfg, qwentin_abi.CONFIG_FIELDS[name], value.encode() if isinstance(value, str) else value)
+    return cfg
+
+
+def init_engine(L, tqf, overrides):
+    """qwn_init with the server's settings: qwn_init_with(engine_config(...)), or, with a library older than it, the
+    same precedence through the environment."""
+    if getattr(L, "has_config", False):
+        cfg = engine_config(L, overrides)
+        kv_t4, kv_v4 = cfg.kv_t4, cfg.kv_v4
+        cb = cfg.kv_t4_codebook.decode() if cfg.kv_t4_codebook else ""
+    else:
+        for name, value in overrides.items():
+            if value is not None:
+                os.environ.setdefault(name, str(value))
+        kv_t4 = os.environ.get("TQ_KV_T4", "0") not in ("", "0")
+        kv_v4 = os.environ.get("TQ_KV_V4", "0") not in ("", "0")
+        cb = os.environ.get("TQ_KV_T4_CODEBOOK", "")
+    if kv_t4 and not kv_v4:
+        sys.exit("--kv-t4 needs --kv-v4 (the open page is staged as int4 K + V)")
+    if kv_t4 and cb and not os.path.exists(cb):
+        sys.exit(f"--kv-t4: codebook {cb} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
+                 f"unset = the engine's built-in lloyd_kv12a)")
+    if getattr(L, "has_config", False):
+        ck(L.qwn_init_with(tqf.encode(), ctypes.byref(cfg)), "init")
+    else:
+        ck(L.qwn_init(tqf.encode()), "init")
+
+
+def engine_settings(L):
+    """The engine's effective kv_v4 / kv_t4 / park_ring (qwn_config_get; the environment with an older library)."""
+    if getattr(L, "has_config", False):
+        cfg = qwentin_abi.Config()
+        L.qwn_config_get(ctypes.byref(cfg))
+        return {"kv_v4": bool(cfg.kv_v4), "kv_t4": bool(cfg.kv_t4), "park_ring": int(cfg.park_ring)}
+    return {"kv_v4": os.environ.get("TQ_KV_V4", "0") not in ("", "0"),
+            "kv_t4": os.environ.get("TQ_KV_T4", "0") not in ("", "0"),
+            "park_ring": int(os.environ.get("TQ_PARK_RING", "1") not in ("", "0"))}
 
 
 TQ_FLAG_MTP_EXL3 = 1 << 12      # tqf header flag: the MTP projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3)
@@ -114,8 +178,8 @@ def attn_st_summary(L):
     except AttributeError:
         e = os.environ.get("TQ_PAGED_ATTN_ST", "")
         st = int(e) if e.strip().lstrip("-").isdigit() else 1
-    t4 = os.environ.get("TQ_KV_T4", "0") not in ("", "0")
-    v4 = os.environ.get("TQ_KV_V4", "0") not in ("", "0")
+    es = engine_settings(L)
+    t4, v4 = es["kv_t4"], es["kv_v4"]
     what = ("a no-op under --kv-t4 today: the trellis pool runs its own GQA kernels" if t4
             else "fp16 int4 GQA decode/verify kernel" if (st >= 2 and v4)
             else "E4M3 V: base kernel (the fp16 path needs --kv-v4)" if st >= 2
@@ -125,8 +189,9 @@ def attn_st_summary(L):
 
 def kv_summary(L, total_blocks, page):
     """'KV <format> <KiB>/token, <tokens> pooled tokens' for the startup line (needs qwn_paged_token_bytes)."""
-    fmt = "int4 K + int4 V" if os.environ.get("TQ_KV_V4", "0") not in ("", "0") else "int4 K + E4M3 V"
-    if os.environ.get("TQ_KV_T4", "0") not in ("", "0"):
+    es = engine_settings(L)
+    fmt = "int4 K + int4 V" if es["kv_v4"] else "int4 K + E4M3 V"
+    if es["kv_t4"]:
         fmt = "trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16)"
     if not L.has_token_bytes:
         return fmt
@@ -193,9 +258,9 @@ SPEC_MAX_T = 64      # verify wave column cap (qwn_paged_verify)
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, prefill_waves_per_step=2,
                  mixed_prefill=True, prefix_cache=True, park_ram_bytes=0, decode_steps_per_wave=0,
-                 spec=False, spec_k="auto", park_ram_ttl=0.0):
+                 spec=False, spec_k="auto", park_ram_ttl=0.0, cfg_overrides=None):
         self.L = lib
-        ck(self.L.qwn_init(tqf.encode()), "init")
+        init_engine(self.L, tqf, cfg_overrides or {})
         self.page = page; self.max_slots = max_slots
         ck(self.L.qwn_paged_init(max_slots, num_blocks, page), "paged_init")
         fb, tb, pg, mb = self._stats()
@@ -815,7 +880,7 @@ def selftest(args):
                         prefill_waves_per_step=args.prefill_waves_per_step,
                         mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
                         park_ram_bytes=int(args.park_ram_gb * 2**30),
-                        decode_steps_per_wave=args.decode_steps_per_wave)
+                        decode_steps_per_wave=args.decode_steps_per_wave, cfg_overrides=args.cfg_overrides)
     fb, tb, pg, mb = eng._stats()
     print(f"engine up: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
 
@@ -1005,7 +1070,7 @@ def make_handler(eng, tok, args):
                                  "park_ram_ttl_s": eng.park_ram_ttl,
                                  "park_ram_gb": round(eng.park_ram_bytes / 2**30, 1),
                                  "host_parked_oldest_s": round(time.time() - min(h["t"] for h in eng.host_parked.values()), 1) if eng.host_parked else 0,
-                                 "park_ring": os.environ.get("TQ_PARK_RING", "1"),
+                                 "park_ring": str(engine_settings(eng.L)["park_ring"]),
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "decoded_tokens": eng.decoded_tokens, "steps": eng.steps,
                                  "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k,
@@ -1196,7 +1261,8 @@ def serve(args):
                         mixed_prefill=args.mixed_prefill, prefix_cache=args.prefix_cache,
                         park_ram_bytes=int(args.park_ram_gb * 2**30),
                         decode_steps_per_wave=args.decode_steps_per_wave,
-                        spec=args.spec, spec_k=args.spec_k, park_ram_ttl=args.park_ram_ttl)
+                        spec=args.spec, spec_k=args.spec_k, park_ram_ttl=args.park_ram_ttl,
+                        cfg_overrides=args.cfg_overrides)
     fb, tb, pg, mb = eng._stats()
     spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k})" if eng.spec
                  else "speculative decoding OFF (" + (eng.spec_off_reason or getattr(args, "spec_off_reason", "") or "--no-spec") + ")")
@@ -1219,7 +1285,7 @@ def bench(args):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     L = load_lib(args.lib)
-    ck(L.qwn_init(args.tqf.encode()), "init")
+    init_engine(L, args.tqf, args.cfg_overrides)
     text = "The history of cartography is the study of maps and "
     base_ids = tok(text, add_special_tokens=False).input_ids
     # tile the base text up to bench_p so we can measure decode at long contexts (e.g. 64k)
@@ -1405,24 +1471,7 @@ def main():
             k = int(args.spec_k)
             if not 1 <= k <= 16:
                 raise SystemExit("--spec-k must be auto or 1..16")
-    # The engine lib reads these at qwn_init / lazily on the first prefill wave; explicit env overrides the flags.
-    os.environ.setdefault("TQ_WIDE_ATTN_MMA", "1" if (args.wide_attn_mma and args.page >= 128) else "0")
-    os.environ.setdefault("TQ_EMBED_HOST", "1" if args.embed_host else "0")
-    os.environ.setdefault("TQ_NO_MTP", "0" if args.mtp else "1")
-    os.environ.setdefault("TQ_KV_V4", "1" if args.kv_v4 else "0")
-    os.environ.setdefault("TQ_KV_T4", "1" if args.kv_t4 else "0")
-    if os.environ.get("TQ_KV_T4", "0") not in ("", "0"):
-        if args.kv_t4_codebook:
-            os.environ.setdefault("TQ_KV_T4_CODEBOOK", args.kv_t4_codebook)
-        if os.environ.get("TQ_KV_V4", "0") in ("", "0"):
-            sys.exit("--kv-t4 needs --kv-v4 (the open page is staged as int4 K + V)")
-        cb = os.environ.get("TQ_KV_T4_CODEBOOK", "")
-        if cb and not os.path.exists(cb):
-            sys.exit(f"--kv-t4: codebook {cb} not found (--kv-t4-codebook / TQ_KV_T4_CODEBOOK; "
-                     f"unset = the engine's built-in lloyd_kv12a)")
-    os.environ.setdefault("TQ_PDL", "1" if args.pdl else "0")
-    os.environ.setdefault("TQ_DSTATE_BF16", str(args.dstate))
-    os.environ.setdefault("TQ_GDN_PREFILL", "1" if args.gdn_prefill else "0")
+    args.cfg_overrides = config_overrides(args)   # handed to qwn_init_with; explicit env overrides the flags
     if args.bench:
         bench(args)
     elif args.selftest:

@@ -558,12 +558,16 @@ static int ensure_attn_scores(void) {
 }
 
 extern "C" int qwn_probe(const char *path) {
-    tq_config_load();
+    qwn_config c;
+    qwn_config_from_env(&c);
+    tq_config_apply(&c);
     return parse_tqf(path, 0);
 }
 
-extern "C" int qwn_init(const char *path) {
-    tq_config_load();
+// qwn_init with this configuration instead of the TQ_* environment (src/engine/config.cuh).
+extern "C" int qwn_init_with(const char *path, const qwn_config *cfg) {
+    if (!cfg) return -1;
+    tq_config_apply(cfg);
     tq_config_print(stderr, &g_cfg);
     int r = parse_tqf(path, 1);
     if (r != 0) return r;
@@ -581,6 +585,12 @@ extern "C" int qwn_init(const char *path) {
         fprintf(stderr, "KV prefix cache: K int4 asym g32 + Hadamard rotation, "
                         "V E4M3 + pow2 scale (TQ_KV_Q4=1); (scale,zp) groups fp16\n");
     return 0;
+}
+
+extern "C" int qwn_init(const char *path) {
+    qwn_config c;
+    qwn_config_from_env(&c);
+    return qwn_init_with(path, &c);
 }
 
 extern "C" int qwn_hidden_size(void) { return g_qwen.H; }

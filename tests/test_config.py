@@ -44,14 +44,28 @@ HARNESS = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qwentin.h"
 #include "config.cuh"
 int main(int argc, char **argv) {
-    // argv[1..]: NAME=VALUE (NAME= sets the empty string); prints every switch as NAME=value, then the [config] line
-    for (int i = 1; i < argc; i++) { char *eq = strchr(argv[i], '='); *eq = 0; setenv(argv[i], eq + 1, 1); }
-    tq_config_load();
-    for (const tq_switch_t &s : k_tq_switches) printf("%s=%d\n", s.name, g_cfg.*s.field);
-    printf("TQ_KV_T4_CODEBOOK=%s\n", g_cfg.kv_t4_codebook ? g_cfg.kv_t4_codebook : "<built-in>");
-    tq_config_print(stdout, &g_cfg);
+    // argv[1..]: NAME=VALUE sets the environment (NAME= the empty string) before qwn_config_from_env; @field=VALUE then
+    // sets that qwn_config field directly (what a qwn_init_with caller does). Applies the result like qwn_init_with and
+    // prints every switch as NAME=value, then the [config] line.
+    for (int i = 1; i < argc; i++)
+        if (argv[i][0] != '@') { char *eq = strchr(argv[i], '='); *eq = 0; setenv(argv[i], eq + 1, 1); }
+    qwn_config c;
+    qwn_config_from_env(&c);
+    for (int i = 1; i < argc; i++)
+        if (argv[i][0] == '@') {
+            char *eq = strchr(argv[i], '='); *eq = 0;
+            for (const tq_switch_t &s : k_tq_switches)
+                if (!strcmp(s.name, argv[i] + 1)) c.*s.field = atoi(eq + 1);
+        }
+    tq_config_apply(&c);
+    qwn_config g;
+    qwn_config_get(&g);
+    for (const tq_switch_t &s : k_tq_switches) printf("%s=%d\n", s.name, g.*s.field);
+    printf("TQ_KV_T4_CODEBOOK=%s\n", g.kv_t4_codebook ? g.kv_t4_codebook : "<built-in>");
+    tq_config_print(stdout, &g);
     return 0;
 }
 """
@@ -66,8 +80,8 @@ def parse(tmp_path_factory):
     d = tmp_path_factory.mktemp("config")
     (d / "main.cpp").write_text(HARNESS)
     exe = d / "main"
-    subprocess.run([gxx, "-std=c++17", "-Wall", "-Werror", f"-DTQ_MAX_SEQ={max_seq}", "-I", ENGINE, "-o", str(exe),
-                    str(d / "main.cpp")], check=True)
+    subprocess.run([gxx, "-std=c++17", "-Wall", "-Werror", f"-DTQ_MAX_SEQ={max_seq}", "-I", ENGINE, "-I",
+                    os.path.join(ROOT, "src"), "-o", str(exe), str(d / "main.cpp")], check=True)
 
     def run(*assignments: str) -> tuple[dict[str, str], str]:
         env = {k: v for k, v in os.environ.items() if not k.startswith("TQ_")}
@@ -79,8 +93,8 @@ def parse(tmp_path_factory):
 
 
 DEFAULTS = {
-    "TQ_CTX": "8192", "TQ_KV_Q4": "0", "TQ_KV_V4": "0", "TQ_KV_T4": "0", "TQ_DSTATE_BF16": "4", "TQ_EMBED_HOST": "0",
-    "TQ_EMBED_FP8": "0", "TQ_NO_MTP": "0", "TQ_VERIFY_TQF": "0", "TQ_PDL": "0", "TQ_WIDE_ATTN_MMA": "0",
+    "TQ_CTX": "262144", "TQ_KV_Q4": "1", "TQ_KV_V4": "1", "TQ_KV_T4": "1", "TQ_DSTATE_BF16": "4", "TQ_EMBED_HOST": "1",
+    "TQ_EMBED_FP8": "0", "TQ_NO_MTP": "0", "TQ_VERIFY_TQF": "0", "TQ_PDL": "1", "TQ_WIDE_ATTN_MMA": "1",
     "TQ_PAGED_ATTN_MMA": "1", "TQ_GDN_PREFILL": "1", "TQ_T4_ATTN_F16": "1", "TQ_PAGED_ATTN_ST": "3", "TQ_GRAPH": "1",
     "TQ_GEMM_FORK": "1", "TQ_GEMM_FORK_MAXN": "64", "TQ_EXL3_WIDE_NG16": "1", "TQ_EXL3_BF16_R4": "1", "TQ_PATTN_GQA": "1",
     "TQ_WAVE_MAX": "128", "TQ_WIDE_ATTN_QROWS": "32", "TQ_KV_T4_ASYNC": "1", "TQ_PAGED_TOPK_PAGES": "0",
@@ -119,5 +133,21 @@ def test_rule(parse, assignment, expected):
 
 
 def test_config_line_lists_the_non_defaults(parse):
-    _, line = parse("TQ_CTX=262144", "TQ_KV_T4=1", "TQ_GRAPH=1", "TQ_KV_T4_CODEBOOK=/c.f32")
-    assert line == "[config] TQ_CTX=262144 TQ_KV_T4=1 TQ_KV_T4_CODEBOOK=/c.f32 (the other 31 TQ_* switches at their defaults)"
+    _, line = parse("TQ_CTX=8192", "TQ_KV_T4=0", "TQ_GRAPH=1", "TQ_KV_T4_CODEBOOK=/c.f32")
+    assert line == "[config] TQ_CTX=8192 TQ_KV_T4=0 TQ_KV_T4_CODEBOOK=/c.f32 (the other 31 TQ_* switches at their defaults)"
+
+
+@pytest.mark.parametrize("field, expected", [
+    ("@TQ_KV_T4=5", "1"), ("@TQ_CTX=1", "2048"), ("@TQ_CTX=999999", "262144"), ("@TQ_PAGED_ATTN_ST=7", "3"),
+    ("@TQ_GDN_PREFILL=9", "0"), ("@TQ_PDL=-1", "0"), ("@TQ_WIDE_ATTN_QROWS=24", "32"), ("@TQ_QMMA_SF_K_SPLIT=-3", "1"),
+    ("@TQ_QMMA_SF_K_SPLIT=0", "0"),   # a field holding the default (0 = auto) is taken as is
+    ("@TQ_GRAPH=2", "2"),
+])
+def test_fields_follow_the_rule(parse, field, expected):
+    name = field[1:].split("=", 1)[0]
+    assert parse(field)[0][name] == expected, "qwn_init_with must apply the environment's range rule"
+
+
+def test_fields_override_the_environment(parse):
+    got, _ = parse("TQ_KV_T4=0", "@TQ_KV_T4=1", "TQ_PDL=2")
+    assert got["TQ_KV_T4"] == "1" and got["TQ_PDL"] == "2"
