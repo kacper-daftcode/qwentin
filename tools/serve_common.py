@@ -1,13 +1,13 @@
-"""Request-side hardening shared by tools/serve_batched.py and tools/serve_openai.py -- no engine involvement.
+"""Request-side hardening of tools/serve_batched.py -- no engine involvement.
 
-What both servers get from here (flags via add_hardening_args):
-  --host              default 127.0.0.1 (DEFAULT_HOST): the servers bind to loopback unless told otherwise
+What the server gets from here (flags via add_hardening_args):
+  --host              default 127.0.0.1 (DEFAULT_HOST): the server binds to loopback unless told otherwise
   --api-key KEY       when set, every path except /health needs `Authorization: Bearer KEY` (401 otherwise)
   --max-body-bytes N  request bodies above N bytes are refused with 413 before they are read (default 32 MiB)
   --max-tokens-cap N  a request's max_tokens above N is clamped to N; the clamp is reported in the response's
                       x_qwentin (max_tokens_clamped_from / max_tokens_cap) and finish_reason reads "length" (default 16384)
   --socket-timeout S  read / write timeout of a client socket: a connection that stops sending its request or stops
-                      reading the response is closed after S seconds of blocking (default 600; the servers' --timeout is
+                      reading the response is closed after S seconds of blocking (default 600; the server's --timeout is
                       the admission wait, a different thing)
 
 Pure stdlib, no GPU: tests/test_serve_common.py exercises every function here and the handler wiring of
@@ -27,7 +27,7 @@ OPEN_PATHS = ("/health",)
 
 
 def add_hardening_args(ap, host_default: str = DEFAULT_HOST, max_tokens_cap: int = DEFAULT_MAX_TOKENS_CAP):
-    """The shared flags. --host is added here so both servers default to loopback."""
+    """The hardening flags. --host is added here so the server defaults to loopback."""
     ap.add_argument("--host", default=host_default,
                     help=f"bind address (default {host_default}: loopback only; 0.0.0.0 exposes the server to the network -- "
                          "pair that with --api-key)")

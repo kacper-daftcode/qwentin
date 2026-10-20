@@ -7,7 +7,7 @@ Two source kinds, two outputs:
     (flag 0x1000) -- the served format, tools/serve_batched.py --spec;
   * a HF bf16 or FP8 checkpoint: the PRODUCTION FP6 recipe is the default since 2026-10 -- `--block-scaled always
     --block-layout qmma-e2m3 --block-scale-policy pow2` with the MTP head section (flags 0x1|0x20|0x100|0x400), the
-    legacy single-stream format of tools/serve_openai.py. Before 2026-10 the defaults were `auto` / `rowmajor` /
+    2026-08 format (tools/serve_batched.py serves it with plain decode). Before 2026-10 the defaults were `auto` / `rowmajor` /
     `source` with no MTP section, which on a bf16 checkpoint silently produced plain global-scale FP8 without the
     drafter; that behaviour is still available as --legacy-fp8.
 
@@ -1069,7 +1069,7 @@ def write_tqf(
                       f"(flags 0x{FLAG_BLOCK_SCALED_QMMA | FLAG_BLOCK_SCALED_E2M3:x})")
             elif block_scaled:
                 print(f"  WARNING: block-scaled FP8 (E4M3) weights, layout {block_layout} -- NOT the FP6 production format "
-                      f"(that is --block-layout qmma-e2m3); tools/serve_openai.py's documented numbers are FP6")
+                      f"(that is --block-layout qmma-e2m3)")
             else:
                 print("  WARNING: plain global-scale FP8 weights (no block scales) -- NOT the FP6 production format; "
                       "the file will be ~28 GB instead of ~22.6 GB for the 27B and tools/inspect_tqf.py will say "

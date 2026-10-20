@@ -15,7 +15,7 @@ find_package(CUDA REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 # The Qwen3.6 inference engine: one CUDA translation unit (kernels + C ABI),
-# loaded via ctypes by the Python tools (serve_openai.py, mtp_spec_smoke.py, ...).
+# loaded via ctypes by the Python tools (serve_batched.py, ...).
 add_library(qwentin-forward-qwen SHARED
     src/forward_qwen.cu
 )

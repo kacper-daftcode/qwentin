@@ -97,7 +97,7 @@ def test_clamp_max_tokens():
     assert sc.clamp_max_tokens("x", 4096, 128) == (128, None)
     assert sc.clamp_max_tokens(0, 4096, 128) == (128, None)
     assert sc.clamp_max_tokens(-3, 4096, 128) == (128, None)
-    # the server's own default is capped too (serve_openai's Responses default 8192 with the 4096 cap)
+    # the server's own default is capped too (a default of 8192 under a 4096 cap)
     assert sc.clamp_max_tokens(None, 4096, 8192) == (4096, 8192)
     # cap 0 / None disables
     assert sc.clamp_max_tokens(10**9, 0, 128) == (10**9, None)

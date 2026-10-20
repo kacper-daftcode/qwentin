@@ -4,8 +4,8 @@
 Prints the header (flags, model dimensions, layer types), walks the payload to check that the file holds exactly the
 tensors the header announces, and prints two one-line verdicts:
 
-  verdict production FP6 ...  PASS  = FP6 E2M3 block-scaled weights + the MTP head section (the legacy single-stream
-                                      format, tools/serve_openai.py; header flags 0x1 | 0x20 | 0x100 | 0x400)
+  verdict production FP6 ...  PASS  = FP6 E2M3 block-scaled weights + the MTP head section (the 2026-08 format;
+                                      tools/serve_batched.py serves it with plain decode; flags 0x1 | 0x20 | 0x100 | 0x400)
   verdict EXL3 + MTP ...      PASS  = EXL3 trellis weights + the EXL3 MTP layer (the served format, tools/serve_batched.py
                                       --spec; flags 0x800 | 0x400 | 0x1000)
 

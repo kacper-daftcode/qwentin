@@ -31,13 +31,13 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
-    # tools/convert_qwen_tqf.py, qwentin_e2e.py, exl3_diff.py, e2e_frontier.py, mtp_*.py, paged_logit_ab.py, ...
+    # tools/convert_qwen_tqf.py, qwentin_e2e.py, exl3_diff.py, e2e_frontier.py, paged_logit_ab.py, ...
     "torch==2.14.0",            # +cu130 build: see the header
     # every server / engine tool (AutoTokenizer, AutoConfig, chat templates)
     "transformers==5.17.0",
-    # tools/convert_qwen_tqf.py, dequant_fp8_to_bf16.py, mtp_calib_train.py, mtp_accept.py
+    # tools/convert_qwen_tqf.py, dequant_fp8_to_bf16.py
     "safetensors==0.8.0",
-    # tools/convert.py, convert_qwen_tqf.py, sparse_pack.py, mtp_*.py, residual_map.py (arming / reference), residual_map_check.py
+    # tools/convert.py, convert_qwen_tqf.py, sparse_pack.py
     "numpy==2.5.3",
     # tools/harness_common.py and the HTTP verification tools (code_needle.py, spec_speed.py, spec_server_ab.py)
     "httpx==0.28.1",

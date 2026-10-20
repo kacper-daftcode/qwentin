@@ -58,5 +58,5 @@ def test_handwritten_ctypes_match_the_header():
             ok = len(val) == len(args) and all(a == b or (_is_ptr(a) and _is_ptr(b)) for a, b in zip(val, args))
         if not ok:
             bad.append(f"{fn}:{line} {name}.{kind} = {val!r}, header: {res if kind == 'restype' else args}")
-    assert n > 100
+    assert n > 50
     assert not bad, "\n".join(bad)

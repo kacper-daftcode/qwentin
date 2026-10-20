@@ -4,9 +4,8 @@
 A single engine thread owns the CUDA engine (paged Q4 KV pool). HTTP handler threads only
 tokenize, submit a Request, and wait on its completion event. The engine thread runs a
 continuous-batching loop:
-  - ADMIT queued requests into free slots (prefill the prompt single-stream, snapshot into the
-    slot's paged blocks via qwn_paged_load_client = the validated bring-up path), subject to
-    admission control (free slot + enough free pool blocks).
+  - ADMIT queued requests into free slots (their prompts prefill in paged waves, below), subject
+    to admission control (free slot + enough free pool blocks).
   - DECODE one paged step over ALL active slots (qwn_paged_decode_step), push each slot's new
     token to its request, advance positions, and DETACH finished requests (EOS / max_tokens),
     returning their blocks to the pool.
@@ -15,8 +14,7 @@ Decodes are batched (the throughput win). Short prompts are batched into one rag
 a long prompt is prefilled in <=128-column waves that carry the active slots' decode steps as
 1-token final segments (--mixed-prefill, default), so decoders keep producing one token per wave
 while the long prompt prefills at ~full speed (--no-mixed-prefill alternates waves and decode
-steps; --prefill-waves-per-step 0 restores the blocking whole-prompt prefill). Default-off
-relative to the single-stream serve_openai.py; this is a SEPARATE server.
+steps; --prefill-waves-per-step 0 restores the blocking whole-prompt prefill).
 
 Modes:
   --selftest     : staggered join/leave correctness vs single-stream + aggregate tok/s (no HTTP)
@@ -61,8 +59,6 @@ def load_lib(path):
     L.qwn_paged_stats.argtypes = [ctypes.POINTER(ctypes.c_int)] * 4; L.qwn_paged_stats.restype = ctypes.c_int
     L.qwn_paged_prefill_batch.argtypes = [ctypes.POINTER(ctypes.c_int)] * 7 + [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     L.qwn_paged_prefill_batch.restype = ctypes.c_int
-    L.qwn_prefill_chunk.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-    L.qwn_prefill_chunk.restype = ctypes.c_int
     L.qwn_free.restype = None
     # session parking (slot KV blocks + DeltaNet state <-> host buffer); older builds lack these
     try:
@@ -144,24 +140,6 @@ def kv_summary(L, total_blocks, page):
     except (AttributeError, IndexError):
         pass
     return s
-
-
-def fast_prefill(L, ids, chunk=16):
-    """Single-stream prefill in <=16-token spec chunks (qwn_prefill_chunk) so long
-    contexts (e.g. 64k) prefill in seconds instead of token-by-token minutes.
-    Returns (final_argmax, last_pos). Timing-grade: the committed KV is what
-    qwn_paged_load_client snapshots into each paged slot."""
-    L.qwn_reset_state()
-    n = len(ids); pos = 0; am = 0
-    out = (ctypes.c_int * 1)()
-    while pos < n:
-        c = min(chunk, n - pos)
-        buf = (ctypes.c_int * c)(*[int(x) for x in ids[pos:pos + c]])
-        rc = L.qwn_prefill_chunk(buf, pos - 1, c, out)
-        if rc != 0:
-            raise RuntimeError(f"qwn_prefill_chunk rc={rc} at pos {pos}")
-        am = out[0]; pos += c
-    return am, n - 1
 
 
 def paged_prefill_slot(L, slot, ids, page, wave_max=128):
@@ -895,7 +873,7 @@ def selftest(args):
     eng.shutdown()
 
 
-# ----------------------------- tool-calling (ported from serve_openai.py) -----------------
+# ----------------------------- tool-calling -----------------
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
 
 

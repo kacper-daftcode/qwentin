@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # T1 of the quality protocol (docs/QUALITY.md): EvalPlus HumanEval+ / MBPP+ pass@1, greedy, against an OpenAI-compatible
-# endpoint -- tools/serve_batched.py (the served stack), tools/serve_openai.py, vLLM (the FP8 reference row), ...
+# endpoint -- tools/serve_batched.py (the served stack), vLLM (the FP8 reference row), ...
 #
 # Usage: tools/evalplus.sh <base-url> <served-model-name> <out-dir> [humaneval|mbpp]
 #   EVALPLUS=/path/to/venv/bin/evalplus.evaluate   (default: `evalplus.evaluate` on PATH; `pip install evalplus`)

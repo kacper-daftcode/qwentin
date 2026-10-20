@@ -1,8 +1,8 @@
 """Shared helpers for the verification tools that talk to a running server (code_needle.py, spec_speed.py,
 spec_server_ab.py). Vendored from the qwen256k research harness (eval/common.py) so the tools run from this repo alone.
 
-Model-agnostic: everything talks to an OpenAI-compatible /v1/chat/completions endpoint (qwentin's serve_batched.py or
-serve_openai.py, vLLM, ...). Token accounting uses the served model's tokenizer.json when given (--tokenizer), else a
+Model-agnostic: everything talks to an OpenAI-compatible /v1/chat/completions endpoint (qwentin's serve_batched.py,
+vLLM, ...). Token accounting uses the served model's tokenizer.json when given (--tokenizer), else a
 chars/token estimate.
 
 The "code corpus" is a directory tree of source files that the tools concatenate into repository-snapshot prompts
