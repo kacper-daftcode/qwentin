@@ -25,6 +25,20 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 - Gate (`docs/evidence/cand17-all.log`): of the 211 kernels left, 210 keep their SASS bit for bit; the one that changed
   is the single-stream decoder's attention, whose non-inlined helper lost its other callers and was
   specialized by the compiler — the decoder's tokens, its KV and the paged logits after it are bitwise unchanged.
+- **The engine reads its environment once, in one place.** `src/engine/config.cuh` parses the 34 switches into one
+  struct when `qwn_init` (or `qwn_probe`) runs; no other part calls `getenv`, so nothing changes if the environment
+  does later. One parse rule for every switch: unset or empty = the default, otherwise the integer value, a boolean on
+  for any non-zero value, ranges clamped or replaced as the table says. Every documented value parses as before; odd
+  inputs now follow the rule too — `TQ_EXL3_DEBUG=0` / `TQ_PATTN_DEBUG=0` are off (presence used to turn them on),
+  `TQ_EMBED_HOST` / `TQ_NO_MTP` / `TQ_EMBED_FP8` read the number instead of the first character (`TQ_EMBED_FP8=e` is
+  no longer an alias of 2), and an empty `TQ_CTX` / `TQ_QMMA_SF_K_SPLIT` is the default instead of 2048 / 1.
+  `qwn_init` prints the switches that differ from their defaults as one `[config]` line on stderr. docs/FLAGS.md
+  lists the switches in the struct's four groups; `tests/test_config.py` keeps the two in step and pins the rule.
+- **A bf16 MTP head is no longer loaded.** Nothing drafts with it since the single-stream path went (the paged drafter
+  needs a `--mtp-exl3` file), so FP6 files and older `-mtp.tqf` files skip it: 0.85 GB less device memory with
+  `TQ_NO_MTP` unset.
+- Four engine parts renamed to what they hold (`embed_rows`, `wide_mlp`, `norm_launch`, `decode_oracle`), `config.cuh`
+  added: 21 parts.
 
 ## [v0.11] — 2026-10-20
 
