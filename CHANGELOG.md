@@ -39,6 +39,9 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
   `TQ_NO_MTP` unset.
 - Four engine parts renamed to what they hold (`embed_rows`, `wide_mlp`, `norm_launch`, `decode_oracle`), `config.cuh`
   added: 21 parts.
+- Gate (`docs/evidence/cand18-all.log`, `cand18-matrix.log`): host code only — all 211 kernels keep their SASS bit
+  for bit; the served line, spec exactness, the test decoder and an FP6 file as before, and 25 cells with switches
+  off their defaults bitwise against the previous library under the same environment.
 
 ## [v0.11] — 2026-10-20
 

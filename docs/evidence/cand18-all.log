@@ -1,0 +1,89 @@
+[cand18-all] start 10:39:07; cand eb62621e576b = 78d65cd docs: the config struct, the bf16 MTP head and the r; served 1be5daa15c3d
+== gate 0: ruff + pytest, the exported ABI, the parse rule vs the old expressions   10:39:07
+[1;32mAll checks passed![0m
+65 passed, 2 skipped in 0.81s
+67 passed in 0.82s
+   exported qwn_*: 55, qwentin.h: 55
+   [config-ab] 2050 (switch, input) pairs, 115 parse differently; documented values or unset among them: 0
+   [config-ab] PASS
+[gate0] PASS
+== gate 1: per-kernel SASS + bitwise vs the served library   10:39:09
+kernels: old 211, new 211, common 211; identical 211, different 0
+[plab] N=3 cand-1208 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1208 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (v2 file), cand-1208 vs served: bitwise True (25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1208 vs served: bitwise True (16 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K + 32K   10:41:41
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: the test decoder (FP6 file), old vs new   10:42:59
+[oracle] 14 tensors (1800 teacher-forced argmax, greedy continuations, paged logits after the oracle's KV): bitwise True
+   paged_smoke:   -> 8/8 argmax match   -> 7/8 seed match; wave T=108 cols, 1 weight-read for all clients 
+   paged_smoke: the same token lines; the bf16 MTP head loaded by the served library, read past by the candidate
+     client 0: gen=64 leading-match-vs-single=1/64  text=' changed over time. It is a field that is both a par
+     client 1: gen=64 leading-match-vs-single=64/64  text=' state of a particle. For a free particle in one di
+     client 2: gen=64 leading-match-vs-single=64/64  text=' if n == 0:\n        return 0\n    elif n == 1:\n  
+     client 3: gen=64 leading-match-vs-single=61/64  text=' simple dough made from flour, water, yeast, salt, 
+     client 4: gen=64 leading-match-vs-single=50/64  text=' variety of methods, including weather stations, sa
+     client 5: gen=64 leading-match-vs-single=14/64  text=' Third Estate, representing the common people, decl
+     client 6: gen=64 leading-match-vs-single=21/64  text=' a loss function that measures how far the networkâ
+     client 7: gen=64 leading-match-vs-single=20/64  text=' cell. It is the site of cellular respiration, wher
+[gate3] PASS
+== gate 4: FP6 on the batched path   10:45:19
+[plab] FP6 file, Q4 pool, N=3: cand-1208 vs served bitwise True (25 tensors)
+[plab] FP6 file, Q4 pool, N=8: cand-1208 vs served bitwise True (25 tensors)
+   [   32k depth=0.95 rep=0] PASS prompt=32596 ttft=13.009s e2e=13.185s ans='FF-699212-PR' exp=['FF-699
+   [   32k depth=0.50 rep=0] PASS prompt=32596 ttft=12.998s e2e=13.164s ans='UI-672763-WB' exp=['UI-672
+   [   32k depth=0.05 rep=0] PASS prompt=32602 ttft=12.983s e2e=13.166s ans='ZU-821600-AR' exp=['ZU-821
+   FP6 server: needle 3/3, the same answers as the served library
+[gate4] PASS
+== gate 5: THE SERVED LINE (v2 file), pure defaults   10:47:57
+   server up after 10 s, pid 213859, 29894 MiB
+   576000 pooled tokens
+   [config] TQ_CTX=262144 TQ_KV_Q4=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_EMBED_HOST=1 TQ_EMBED_FP8=2 TQ_PDL=1 TQ_WIDE_ATTN_MMA=1 (the other 26 TQ_* switches at their defaults)
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.797s e2e=11.841s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.773s e2e=11.816s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.776s e2e=11.841s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=60.383s e2e=60.433s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.358s e2e=60.409s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.315s e2e=60.366s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[ab-vs-cand17] prompts identical True; texts identical to cand17 (the served library, same file): on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 176.3 (min 176.3, max 176.3), aggregate 176.3; 300 tokens in 1.8s; rounds 79 steps 79 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 80.5 (min 69.9, max 85.0), aggregate 626.2; 2400 tokens in 4.7s; rounds 137 steps 137 tokens/round
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1, texts = cand17: 1; speed rc 0
+[gate5] PASS
+== gate 6: the off-switch matrix (logs/cand18-matrix.log, GPU 1)   10:54:46
+   [matrix] t4-attn-f16-0: bitwise (25 tensors); [config] line as expected (TQ_T4_ATTN_F16=0): 1
+   [matrix] graph-0: bitwise (25 tensors); [config] line as expected (TQ_GRAPH=0): 1
+   [matrix] gemm-fork-0: bitwise (25 tensors); [config] line as expected (TQ_GEMM_FORK=0): 1
+   [matrix] dstate-0: bitwise (25 tensors); [config] line as expected (TQ_DSTATE_BF16=0): 1
+   [matrix] pdl-0: bitwise (25 tensors); [config] line as expected (!TQ_PDL=): 1
+   [matrix] pdl-2: bitwise (25 tensors); [config] line as expected (TQ_PDL=2): 1
+   [matrix] pins: bitwise (25 tensors); [config] line as expected (TQ_QMMA_SF_K_SPLIT=4 TQ_PAGED_GQA_SPLIT=8): 1
+   [matrix] embed-fp8-2: bitwise (25 tensors); [config] line as expected (TQ_EMBED_FP8=2): 1
+   [matrix] embed-fp8-1: bitwise (25 tensors); [config] line as expected (TQ_EMBED_FP8=1): 1
+   [matrix] verify-tqf: bitwise (25 tensors); [config] line as expected (TQ_VERIFY_TQF=1): 1
+   [matrix] codebook-file: bitwise (25 tensors); [config] line as expected (TQ_KV_T4_CODEBOOK=/mnt/nvme/qwen256k/qwentin-cfg/tools/codebooks/lloyd_kv12a.f32): 1
+   [matrix] fp4-st3: bitwise (25 tensors); [config] line as expected (!TQ_KV_T4=): 1
+   [matrix] fp4-st1: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=1): 1
+   [matrix] fp4-st0: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=0): 1
+   [matrix] fp4-st2: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=2): 1
+   [matrix] fp4-mma-0: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_MMA=0): 1
+   [matrix] fp4-topk: bitwise (25 tensors); [config] line as expected (TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0): 1
+   [matrix] fp6-mtp-head: bitwise (25 tensors); [config] line as expected (!TQ_NO_MTP=): 1
+   [matrix] gdn-prefill-0: bitwise (16 tensors); [config] line as expected (TQ_GDN_PREFILL=0): 1
+   [matrix] pattn-gqa-0-qrows-16: bitwise (16 tensors); [config] line as expected (TQ_PATTN_GQA=0 TQ_WIDE_ATTN_QROWS=16): 1
+   [matrix] t4-async-0: bitwise (16 tensors); [config] line as expected (TQ_KV_T4_ASYNC=0): 1
+   [matrix] exl3-ng16-0: bitwise (16 tensors); [config] line as expected (TQ_EXL3_WIDE_NG16=0): 1
+   [matrix] exl3-bf16-r4-0: bitwise (16 tensors); [config] line as expected (TQ_EXL3_BF16_R4=0): 1
+   [matrix] gemm-fork-maxn: bitwise (16 tensors); [config] line as expected (TQ_GEMM_FORK_MAXN=1000000): 1
+   [matrix] fp4-ctx-qrows-16: bitwise (16 tensors); [config] line as expected (TQ_WIDE_ATTN_QROWS=16): 1
+   [matrix] example: [config] TQ_CTX=262144 TQ_KV_Q4=1 TQ_KV_V4=1 TQ_EMBED_HOST=1 TQ_EMBED_FP8=2 TQ_NO_MTP=1 TQ_PDL=1 TQ_WIDE_ATTN_MMA=1 TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0 (the other 24 TQ_* switches at their defaults)
+   [matrix] bf16 MTP head (FP6 file, TQ_NO_MTP=0): served 'MTP head section loaded (BF16 projections)', candidate 'MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)'
+   [matrix] 25 cells, 0 failed   10:50:03
+   [matrix] PASS
+[gate6] PASS
+== ALL PASS   10:54:46  (landing: build-qwen/ := the candidate, main := cand-1208 (ff), patches 0115-0119)
