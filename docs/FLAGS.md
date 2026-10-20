@@ -1,8 +1,8 @@
 # Flags — the engine's environment variables and the server's arguments (full reference)
 
 The full reference. Every default is the served line (the README's "Quick start" runs it with no flags). Current as of
-`main`: the v0.10 served line (engine `b2e7a3f`, library md5 `484bdb825c36`) plus the changes under "Unreleased" in
-[`CHANGELOG.md`](../CHANGELOG.md) (`TQ_PATTN_GQA`, the built-in trellis-KV codebook). Also here: the server's endpoints
+v0.11 (engine `dd6d21e`, library md5 `158edd067533`; what changed since: "Unreleased" in
+[`CHANGELOG.md`](../CHANGELOG.md)). Also here: the server's endpoints
 and request-side behaviour (thinking, per-request stats, logging), the exposure guards, and the off-switches that
 restore each previous served line bit for bit.
 

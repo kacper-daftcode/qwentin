@@ -122,7 +122,8 @@ EXL3 records (0.25 GB on the device; the batched server's paged drafter, `--mtp-
 Since `src/engine/loader.cuh` / `tools/convert_qwen_tqf.py` of 2026-10-18 the converter writes **format version 2**:
 the header above, then an 80-byte **extension** right after the layer-type bytes (`header_bytes` = 116 + L + 80),
 then the payload as before. The magic stays `TQF1`; a file without the extension is version 1 and loads as it always
-did (the served `-mtp4.tqf` of v0.10 is version 1). An engine older than this rule refuses a version-2 file
+did (the served `-mtp4.tqf` of v0.10 is version 1; v0.11 was measured on its version-2 re-conversion). An engine
+older than this rule refuses a version-2 file
 ("Unexpected header_bytes") instead of misreading it.
 
 ```

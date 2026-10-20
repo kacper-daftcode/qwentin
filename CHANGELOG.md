@@ -8,6 +8,40 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [v0.11] — 2026-10-20
+
+The v0.10 served stack with a faster prefill and a tidier tree: **TTFT 13.3 → 11.6 s @32K and 77.0 → 59.7 s @128K**
+(the GQA-grouped prefill attention), the decode path bit for bit v0.10's, the engine in 26 parts behind a generated C
+header, `.tqf` format version 2 (recorded payload size, BLAKE2b-256 hashes), the trellis-KV codebook compiled in, ten
+experiment switches gone. Engine `dd6d21e`, library `build-qwen/libforward_qwen.so` md5 `158edd067533`, served line
+`--max-slots 12 --num-blocks 4500` with no flags on a version-2 `.tqf` (the v0.10 model re-converted: the same payload
+byte for byte), CUDA 13.1, driver 610.57.04, RTX 5090 at 550 W.
+
+### Numbers pinned at this tag
+
+| | value | log |
+|---|---|---|
+| Pooled KV capacity | **576 000 tokens** (4500 × 128-token pages, 12 slots × up to 256K) at **29 894 MiB**, unchanged | `docs/evidence/cand16-all.log` gate 2 |
+| Needle-in-a-repository | **6/6** at 32K and 128K (3 depths × 3 decoys) | `cand16-all.log` gate 2 |
+| Time to first token, cold | **11.6 s @32K · 59.7 s @128K** (v0.10: 13.3 / 77.0 s) | `cand16-all.log` gate 2; the same in `cand14` / `cand15` |
+| Decode per stream @32K, N = 1 / 2 / 4 / 8, spec on | **177 / 153 / 106 / 79 tok/s** — one prompt per cell; the gates since v0.10 read 175–177 / 78–82 at N = 1 / 8 | `cand16-all.log` gate 2 |
+| Decode per stream @32K, spec off | 66 / 62 / 57 / 48 tok/s | `cand16-all.log` gate 2 |
+| Decode per stream @128K, N = 1 / 2, spec on | **115 / 99 tok/s** (v0.10: 133 / 111, see below) | `cand16-all.log` gate 2 |
+| Quality vs the bf16 original | KL 0.0022–0.0027, top-1 99.0–99.1 %, unchanged | v0.10's rows; `cand9-all.log` gate 2 for the new prefill attention |
+
+The decode path is v0.10's bit for bit: the v0.11 library reproduces the v0.10 library's paged-decode logits exactly
+(401 decode steps at N = 3 and 8, with the default flags and with `TQ_PATTN_GQA=0`;
+`docs/evidence/rel11-v010-bitwise.log`), and a round costs what it did (~21 ms @32K, ~25 ms @128K at N = 1). The
+spec-on cells moved with the accepted draft length of their one prompt, which the new prefill attention (not bitwise)
+shifts: 3.78 instead of 3.56 tokens per round @32K N = 1, 2.85 instead of 3.29 @128K. With `TQ_PATTN_GQA=0` the same
+library reads v0.10's 167 tok/s @32K and 130 @128K in v0.10's 84 / 91 rounds (`diag-128k-pattn.log`). The quality rows
+carry over: the decode path is the one they were measured on, and the new attention's prefill rows are within the 95 %
+CI of v0.10's (`cand9-all.log` gate 2).
+
+### Changes
+
 - **Prefill attention on the trellis pool** (`TQ_PATTN_GQA=1`, default since 2026-10-17, main `9c0a046`): one
   GQA-grouped tensor-core kernel with fp32 accumulation instead of the per-head bf16 kernel — attention 17.0 → 9.3 ms
   per 128-column wave at 32K, 67.6 → 34.2 ms at 128K; served-line **TTFT 13.3 → 11.8 s @32K, 77.0 → 60.4 s @128K**.

@@ -232,6 +232,6 @@ docs/FLAGS.md                every engine environment flag and server argument, 
 docs/VARIANTS.md             the 16 GB and 24 GB variants (tables + serve lines)
 docs/legacy-fp6.md           the 2026-08 single-stream FP6 path (serve_openai.py, Dogs, the residual-map hook, its tables)
 docs/QUALITY.md, docs/TQF_FORMAT.md, docs/evidence/   the quality protocol, the file format, the gate logs behind the numbers
-CHANGELOG.md                 what landed in each release (v0.10 = the 2026-10 served stack)
+CHANGELOG.md                 what landed in each release (v0.10 = the 2026-10 served stack, v0.11 = its prefill + hygiene)
 .github/workflows/           CI (compile check, ruff, pytest) and the disabled nightly 5090 gate
 ```

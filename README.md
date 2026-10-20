@@ -1,7 +1,7 @@
 # qwentin
 
 **Qwen3.8-27B on one RTX 5090 (32 GB): 576K pooled context tokens across 12 sessions at FP8 quality, with speculative
-decoding on every stream — 167 / 109 / 81 tok/s per stream at 1 / 4 / 8 streams @32K.**
+decoding on every stream — 177 / 106 / 79 tok/s per stream at 1 / 4 / 8 streams @32K.**
 
 A from-scratch CUDA inference engine for the 27B hybrid-attention Qwen3.6/3.8 model on one consumer Blackwell GPU
 (SM120): hand-written tensor-core kernels behind an OpenAI-compatible server with paged continuous batching. The memory
@@ -11,22 +11,25 @@ comes from EXL3 trellis-quantized weights at 5.75 bpw (quantized with turboderp'
 (Cursor) directed by the maintainer; every number below is backed by a log in [`docs/evidence/`](docs/evidence/README.md),
 and `bench/reproduce.sh` re-measures the served line on your card.
 
-## One 32 GB card (v0.10, 2026-10-17)
+## One 32 GB card (v0.11, 2026-10-20)
 
 | | **qwentin**, 1 × RTX 5090 | vLLM NVFP4, 1 × RTX 5090 (bf16 KV ; fp8 KV) | vLLM FP8, 2 × RTX 5090 (TP2) |
 |---|---|---|---|
 | Weights, KV cache | EXL3 5.75 bpw, 4-bit trellis K+V (16.5 KiB/token) | NVFP4 4.5 bpw, bf16 ; fp8 K+V | FP8, bf16 K+V |
 | Pooled KV capacity | **576K tokens** (12 slots, 29 894 MiB) | 147–179K ; 283K | 493K over two cards |
 | Quality vs bf16 (KL / top-1) | **0.0022–0.0027 / 99.0–99.1 %**, EvalPlus = FP8 | ≈ 0.04 KL (fake-quant estimate) | 0.0037 / 98.7 % |
-| Decode per stream @32K, N = 1 / 4 / 8 | **167 / 109 / 81 tok/s** (65 / 56 / 47 without spec) | 71.5 / 51.4 / — ; 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 |
-| Decode per stream @128K, N = 1 | **133 tok/s** | 55.5 ; 66.0 | 65.8 |
-| Cold TTFT, 32K / 128K | 13.3 / 77.0 s | **3.1 / 25.2 s** ; 3.3 / 30.0 s | **4.4 / 24.1 s** |
+| Decode per stream @32K, N = 1 / 4 / 8 | **177 / 106 / 79 tok/s** (66 / 57 / 48 without spec) | 71.5 / 51.4 / — ; 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 |
+| Decode per stream @128K, N = 1 | **115 tok/s** | 55.5 ; 66.0 | 65.8 |
+| Cold TTFT, 32K / 128K | 11.6 / 59.7 s | **3.1 / 25.2 s** ; 3.3 / 30.0 s | **4.4 / 24.1 s** |
 | Needle in a repository, 32K + 128K | 6/6 | 6/6 | 6/6 |
 
-<sub>qwentin: engine `b2e7a3f`, library md5 `484bdb825c36`, the serve line below, 550 W, CUDA 13.1. Spec-on decode varies
-run to run (157–169 / 74–81 tok/s at N = 1 / 8 across the gate runs) and with the text (3.4–3.6 accepted tokens per round
-on the vLLM-repository corpus of this table, 2.7 on this repository's code, where `bench/reproduce.sh` reads ~129 / 72).
-vLLM `0.32.0rc1.dev281`, same cards, same day; the FP8 checkpoint does not fit one 5090. Cell-by-cell sources:
+<sub>qwentin: engine `dd6d21e`, library md5 `158edd067533`, the serve line below, 550 W, CUDA 13.1. The decode kernels are
+v0.10's bit for bit. Each spec-on cell is one prompt, and its speed follows the accepted draft length, which the v0.11
+prefill attention (`TQ_PATTN_GQA`, not bitwise) shifts for these prompts: 3.78 tokens per round @32K N = 1 (v0.10: 3.56),
+2.85 @128K (3.29), at the same ~21 / 25 ms per round — the same binary with `TQ_PATTN_GQA=0` reads v0.10's 167 / 130
+tok/s. Run to run, the gates since v0.10 read 175–177 / 78–82 tok/s at N = 1 / 8; `bench/reproduce.sh` reads 176 / 79
+with `CORPUS` = the vLLM checkout and ~115 / 75 on this repository's own code (2.45 tokens per round). vLLM
+`0.32.0rc1.dev281`, same cards, 2026-10-17; the FP8 checkpoint does not fit one 5090. Cell-by-cell sources:
 [`docs/evidence/README.md`](docs/evidence/README.md); the story behind the numbers: [`docs/NOTES.md`](docs/NOTES.md).</sub>
 
 Smaller cards, emulated on a 5090 with a capped pool ([`docs/VARIANTS.md`](docs/VARIANTS.md)): **16 GB** — the 4.25 bpw
