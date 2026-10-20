@@ -47,14 +47,6 @@ extern "C" void qwn_free(void) {
         if (m->d_v_scale) cudaFree(m->d_v_scale);
         if (m->d_k_cache4) cudaFree(m->d_k_cache4);
         if (m->d_k_q4s) cudaFree(m->d_k_q4s);
-        if (g_qwen.mtp_fc.d_w) cudaFree(g_qwen.mtp_fc.d_w);
-        if (g_qwen.mtp_q_proj.d_w) cudaFree(g_qwen.mtp_q_proj.d_w);
-        if (g_qwen.mtp_k_proj.d_w) cudaFree(g_qwen.mtp_k_proj.d_w);
-        if (g_qwen.mtp_v_proj.d_w) cudaFree(g_qwen.mtp_v_proj.d_w);
-        if (g_qwen.mtp_o_proj.d_w) cudaFree(g_qwen.mtp_o_proj.d_w);
-        if (g_qwen.mtp_gate.d_w) cudaFree(g_qwen.mtp_gate.d_w);
-        if (g_qwen.mtp_up.d_w) cudaFree(g_qwen.mtp_up.d_w);
-        if (g_qwen.mtp_down.d_w) cudaFree(g_qwen.mtp_down.d_w);
         if (g_qwen.mtp_exl3) {                     // EXL3 MTP projections (paged drafter)
             free_qmma(&g_qwen.mtp_fc_x);
             free_qmma(&m->q_proj); free_qmma(&m->k_proj); free_qmma(&m->v_proj); free_qmma(&m->o_proj);
@@ -460,52 +452,47 @@ static int parse_tqf(const char *path, int upload) {
         if (i % 6 == 0) printf("  layer %d/%d loaded\n", i, g_qwen.L);
     }
 
-    // Native MTP head section (appended after the main payload when the converter
-    // ran with TQ_EMIT_MTP=1). Read order MUST match mtp_tensor_specs() in
-    // tools/convert_qwen_tqf.py. The MTP layer is one full_attention decoder layer.
-    // TQ_NO_MTP=1 skips it (servers without speculative decoding, e.g. serve_batched.py):
-    // the bytes are read past and the engine behaves as for a TQF without the section.
+    // Native MTP head section (appended after the main payload by the converter; read order MUST match
+    // mtp_tensor_specs() in tools/convert_qwen_tqf.py). The MTP layer is one full_attention decoder layer. Only a
+    // head with EXL3 projections (TQ_FLAG_MTP_EXL3, convert_qwen_tqf.py --mtp-exl3) is loaded: the paged drafter
+    // reads it. A bf16 head (FP6 files, the older -mtp.tqf) is read past -- nothing drafts with it, and
+    // qwn_paged_mtp_init refuses the file (-3). TQ_NO_MTP=1 reads past any head, and the engine then behaves as for a
+    // TQF without the section.
     int no_mtp = upload && g_cfg.no_mtp;
     if (g_qwen.has_mtp_section) {
-        int mup = upload && !no_mtp;
+        int mtp_exl3 = (g_qwen.flags & TQ_FLAG_MTP_EXL3) != 0;
+        int mup = upload && !no_mtp && mtp_exl3;
         tq_layer_t *m = &g_qwen.mtp_layer;
         int q_m = g_qwen.nh * g_qwen.hd * 2;
         int kv_m = g_qwen.nkv * g_qwen.hd;
         int attn_m = g_qwen.nh * g_qwen.hd;
-        // All 8 MTP projections are FULL-PRECISION BF16 (non_quant), or EXL3 records with
-        // TQ_FLAG_MTP_EXL3 (--mtp-exl3). Order MUST match mtp_tensor_specs() in tools/convert_qwen_tqf.py.
-        int mtp_exl3 = (g_qwen.flags & TQ_FLAG_MTP_EXL3) != 0;
-        #define TQ_READ_MTP_BF16(W, MM, KK, NAME)                                              \
-            do { (W).M = (MM); (W).K = (KK);                                                   \
-                 if (read_non_quant(f, &(W).d_w, (size_t)(MM) * (KK), NAME, mup) != 0) {        \
-                     fclose(f); return -1; } } while (0)
-        #define TQ_READ_MTP_PROJ(W, XW, MM, KK, NAME)                                          \
-            do { if (mtp_exl3) { if (read_exl3(f, &(XW), (MM), (KK), NAME, mup) != 0) { fclose(f); return -1; } } \
-                 else TQ_READ_MTP_BF16(W, MM, KK, NAME); } while (0)
+        uint16_t *bf16_unread = NULL;
+        #define TQ_READ_MTP_PROJ(XW, MM, KK, NAME)                                                                    \
+            do { if (mtp_exl3) { if (read_exl3(f, &(XW), (MM), (KK), NAME, mup) != 0) { fclose(f); return -1; } }      \
+                 else if (read_non_quant(f, &bf16_unread, (size_t)(MM) * (KK), NAME, 0) != 0) { fclose(f); return -1; } \
+            } while (0)
         if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_emb, g_qwen.H, "mtp.pre_fc_norm_emb", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_hidden, g_qwen.H, "mtp.pre_fc_norm_hidden", mup) != 0) { fclose(f); return -1; }
-        TQ_READ_MTP_PROJ(g_qwen.mtp_fc, g_qwen.mtp_fc_x, g_qwen.H, 2 * g_qwen.H, "mtp.fc");
+        TQ_READ_MTP_PROJ(g_qwen.mtp_fc_x, g_qwen.H, 2 * g_qwen.H, "mtp.fc");
         if (read_non_quant(f, &m->d_input_ln, g_qwen.H, "mtp.input_ln", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &m->d_post_ln, g_qwen.H, "mtp.post_ln", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &m->d_q_norm, g_qwen.hd, "mtp.q_norm", mup) != 0) { fclose(f); return -1; }
         if (read_non_quant(f, &m->d_k_norm, g_qwen.hd, "mtp.k_norm", mup) != 0) { fclose(f); return -1; }
-        TQ_READ_MTP_PROJ(g_qwen.mtp_q_proj, m->q_proj, q_m, g_qwen.H, "mtp.q_proj");
-        TQ_READ_MTP_PROJ(g_qwen.mtp_k_proj, m->k_proj, kv_m, g_qwen.H, "mtp.k_proj");
-        TQ_READ_MTP_PROJ(g_qwen.mtp_v_proj, m->v_proj, kv_m, g_qwen.H, "mtp.v_proj");
-        TQ_READ_MTP_PROJ(g_qwen.mtp_o_proj, m->o_proj, g_qwen.H, attn_m, "mtp.o_proj");
-        TQ_READ_MTP_PROJ(g_qwen.mtp_gate, m->mlp_gate, g_qwen.I, g_qwen.H, "mtp.mlp_gate");
-        TQ_READ_MTP_PROJ(g_qwen.mtp_up, m->mlp_up, g_qwen.I, g_qwen.H, "mtp.mlp_up");
-        TQ_READ_MTP_PROJ(g_qwen.mtp_down, m->mlp_down, g_qwen.H, g_qwen.I, "mtp.mlp_down");
+        TQ_READ_MTP_PROJ(m->q_proj, q_m, g_qwen.H, "mtp.q_proj");
+        TQ_READ_MTP_PROJ(m->k_proj, kv_m, g_qwen.H, "mtp.k_proj");
+        TQ_READ_MTP_PROJ(m->v_proj, kv_m, g_qwen.H, "mtp.v_proj");
+        TQ_READ_MTP_PROJ(m->o_proj, g_qwen.H, attn_m, "mtp.o_proj");
+        TQ_READ_MTP_PROJ(m->mlp_gate, g_qwen.I, g_qwen.H, "mtp.mlp_gate");
+        TQ_READ_MTP_PROJ(m->mlp_up, g_qwen.I, g_qwen.H, "mtp.mlp_up");
+        TQ_READ_MTP_PROJ(m->mlp_down, g_qwen.H, g_qwen.I, "mtp.mlp_down");
         if (read_non_quant(f, &g_qwen.d_mtp_norm, g_qwen.H, "mtp.norm", mup) != 0) { fclose(f); return -1; }
         #undef TQ_READ_MTP_PROJ
-        #undef TQ_READ_MTP_BF16
-        g_qwen.mtp_exl3 = mup && mtp_exl3;
-        if (mup) printf(mtp_exl3 ? "  MTP head section loaded (EXL3 projections: paged drafter only)\n"
-                                 : "  MTP head section loaded (BF16 projections)\n");
+        g_qwen.mtp_exl3 = mup;
+        if (mup) printf("  MTP head section loaded (EXL3 projections: the paged drafter)\n");
         else if (no_mtp) {
             g_qwen.has_mtp_section = 0;
             printf("  MTP head section skipped (TQ_NO_MTP)\n");
-        }
+        } else if (upload) printf("  MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)\n");
     }
 
     long pos = ftell(f);

@@ -113,13 +113,6 @@ typedef struct {
     uint16_t *d_exl3_bf16;    // kbits == 0 only
 } tq_qmma_weight_t;
 
-// Full-precision (BF16) weight, row-major [M, K]. Used for the MTP head projections,
-// which are kept unquantized (the head is tiny; quantizing it costs accept length).
-typedef struct {
-    uint16_t *d_w;
-    int M, K;
-} tq_bf16_weight_t;
-
 typedef struct {
     uint16_t *d_input_ln;
     uint16_t *d_post_ln;
@@ -203,26 +196,11 @@ typedef struct {
     tq_qmma_weight_t lm_head;
     tq_layer_t layers[TQ_MAX_LAYERS];
 
-    // Native MTP (multi-token-prediction) head. The 8 projection weights are kept
-    // FULL-PRECISION BF16 (the head is ~0.42-0.85 GB; quantizing it costs accept for
-    // negligible memory). mtp_layer holds ONLY the norms (input/post/q/k) + the MTP
-    // KV cache; the projections live in dedicated BF16 buffers below.
+    // The native MTP (multi-token-prediction) head of a --mtp-exl3 tqf (TQ_FLAG_MTP_EXL3), read by the paged drafter
+    // (qwn_paged_mtp_*) through the wide path: the 8 projections are EXL3 records in mtp_layer.{q,k,v,o}_proj /
+    // mlp_{gate,up,down} and mtp_fc_x, the norms in mtp_layer.d_{input,post}_ln / d_{q,k}_norm and the three below.
+    // mtp_exl3 = 1 when it is loaded (a bf16 head is never loaded: nothing drafts with it).
     tq_layer_t mtp_layer;
-    tq_bf16_weight_t mtp_fc;        // [H, 2H]
-    tq_bf16_weight_t mtp_q_proj;    // [nh*hd*2, H]
-    tq_bf16_weight_t mtp_k_proj;    // [nkv*hd, H]
-    tq_bf16_weight_t mtp_v_proj;    // [nkv*hd, H]
-    tq_bf16_weight_t mtp_o_proj;    // [H, nh*hd]
-    tq_bf16_weight_t mtp_gate;      // [I, H]
-    tq_bf16_weight_t mtp_up;        // [I, H]
-    tq_bf16_weight_t mtp_down;      // [H, I]
-    // E2M3-quantized copies of the MTP head projections (packed on first batched
-    // tree build; the BF16 originals stay for the sequential fallback). Order:
-    // fc, q, k, v, o, gate, up, down.
-    // TQ_FLAG_MTP_EXL3 (tqf from convert_qwen_tqf.py --mtp-exl3): the 8 projections are EXL3 records
-    // loaded into mtp_layer.{q,k,v,o}_proj / mlp_{gate,up,down} and mtp_fc_x, read by the paged drafter
-    // (qwn_paged_mtp_*) through the wide path; the bf16 buffers above stay NULL and the single-stream
-    // MTP entry points refuse (-40).
     tq_qmma_weight_t mtp_fc_x;
     int mtp_exl3;
     uint16_t *d_mtp_pre_fc_norm_emb;

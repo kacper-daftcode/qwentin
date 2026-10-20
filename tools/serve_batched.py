@@ -1326,8 +1326,8 @@ def main():
                          "(10 KB) is read over PCIe. Overrides TQ_EMBED_FP8.")
     ap.add_argument("--no-embed-host", dest="embed_host", action="store_false")
     ap.add_argument("--mtp", dest="mtp", action="store_true", default=False,
-                    help="load the tqf's MTP head (0.85 GB bf16, 0.21 GB as EXL3 records). Only --spec uses it, so by "
-                         "default TQ_NO_MTP=1 skips it.")
+                    help="load the tqf's EXL3 MTP head (0.21 GB; the engine never loads a bf16 head). Only --spec uses "
+                         "it, so by default TQ_NO_MTP=1 skips it.")
     ap.add_argument("--kv-v4", dest="kv_v4", action="store_true", default=True,
                     help="store V like K in the paged pool (TQ_KV_V4=1, default): FWHT-256 rotated int4, asymmetric "
                          "per 32 channels, 20.0 instead of 26.2 KiB per token (+31%% pooled tokens in the same pool "
@@ -1394,7 +1394,7 @@ def main():
     if args.spec:
         has_mtp4 = tqf_has_exl3_mtp(args.tqf)
         if has_mtp4 is False:
-            # Decided before qwn_init so the bf16 MTP head of an older -mtp.tqf is not loaded for nothing (TQ_NO_MTP=1).
+            # Decided before qwn_init: TQ_NO_MTP below follows args.mtp.
             args.spec_off_reason = (f"{os.path.basename(args.tqf)} has no EXL3 MTP section (header flag 0x1000); "
                                     f"speculative decoding needs the --mtp-exl3 tqf (...-mtp4.tqf)")
             print(f"[spec] WARNING: speculative decoding OFF: {args.spec_off_reason} (--no-spec silences this)", flush=True)

@@ -54,7 +54,7 @@ The two production formats and what `tools/inspect_tqf.py` checks for its PASS /
 - **EXL3 + MTP** (the served format, `tools/serve_batched.py --spec`): `0x800 | 0x400 | 0x1000`, i.e. `0x1c1d`.
   Written from an exllamav3 checkpoint with `--mtp-exl3`. 21.3 GB for opt-5.75, 16.7 GB for t45-s425.
 
-Other combinations run (`0xc1d` = EXL3 with a bf16 MTP head, the `-mtp.tqf` of the single-stream MTP tools;
+Other combinations run (`0xc1d` = EXL3 with a bf16 MTP head, an older `-mtp.tqf` whose head the engine reads past;
 `0x1d` = plain global-scale FP8 without the drafter, what the pre-2026-10 converter defaults produced from a bf16
 checkpoint) but are not what the README measured; the verdict lines say so.
 
@@ -114,8 +114,9 @@ Appended right after the main payload, in this order (`mtp_tensor_specs()` in th
 [h]`, `pre_fc_norm_hidden [h]`, `fc [h, 2h]`, `layers.0.input_layernorm [h]`, `layers.0.post_attention_layernorm [h]`,
 `q_norm [hd]`, `k_norm [hd]`, `q_proj [2·A·hd, h]`, `k_proj [KV·hd, h]`, `v_proj [KV·hd, h]`, `o_proj [h, A·hd]`,
 `gate_proj [i, h]`, `up_proj [i, h]`, `down_proj [h, i]`, `norm [h]`. The norms are `non_quant`; the 8 projections are
-`non_quant` bf16 matrices (0.85 GB for the 27B; the single-stream MTP tools and `--mtp-source`) or, with `0x1000`,
-EXL3 records (0.25 GB on the device; the batched server's paged drafter, `--mtp-exl3`).
+`non_quant` bf16 matrices (0.85 GB for the 27B; `--mtp-source` and the FP6 recipe write them, the engine reads past them
+since v0.11 -- the single-stream path that drafted with them is retired) or, with `0x1000`, EXL3 records (0.25 GB on the
+device; the batched server's paged drafter, `--mtp-exl3`).
 
 ## Format version 2: recorded size, hashes, and a loader that refuses
 

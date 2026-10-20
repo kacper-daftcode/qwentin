@@ -1300,7 +1300,7 @@ def main() -> None:
     parser.add_argument(
         "--mtp-source",
         default=None,
-        help="Model directory to take the bf16 MTP head from (an EXL3 checkpoint quantizes it): writes the -mtp.tqf for the single-stream MTP tools",
+        help="Model directory to take the bf16 MTP head from (an EXL3 checkpoint quantizes it): writes a -mtp.tqf, whose bf16 head the engine reads past since v0.11 (the paged drafter needs --mtp-exl3)",
     )
     parser.add_argument(
         "--mtp-exl3",

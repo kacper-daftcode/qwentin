@@ -418,7 +418,7 @@ def verdict_exl3_mtp(flags: int, payload_ok: bool) -> tuple[bool, str]:
         return False, ("EXL3 weights but no MTP section: serve_batched.py runs with speculative decoding OFF "
                        "(reconvert with --mtp-exl3)")
     if not flags & FLAG_MTP_EXL3:
-        return False, ("EXL3 weights with a bf16 MTP head (a `-mtp.tqf` for the single-stream MTP tools): the batched "
+        return False, ("EXL3 weights with a bf16 MTP head (an older `-mtp.tqf`; the engine reads past it): the batched "
                        "server's paged drafter needs the EXL3 MTP records (reconvert with --mtp-exl3) -> --spec OFF")
     if not payload_ok:
         return False, "payload size does not match the header (truncated or foreign file)"
