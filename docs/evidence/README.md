@@ -113,6 +113,12 @@ moved out of this repository together with the steering maps it was measured for
 | ten experiment switches of the served path removed, their defaults hard-coded (main `dd6d21e`, library md5 `158edd067533` — **v0.11**) | `cand15-all.log` (2026-10-20 07:15–07:26 UTC) | gate 1: SASS identical, bitwise at N = 3 / 8 and 32K × 2 slots; gate 2: spec exactness 4K + 32K; gate 3: the served line, needle 6/6 (TTFT 11.6–11.7 / 59.7–59.8 s), A/B 10/10, 177 / 80 tok/s |
 | the served line on the version-2 `.tqf`; the v0.11 numbers | `cand16-all.log` (07:37–07:54 UTC) | see the first section |
 
+## Since v0.11 (CHANGELOG "Unreleased")
+
+| change | file | what the gate proved |
+|---|---|---|
+| the single-stream path retired: 138 → 55 entry points, 398 → 211 kernels, 119 → 34 `TQ_*` switches (main `cand-1207`) | `cand17-all.log` (2026-10-20; `scripts/cand17-all.sh`) | gate 0: the library exports exactly `src/qwentin.h`'s 55 entry points; gate 1: 187 kernels gone, 210 of the 211 left with identical SASS, the one that differs is the single-stream decoder's `k_tq_full_attn_decode`; paged-decode logits bitwise at N = 3 / 8, with the MTP drafter's trunk hooks on, and at 32K × 2 slots; gate 2: spec exactness 4K + 32K; gate 3: the decoder (`qwn_decode`, FP6 file) bitwise — teacher-forced argmax, greedy continuations and the paged logits after loading its KV (`analysis/oracle_ab.py` of the research repo) — and `tools/paged_smoke.py` line for line; gate 4: an FP6 file on the batched path bitwise (paged logits) and served (needle 3/3, the same answers); gate 5: the served line as `cand16` (needle 6/6, A/B 10/10 with the same texts) |
+
 ## Reading the logs
 
 - `[plab] ... bitwise identical ... True (max |d| 0)` — `tools/paged_logit_ab.py` dumped 25 paged-decode steps of raw

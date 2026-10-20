@@ -1,0 +1,56 @@
+[cand17-all] start 09:27:39; cand 1be5daa15c3d = 843cd59 docs: the single-stream path retired -- legacy-fp6.m; served 158edd067533
+== gate 0: ruff + pytest, the exported ABI   09:27:39
+[1;32mAll checks passed![0m
+23 passed, 2 skipped in 0.73s
+25 passed in 0.72s
+   exported qwn_*: 55, qwentin.h: 55
+[gate0] PASS
+== gate 1: per-kernel SASS + bitwise vs the served library   09:27:40
+kernels: old 398, new 211, common 211; identical 210, different 1
+   removed kernels: 187
+[plab] N=3 cand-1207 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1207 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (v2 file), cand-1207 vs served: bitwise True (25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1207 vs served: bitwise True (16 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K + 32K   09:30:17
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: the test decoder (FP6 file), old vs new   09:31:35
+[oracle] 14 tensors (1800 teacher-forced argmax, greedy continuations, paged logits after the oracle's KV): bitwise True
+   paged_smoke:   -> 8/8 argmax match   -> 7/8 seed match; wave T=108 cols, 1 weight-read for all clients 
+     client 0: gen=64 leading-match-vs-single=1/64  text=' changed over time. It is a field that is both a par
+     client 1: gen=64 leading-match-vs-single=64/64  text=' state of a particle. For a free particle in one di
+     client 2: gen=64 leading-match-vs-single=46/64  text=' if n == 0:\n        return 0\n    elif n == 1:\n  
+     client 3: gen=64 leading-match-vs-single=53/64  text=' simple dough made from flour, water, yeast, salt, 
+     client 4: gen=64 leading-match-vs-single=58/64  text=' variety of methods, including weather stations, sa
+     client 5: gen=64 leading-match-vs-single=14/64  text=' Third Estate, representing the common people, decl
+     client 6: gen=64 leading-match-vs-single=21/64  text=' a loss function that measures how far the networkâ
+     client 7: gen=64 leading-match-vs-single=8/64  text=' cell. It is the site of the electron transport chai
+   paged_smoke: the same lines with both libraries; --selftest: 8 clients x 64 tokens with both
+[gate3] PASS
+== gate 4: FP6 on the batched path   09:33:55
+[plab] FP6 file, Q4 pool, N=3: cand-1207 vs served bitwise True (25 tensors)
+[plab] FP6 file, Q4 pool, N=8: cand-1207 vs served bitwise True (25 tensors)
+   [   32k depth=0.95 rep=0] PASS prompt=32596 ttft=12.952s e2e=13.123s ans='FF-699212-PR' exp=['FF-699
+   [   32k depth=0.50 rep=0] PASS prompt=32596 ttft=12.926s e2e=13.092s ans='UI-672763-WB' exp=['UI-672
+   [   32k depth=0.05 rep=0] PASS prompt=32602 ttft=12.924s e2e=13.107s ans='ZU-821600-AR' exp=['ZU-821
+   FP6 server: needle 3/3, the same answers as the served library
+[gate4] PASS
+== gate 5: THE SERVED LINE (v2 file), pure defaults   09:36:32
+   server up after 10 s, pid 136965, 29894 MiB
+   576000 pooled tokens
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.814s e2e=11.858s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.681s e2e=11.724s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.692s e2e=11.756s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.964s e2e=60.015s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.029s e2e=60.08s ans='AB-416549-JJ' exp=['AB-416
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.083s e2e=60.134s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[ab-vs-v011] prompts identical True; texts identical to cand16 (the v0.11 library, same file): on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 176.8 (min 176.8, max 176.8), aggregate 176.8; 300 tokens in 1.8s; rounds 79 steps 79 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 75.8 (min 74.8, max 86.8), aggregate 623.5; 2400 tokens in 4.7s; rounds 138 steps 138 tokens/round
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1, texts = cand16: 1; speed rc 0
+[gate5] PASS
+== ALL PASS   09:43:19  (landing: build-qwen/ := the candidate, main := cand-1207 (ff), patches 0111-0113)
