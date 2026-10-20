@@ -39,6 +39,11 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
   a newer format, a truncated copy, a corrupted header or payload and unknown flags with distinct codes (-40 … -45);
   `tools/inspect_tqf.py --verify` does the same offline. Version-1 files load as before; re-converting the served
   `-mtp4.tqf` gives the same payload byte for byte plus the extension (docs/TQF_FORMAT.md).
+- Ten experiment switches of the served path removed, their defaults hard-coded (bitwise: today's behaviour is the
+  default branch): the sweep overrides `TQ_PATTN_S`, `TQ_WIDE_ATTN_SPLIT`, `TQ_EXL3_WIDE_NG`, `TQ_PAGED_SPLIT`,
+  `TQ_BFRAG_BDIM`; the never-adopted opt-in `TQ_VF_NG8`; `TQ_VF_SPLIT_BY_SLOTS` (its other value broke the
+  spec-exactness guarantee); and the bitwise-either-way `TQ_VF_COMMIT_FUSED`, `TQ_VF_SEG_ATTN`, `TQ_FUSE_NORM`. None was
+  documented or used by a tool. Debug switches are now listed in docs/FLAGS.md.
 - Tools: the default `--lib` is this repository's `build-qwen/libforward_qwen.so` (was a path on the development box),
   and both servers require `--tqf` / `--model-dir` instead of defaulting to files that do not exist.
 

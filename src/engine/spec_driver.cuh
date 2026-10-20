@@ -749,16 +749,11 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
 // Wide MLP for a chunk of n tokens: post-rmsnorm(resid) -> gate/up (wide, shared B-frag)
 // -> silu*mul -> down (wide) -> layer_out = resid + down. resid and layer_out are [n x H]
 // (token-major); may NOT alias. Returns 0; -1 if mlp weights aren't e2m3-SF (caller falls back).
-// TQ_FUSE_NORM (default 1): the decode/verify steps fuse (a) the residual add after o_proj / out_proj with the
-// post-attention norm, (b) SiLU * up into the down projection's fragment build, (c) the layer's final residual add
-// with the NEXT layer's input norm (the final norm after the last layer). Same expressions, same reduction order ->
-// bitwise identical to the separate kernels (k_tq_add_rmsnorm_b has k_tq_qwen_rmsnorm_b's reduction); -128 launches
-// per step. TQ_FUSE_NORM=0 reverts to the separate kernels.
-static int tq_fuse_norm(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_FUSE_NORM"); c = (e && *e) ? (atoi(e) != 0) : 1; }
-    return c;
-}
+// With EXL3 weights the decode/verify steps fuse (a) the residual add after o_proj / out_proj with the post-attention
+// norm, (b) SiLU * up into the down projection's fragment build, (c) the layer's final residual add with the NEXT
+// layer's input norm (the final norm after the last layer). Same expressions, same reduction order -> bitwise identical
+// to the separate kernels (k_tq_add_rmsnorm_b has k_tq_qwen_rmsnorm_b's reduction); -128 launches per step. The other
+// weight formats take the separate kernels.
 // add_a/add_b (optional): resid = add_a + add_b is computed here, fused with the post norm. next_ln/next_norm
 // (optional): the final residual add also writes next_norm = rmsnorm(layer_out, next_ln).
 static int wide_mlp(tq_layer_t *l, float *resid, float *layer_out, int n,
@@ -783,7 +778,7 @@ static int wide_mlp(tq_layer_t *l, float *resid, float *layer_out, int n,
     const tq_qmma_weight_t *gu[2] = {&l->mlp_gate, &l->mlp_up};
     float *gu_out[2] = {g_wide_gate, g_wide_up};
     if ((ret = wide_proj_group(gu, gu_out, 2, n)) != 0) return ret;
-    if (exl3_ok && tq_fuse_norm()) {
+    if (exl3_ok) {
         // the down projection's fragment build applies silu(gate) * up itself
         if ((ret = wide_quant_input(g_wide_gate, I, n)) != 0) return ret;
         g_exl3_x2 = g_wide_up;

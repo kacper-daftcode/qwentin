@@ -124,15 +124,8 @@ __global__ void k_tq_quantize_bfrag_pow2_fused_nk_fast(uint8_t *__restrict__ b,
 // blockDim for the fast quantizer. With 64KB shared (nvar=128) only one block
 // fits per SM, so more warps = better latency hiding; but for small nvar a huge
 // block wastes warps and inflates the reduction, so scale threads with the work
-// (32*nvar float4 loads per 128-K block). Overridable via TQ_BFRAG_BDIM.
+// (32*nvar float4 loads per 128-K block).
 static int tq_bfrag_bdim(int nvar) {
-    static int forced = -1;
-    if (forced < 0) {
-        const char *e = getenv("TQ_BFRAG_BDIM");
-        forced = e ? atoi(e) : 0;
-        if (forced && (forced < 32 || forced > 1024 || (forced & 31))) forced = 0;
-    }
-    if (forced) return forced;
     int work = 32 * nvar;                          // float4s per 128-K block
     return work <= 256 ? 256 : (work <= 512 ? 512 : 1024);
 }

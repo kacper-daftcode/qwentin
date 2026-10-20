@@ -133,7 +133,7 @@ static int run_paged_decode_step_graph(const int *tokens, const int *slot_ids_h,
     // the GQA key-split count the launcher will pick for this step (and its partials, allocated before the capture)
     int S = paged_attn_split_S(N, dec_maxpos, 1);
     if (S > 1 && ensure_attn_partials((size_t)g_qwen.nh * N * S) != 0) S = 1;
-    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    const int fuse = (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) != 0;
     unsigned long long key = 1ull;                                   // kind 1 = decode step
     key = (key << 8) | (unsigned)N;
     key = (key << 8) | (unsigned)S;

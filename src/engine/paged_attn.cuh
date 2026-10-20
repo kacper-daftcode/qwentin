@@ -2006,11 +2006,8 @@ static int paged_attn_split_S(int N, int pos_max, int qt) {
 }
 
 // pick S so nh*N*S ~ 4x SM count, but only when few-client + long-ctx (else S=1 -> single kernel,
-// so short-ctx / high-concurrency is byte-for-byte unchanged). TQ_PAGED_SPLIT overrides (0=off).
+// so short-ctx / high-concurrency is byte-for-byte unchanged).
 static int paged_split_S(int N, int max_pos) {
-    static int forced = -2;
-    if (forced == -2) { const char *e = getenv("TQ_PAGED_SPLIT"); forced = e ? atoi(e) : -1; }
-    if (forced >= 0) return forced < 1 ? 1 : forced;
     int total = max_pos + 1, sm = paged_sm_count(), blocks0 = g_qwen.nh * N;
     if (blocks0 >= 2 * sm || total < 2048) return 1;     // already enough blocks / short ctx
     int s_occ = (6 * sm + blocks0 - 1) / blocks0;        // aim ~6x SMs of blocks

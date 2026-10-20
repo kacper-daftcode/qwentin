@@ -26,21 +26,6 @@ struct tq_vf_lp { float *x; const float *b; const float *a; void *recur; float *
                   const uint16_t *conv_w; const float *A_log; const uint16_t *dt_bias; };
 #define TQ_VF_MAX_T 64
 #define TQ_VF_MAX_SEG 256
-// TQ_VF_SPLIT_BY_SLOTS=1 (default): the verify's GEMM k-splits and attention key-splits are picked for its slot
-// count, not its column count, so the committed tokens equal plain decode's at that client count bit for bit
-// (except a wave crossing a 128-key tile boundary); 0 = pick by columns (slightly faster at T >= 16).
-static int vf_split_by_slots(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_VF_SPLIT_BY_SLOTS"); c = (e && *e) ? (atoi(e) != 0) : 1; }
-    return c;
-}
-// TQ_VF_SEG_ATTN=1 (default): the verify's full-attention layers stream each slot's K/V once per sub-segment of up
-// to 32/group columns (k_tq_paged_attn_q4_gqa_seg) instead of once per column; 0 = the per-column decode kernel.
-static int vf_seg_attn(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_VF_SEG_ATTN"); c = (e && *e) ? (atoi(e) != 0) : 1; }
-    return c;
-}
 static int    g_vf_cap = 0;                          // columns the kept-input buffers hold
 static float *g_vf_x[TQ_MAX_LAYERS] = {0};           // per linear layer: pre-conv in_proj_qkv output [cap][conv_dim]
 static float *g_vf_b[TQ_MAX_LAYERS] = {0};           // [cap][lvh]
@@ -369,8 +354,10 @@ static int paged_verify_prep(const int *tokens, const int *col_slot, const int *
     cudaMemcpyAsync(g_vf_seg_d + 2 * TQ_VF_MAX_SEG, h_vf_seg_len, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     // each column's GQA key-split count = the one a decode step would pick at ITS position (a wave can span a
     // tile boundary where the context clamp changes S), so the attention bits match the step's column by column
+    // the full-attention layers stream each slot's K/V once per sub-segment of up to 32/group columns
+    // (k_tq_paged_attn_q4_gqa_seg) instead of once per column, when the group fits one m16 tile
     int vf_qt = 1;
-    if (vf_seg_attn() && g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
+    if (g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
         int group = g_qwen.nh / g_qwen.nkv, nmax = 0;
         for (int k = 0; k < K; k++) if (seg_len[k] > nmax) nmax = seg_len[k];
         vf_qt = (nmax * group <= 16) ? 1 : 2;
@@ -382,7 +369,7 @@ static int paged_verify_prep(const int *tokens, const int *col_slot, const int *
         g_attn_col_S = g_vf_colS; g_attn_col_S_max = smax;
     }
     g_attn_seg_cnt = 0;
-    if (vf_seg_attn() && g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
+    if (g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
         // sub-segments of <= QT*16/group columns; QT = 1 when every segment fits one m16 tile, else 2
         int group = g_qwen.nh / g_qwen.nkv, nmax = 0;
         for (int k = 0; k < K; k++) if (seg_len[k] > nmax) nmax = seg_len[k];
@@ -420,7 +407,7 @@ static int paged_verify_body(const int *tokens, const int *col_slot, const int *
         for (int j = 0; j < T; j++)
             k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
                 g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
-    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    const int fuse = (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) != 0;
     int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
@@ -516,7 +503,7 @@ static int run_paged_verify_graph(const int *tokens, const int *col_slot, const 
     int ret = paged_verify_prep(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T, 1, &vf_maxpos, &tiles);
     if (ret == -92) return 1;
     if (ret != 0) return ret;
-    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    const int fuse = (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) != 0;
     unsigned long long key = 2ull;                                   // kind 2 = verify wave
     key = (key << 8) | (unsigned)K;
     key = (key << 8) | (unsigned)T;
@@ -577,12 +564,11 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     int pdl = tq_pdl_enabled();
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
-    // TQ_VF_NG8=1: waves of more than 32 columns take 64-token GEMM units (fp16 accumulators, the prefill waves'
-    // regime) instead of two 32-token passes; the verify is then no longer bitwise the decode step's (default off).
-    static int ng8 = -1;
-    if (ng8 < 0) { const char *e = getenv("TQ_VF_NG8"); ng8 = (e && *e) ? (atoi(e) != 0) : 0; }
-    g_exl3_ng_max = (ng8 && T > 32) ? 8 : 4;
-    g_split_n_override = vf_split_by_slots() ? K : 0;
+    // 32-token GEMM units, and the GEMM k-splits / attention key-splits of the slot count rather than the column
+    // count: the committed tokens equal plain decode's at that client count bit for bit (except a wave crossing a
+    // 128-key tile boundary)
+    g_exl3_ng_max = 4;
+    g_split_n_override = K;
     g_vf_K = 0;
     int ret = 1;
     if (tq_graph_enabled() >= 2) ret = run_paged_verify_graph(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
@@ -633,9 +619,7 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
     const int *d_cslot = g_vf_cseg_d, *d_coff = g_vf_cseg_d + TQ_VF_MAX_SEG, *d_clen = g_vf_cseg_d + 2 * TQ_VF_MAX_SEG;
     int pdl = tq_pdl_enabled();
     g_pdl_small = pdl == 2;
-    static int fused = -1;
-    if (fused < 0) { const char *e = getenv("TQ_VF_COMMIT_FUSED"); fused = (e && *e) ? (atoi(e) != 0) : 1; }
-    if (fused && g_vf_lp) {
+    if (g_vf_lp) {
         // all 48 linear layers in two launches (grid.z = layer): 48 x 8 x 192 blocks fill the GPU instead of 48 x 1.13
         // waves of a 1536-block launch; the per-thread math (and so the state) is the per-layer kernels' bit for bit
         int heads = lvh, dim = ld, lc_g = linear_core_par_g(), lc_hs = linear_core_hs();

@@ -420,7 +420,7 @@ static int paged_decode_body(const int *tokens, const int *slot_ids_h, const int
         for (int j = 0; j < N; j++)
             k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
                 g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
-    const int fuse = tq_fuse_norm() && (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS);
+    const int fuse = (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) != 0;
     int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];

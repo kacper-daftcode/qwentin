@@ -703,8 +703,6 @@ static int exl3_unit_ng(int N, int MB) {
     int g = wide_ng(N);
     if (g <= 4) return g;
     if (g_exl3_ng_max < 8) return g_exl3_ng_max;
-    const char *e = getenv("TQ_EXL3_WIDE_NG");          // A/B override
-    if (e && *e) { int v = atoi(e); if (v == 4 || v == 8 || v == 16) return v; }
     // measured (5090, 128 tokens, fp16-accumulate MMAs): 64-token units are the best trade
     // between dequant amortization and k-split partial traffic for every projection except the
     // lm_head, whose 1940 feature blocks fill the GPU with 128-token units and no split

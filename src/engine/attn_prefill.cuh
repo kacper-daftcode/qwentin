@@ -1379,17 +1379,11 @@ static int pattn_gqa_mode(void) {
     if (c < 0) { const char *e = getenv("TQ_PATTN_GQA"); c = (e && *e) ? atoi(e) : 1; }
     return c;
 }
-static int pattn_split_override(void) {                 // TQ_PATTN_S: force the key-split count (experiments)
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_PATTN_S"); c = e ? atoi(e) : 0; }
-    return c;
-}
 static float *g_pattn_part = NULL;
 static size_t g_pattn_part_f = 0;
 static int g_pattn_sms = 0;
 // Key-split count: about one block per SM (nkv x nblk x S ~ SMs), at least 16 tiles (512 keys) per split, <= 16.
 static int pattn_split_S(int nkv, int nblk, int max_pos) {
-    if (pattn_split_override() > 0) return pattn_split_override();
     if (g_pattn_sms <= 0) { cudaDeviceGetAttribute(&g_pattn_sms, cudaDevAttrMultiProcessorCount, 0); if (g_pattn_sms <= 0) g_pattn_sms = 170; }
     int S = g_pattn_sms / (nkv * nblk);
     const int nst = (max_pos + TQ_PA_TK) / TQ_PA_TK;
@@ -1466,15 +1460,9 @@ static int launch_pattn_t4(float *out, const float *q_proj, const uint16_t *q_no
 
 // S key-chunks for a wide-prefill attention launch over prefix [0..max_pos]:
 // 1 (bit-identical single pass) until the prefix outgrows what nh x nqt blocks
-// keep parallel, then ~1 chunk per TQ_WIDE_ATTN_SPLIT positions, capped at 8.
+// keep parallel, then ~1 chunk per 16384 positions, capped at 8.
 static int wide_attn_split_S(int max_pos) {
-    static int chunk = -1;
-    if (chunk < 0) {
-        const char *e = getenv("TQ_WIDE_ATTN_SPLIT");
-        chunk = e ? atoi(e) : 16384;
-        if (chunk == 0) chunk = 1 << 30;               // 0 = never split
-        if (chunk < 2048) chunk = 2048;
-    }
+    const int chunk = 16384;
     int S = max_pos >= 0 ? (max_pos + chunk) / chunk : 1;
     if (S > 8) S = 8;
     return S < 1 ? 1 : S;
