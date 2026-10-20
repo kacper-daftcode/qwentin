@@ -3,8 +3,8 @@
 The engine's feature list ("Highlights"), the pipeline from a HuggingFace checkpoint to a served token ("How it
 works"), the conversion details and the full repository layout — moved from the 2026-10-17 README at v0.10. Flags:
 [`FLAGS.md`](FLAGS.md); the numbers and where they come from: the [README](../README.md) and
-[`evidence/README.md`](evidence/README.md); the narrative of the 2026-10 build: [`NOTES.md`](NOTES.md); the 2026-08
-single-stream FP6 path: [`legacy-fp6.md`](legacy-fp6.md).
+[`evidence/README.md`](evidence/README.md); the narrative of the 2026-10 build: [`NOTES.md`](NOTES.md); FP6 models and
+the retired 2026-08 single-stream path: [`legacy-fp6.md`](legacy-fp6.md).
 
 qwentin is a from-scratch CUDA inference engine for the 27B hybrid-attention Qwen3.6/3.8 tower
 on one consumer Blackwell GPU (SM120), with hand-written tensor-core kernels and an
@@ -12,10 +12,10 @@ OpenAI-compatible API, so any client — including an `opencode`/`continue`-styl
 can use it. Since 2026-10 the primary path is the **batched server** (`tools/serve_batched.py`):
 paged KV + continuous batching, EXL3 weights straight from an exllamav3 checkpoint, the
 trellis-coded KV cache, an EXL3 MTP drafter for speculative decoding, host-RAM parking of idle
-sessions. The 2026-08 **FP6 single-stream path** (`tools/serve_openai.py`, FP6 E2M3 weights +
-int4/E4M3 KV + MTP tree, the residual-stream steering hook, Reservoir Dogs) is still in the tree
-and documented in [`legacy-fp6.md`](legacy-fp6.md) as the legacy single-stream path. Qwen3.6-27B shares the
-text-tower layout and runs identically on the FP6 path (the EXL3 path was measured on Qwen3.8 only).
+sessions. The 2026-08 single-stream server (`tools/serve_openai.py`: FP6 MTP tree, the residual-stream
+steering hook, Reservoir Dogs) was retired after v0.11; FP6 E2M3 files still serve on the batched server
+([`legacy-fp6.md`](legacy-fp6.md)). Qwen3.6-27B shares the text-tower layout of Qwen3.8-27B (the EXL3 path was
+measured on Qwen3.8 only).
 
 ## Highlights
 
@@ -62,9 +62,6 @@ text-tower layout and runs identically on the FP6 path (the EXL3 path was measur
   `mma.sync ...kind::mxf8f6f4.block_scale` for FP6, fp16 HMMA with on-the-fly trellis dequant for
   EXL3, GQA decode attention, chunkwise DeltaNet, the trellis Viterbi encoder), compiled by the
   stock CUDA 13 `nvcc`/`ptxas` — no external assembler or precompiled cubins.
-- **Legacy single-stream path (FP6 E2M3 + int4 KV + MTP tree, `serve_openai.py`).**   256K in one
-  session on 32 GB, 137–157 tok/s at short context (200+ on prefix-cached turns), the
-  residual-stream steering hook (`--residual-map`), Reservoir Dogs — [`legacy-fp6.md`](legacy-fp6.md).
 
 > Research engine. SM120-only, wired for the Qwen3.6/3.8-27B layout (64 layers, 5120 hidden,
 > 16 full-attn / 48 gated-DeltaNet). Every 2026-10 number here was measured on one RTX 5090 at a
@@ -120,18 +117,16 @@ EXL3 checkpoint ──convert_qwen_tqf.py --mtp-exl3──▶  model-mtp4.tqf  (
 - **Scheduler.** Continuous batching over 12 slots; admission = free slot + enough free pages;
   SRPT prefill order; slot-level prefix cache (a follow-up whose prompt extends a slot's history
   prefills only the suffix); LRU parking of evicted sessions to pinned host RAM at 37–45 GB/s.
-- **Legacy FP6 path.** FP6 E2M3 block-scaled weights (`mma.sync ...mxf8f6f4.block_scale`, FP6
-  `ldmatrix ...b6x16` unpack), int4-K/E4M3-V KV, the MTP covering tree + batched FP6 verify, the
-  wide prefill — as described in [`legacy-fp6.md`](legacy-fp6.md); `serve_openai.py` still needs an
-  E2M3 tqf (it does not load EXL3 weights).
+- **FP6 weights.** FP6 E2M3 block-scaled weights (`mma.sync ...mxf8f6f4.block_scale`) in the batched path's
+  GEMV / wide GEMM (`--no-kv-t4 --no-spec`; [`legacy-fp6.md`](legacy-fp6.md)); the single-stream decoder
+  `qwn_decode` stays as the test oracle of `serve_batched.py --selftest` and `tools/paged_smoke.py`.
 
 ## Converting a model — the annotated recipe (EXL3, the served format)
 
-The README's "Quick start" has the short form of this; the FP6 E2M3 format of the single-stream path is in
-[`legacy-fp6.md`](legacy-fp6.md). The quantizer is stock upstream
+The README's "Quick start" has the short form of this; the FP6 E2M3 format is in [`legacy-fp6.md`](legacy-fp6.md). The quantizer is stock upstream
 [exllamav3](https://github.com/turboderp-org/exllamav3) at commit `02aef45` or newer (it carries `convert.py -rcp`
 and the `sc_measure.py` / `sc_optimize.py` sensitivity pipeline); its input must be the **original bf16**
-`Qwen/Qwen3.8-27B` — quantizing from the FP8 checkpoint costs +0.003 KL (double quantization). The FP6 legacy path
+`Qwen/Qwen3.8-27B` — quantizing from the FP8 checkpoint costs +0.003 KL (double quantization). The FP6 recipe
 converts either checkpoint. Python: 3.10 or newer (measured with 3.14) with `torch`, `transformers`, `numpy`,
 `safetensors`, `tokenizers`; the HTTP verification tools also need `httpx` — the measured versions are pinned in
 `requirements.txt` / `pyproject.toml`.
@@ -169,9 +164,8 @@ TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-t45-s4
 per-bitrate histogram, byte-exact size check) and prints two verdict lines — `verdict EXL3 + MTP ...
 PASS` is the file `--spec` needs (bits `0x800`, `0x400` and `0x1000` set; `--expect exl3-mtp` makes
 that an exit code). `--mtp-source /path/to/Qwen3.8-27B` instead of `--mtp-exl3` writes a bf16 MTP
-head (`-mtp.tqf`) for the single-stream MTP tools; the batched server's drafter needs the EXL3 one
-(the converter warns when an EXL3 source is converted without either). Only `serve_batched.py` runs
-EXL3 files; `serve_openai.py` needs the FP6 format ([`legacy-fp6.md`](legacy-fp6.md)). The format itself:
+head (`-mtp.tqf`), which nothing drafts with any more; the batched server's drafter needs the EXL3 one
+(the converter warns when an EXL3 source is converted without either). The format itself:
 [`TQF_FORMAT.md`](TQF_FORMAT.md).
 
 ## Repository layout, in full
@@ -180,15 +174,13 @@ EXL3 files; `serve_openai.py` needs the FP6 format ([`legacy-fp6.md`](legacy-fp6
 src/forward_qwen.cu          the engine's one CUDA translation unit: it includes qwentin.h, then the src/engine/ parts in order
 src/qwentin.h                the C ABI (all qwn_* entry points), generated by tools/gen_qwentin_h.py; a definition that
                              drifts from it does not compile
-src/engine/*.cuh             the engine in 26 parts (~30k lines; each part's first line says what it holds): FP6
-                             single-stream path, paged pool (int4 / FP4 / trellis KV), EXL3 GEMM/GEMV, paged verify /
-                             commit / MTP drafter, DeltaNet state formats, CUDA-graph decode step, parking ring; the
-                             .tqf loader and qwn_init in loader.cuh, the paged pool's init in paged_t4.cuh
+src/engine/*.cuh             the engine in 20 parts (~15k lines; each part's first line says what it holds): paged pool
+                             (int4 / FP4 / trellis KV), EXL3 and FP6 GEMM/GEMV, paged verify / commit / MTP drafter,
+                             DeltaNet state formats, CUDA-graph decode step, parking ring, the single-stream test
+                             decoder; the .tqf loader and qwn_init in loader.cuh, the paged pool's init in paged_t4.cuh
 src/engine/kv_t4_codebook.inc   the trellis-KV codebook compiled into the engine (generated by tools/gen_codebook_inc.py)
 tools/serve_batched.py       THE SERVED SERVER: multi-client OpenAI API, paged KV + continuous batching, spec decode,
                              prefix cache, host-RAM parking (/health, /spec)
-tools/serve_openai.py        legacy single-stream OpenAI server (FP6 + MTP tree, prefix cache, tools, reasoning split,
-                             residual-map hook, Dogs)
 tools/convert_qwen_tqf.py    HuggingFace / EXL3 checkpoint -> .tqf (--exl3, --mtp-exl3, the FP6 block-scaled formats)
 tools/inspect_tqf.py         inspect a .tqf model file (flags, payload walk incl. EXL3 records, format-v2 size and hashes
                              with --verify, production FP6 / EXL3 + MTP verdicts); the format's reference parser
@@ -204,33 +196,23 @@ tools/spec_paged_check.py    exactness of the paged verify / commit path vs plai
 tools/paged_logit_ab.py      raw paged-decode logits of a build for bitwise A/B between builds
 tools/harness_common.py      shared helpers of the HTTP tools (tokenizer, code-corpus snapshots, streaming client) and the
                              quality yardstick's held-out sampler (calibration_ids)
-tools/serve_common.py        request-side guards of both servers (--api-key, body limit, max_tokens cap, socket timeout)
+tools/serve_common.py        request-side guards of the server (--api-key, body limit, max_tokens cap, socket timeout)
 tools/qwentin_e2e.py         the quality yardstick on the engine: KL / top-1 vs the bf16 original (docs/QUALITY.md)
 tools/exl3_diff.py           the same for a checkpoint through exllamav3 (the FP8 reference row, the EXL3 ladder)
 tools/e2e_frontier.py        the gate table: paired dKL / dtop-1 with the 95 % block-bootstrap CI
 tools/dequant_fp8_to_bf16.py FP8 checkpoint -> bf16 containers (the FP8 reference row's input)
 tools/evalplus.sh            T1: EvalPlus HumanEval+ / MBPP+ against any OpenAI endpoint
-tools/paged_smoke.py         batched/paged decode parity + throughput harness (legacy)
-tools/mtp_spec_smoke.py      single-stream spec-decode harness (also exports prefill() used by serve_openai)
-tools/bench_rounds.py        single-stream decode-only spec-round benchmark (ms/round, net tok/s; nsys hook)
-tools/accept_probe.py        teacher-forced accept probe (degeneration-free draft-quality A/B)
-tools/persist_phases.py      phase-clock breakdown of the persistent kernel (work vs barrier tails)
-tools/serve_smoke.py         2-turn cold + prefix-cache E2E smoke against a running single-stream server
-tools/needle_check.py        single-stream long-context retrieval gate
-tools/residual_map.py        the residual-stream steering hook's maps-file loader, server flags (+ deprecated aliases),
-                             schedule parser and numpy reference (CPU-tested in tests/test_residual_map.py)
-tools/residual_map_check.py  kernel-vs-numpy parity of the hook on a maps file (GPU)
-tools/mtp_*.py               MTP draft-head training / accept-length eval / dump (single-stream)
+tools/paged_smoke.py         paged decode vs the single-stream decoder: parity, ragged prefill, capacity (FP6 / FP8 tqf)
 tools/convert.py, tools/sparse_pack.py           older converter pieces
 bench/reproduce.sh           build -> model check -> served line -> needle / spec A-B / speed -> results-<date>-<commit>.json
-tests/                       CPU pytest: the .tqf header parser / payload walk / format-v2 integrity, the servers' request guards, the residual-map
-                             flags / file format, the built-in codebook vs its source file, the unity build's part list,
+tests/                       CPU pytest: the .tqf header parser / payload walk / format-v2 integrity, the server's request
+                             guards, the built-in codebook vs its source file, the unity build's part list,
                              qwentin.h / qwentin_abi.py current and the tools' ctypes declarations consistent with them
 docs/NOTES.md                the 2026-10 build's narrative: where the memory went, DeepSeek-V4.1, the served stack's performance
 docs/ARCHITECTURE.md         this file: highlights, how it works, the annotated conversion recipe, this layout
 docs/FLAGS.md                every engine environment flag and server argument, the off-switches
 docs/VARIANTS.md             the 16 GB and 24 GB variants (tables + serve lines)
-docs/legacy-fp6.md           the 2026-08 single-stream FP6 path (serve_openai.py, Dogs, the residual-map hook, its tables)
+docs/legacy-fp6.md           FP6 E2M3 models on the batched server; the retired single-stream path (last release v0.11)
 docs/QUALITY.md, docs/TQF_FORMAT.md, docs/evidence/   the quality protocol, the file format, the gate logs behind the numbers
 CHANGELOG.md                 what landed in each release (v0.10 = the 2026-10 served stack, v0.11 = its prefill + hygiene)
 .github/workflows/           CI (compile check, ruff, pytest) and the disabled nightly 5090 gate

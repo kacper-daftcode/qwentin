@@ -48,7 +48,7 @@ section is *present in the file* is flag `0x400`.
 
 The two production formats and what `tools/inspect_tqf.py` checks for its PASS / FAIL lines:
 
-- **production FP6** (legacy single-stream path, `tools/serve_openai.py`): `0x1 | 0x20 | 0x100 | 0x400`, i.e. flags
+- **production FP6** (the 2026-08 format; `tools/serve_batched.py --no-kv-t4 --no-spec` serves it): `0x1 | 0x20 | 0x100 | 0x400`, i.e. flags
   `0x53d` for a bf16 source with a dropped vision tower. Written by `tools/convert_qwen_tqf.py` with its defaults
   (`--block-scaled always --block-layout qmma-e2m3 --block-scale-policy pow2`, MTP on). 22.6 GB for the 27B.
 - **EXL3 + MTP** (the served format, `tools/serve_batched.py --spec`): `0x800 | 0x400 | 0x1000`, i.e. `0x1c1d`.

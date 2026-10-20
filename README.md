@@ -74,7 +74,8 @@ and the spec-decode stats; thinking is off unless a request sets `"enable_thinki
 - [`docs/QUALITY.md`](docs/QUALITY.md) — the quality yardstick (KL / top-1 vs the bf16 original) and its protocol
 - [`docs/evidence/`](docs/evidence/README.md) — the gate logs behind every number and how to re-run each gate
 - [`docs/NOTES.md`](docs/NOTES.md) — the narrative; [`docs/TQF_FORMAT.md`](docs/TQF_FORMAT.md) — the model file format;
-  [`docs/legacy-fp6.md`](docs/legacy-fp6.md) — the single-stream FP6 path; [`CHANGELOG.md`](CHANGELOG.md)
+  [`docs/legacy-fp6.md`](docs/legacy-fp6.md) — FP6 models (the single-stream server was retired after v0.11);
+  [`CHANGELOG.md`](CHANGELOG.md)
 
 ## License
 

@@ -117,7 +117,7 @@ global scale for the fused gated-DeltaNet `in_proj_qkv` / `in_proj_z`, which vLL
 llm-compressor scales separately); needle 6/6 passed either way, so needle is not a sensitive
 quality probe — the KL yardstick is.
 
-Versus the 2026-08 build ([`legacy-fp6.md`](legacy-fp6.md)): pooled tokens 196K → 576K, quality FP6 → FP8-level,
+Versus the 2026-08 build ([`legacy-fp6.md` at v0.11](https://github.com/kacper-daftcode/qwentin/blob/v0.11/docs/legacy-fp6.md)): pooled tokens 196K → 576K, quality FP6 → FP8-level,
 single-stream decode 62 → 167 tok/s on the batched server through speculative decoding
 (2.5–2.7×, outputs bit-for-bit plain decode's), and the pre-2026-10 stack is still one flag
 away (`--no-kv-t4 --no-spec`).

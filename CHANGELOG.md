@@ -8,7 +8,23 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
-Nothing yet.
+- **The single-stream path is retired.** Gone: `tools/serve_openai.py` with Reservoir Dogs and the residual-stream
+  steering hook (`qwn_rmap_*` and the `qwn_ot_*` aliases), the engine's single-stream speculative decoding (MTP
+  covering tree, batched FP6 verify, persistent layer kernel, n-gram drafter, sampling), the pre-paged batched decode
+  (`qwn_batched_*`), the single-stream wide prefill, the FP4 (E2M1) weight path and the never-called debug / bench
+  entry points, with the 17 tools that drove them (`serve_smoke.py`, `bench_coding.py`, `mtp_*.py`,
+  `bench_rounds.py`, `persist_phases.py`, `accept_probe.py`, `needle_check.py`, `residual_map*.py`,
+  `batched_smoke.py`). 138 → 55 entry points in `src/qwentin.h`, 30k → 15k engine lines, 398 → 211 kernels,
+  26 → 20 engine parts. **v0.11 is the last release with any of it.** What stays: FP6 E2M3 files on the batched
+  server (`--no-kv-t4 --no-spec`), the converter's FP6 recipe, and the single-stream decoder `qwn_decode` as the test
+  oracle of `serve_batched.py --selftest` and `tools/paged_smoke.py` (docs/legacy-fp6.md).
+- **Engine switches: 34 left** (119 at v0.10), every one in docs/FLAGS.md: the served line and its documented
+  off-switches, three tool / test pins, four debug switches, `TQ_PAGED_TOPK_*` and `TQ_WIDE_ATTN_QROWS`. Besides the
+  single-stream path's own switches, `TQ_LINEAR_CORE_PAR` / `TQ_LINEAR_CORE_HS` are gone: the DeltaNet decode / verify /
+  commit cores run their served split (8 threads per element, 4 blocks per head) and only that template instance.
+- Gate (`docs/evidence/cand17-all.log`): of the 211 kernels left, 210 keep their SASS bit for bit; the one that changed
+  is the single-stream decoder's attention, whose non-inlined helper lost its other callers and was
+  specialized by the compiler — the decoder's tokens, its KV and the paged logits after it are bitwise unchanged.
 
 ## [v0.11] — 2026-10-20
 

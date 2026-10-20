@@ -216,8 +216,8 @@ lm_eval --model local-completions --tasks wikitext \
 
 `wikitext` (and every loglikelihood task) needs the completions endpoint to return the **prompt's own token logprobs**:
 `lm-eval` sends `{"prompt": ..., "max_tokens": 0, "echo": true, "logprobs": 1}` and reads `choices[0].logprobs.token_logprobs`
-for the prompt tokens (vLLM's `prompt_logprobs`). **Neither server implements this today**: `tools/serve_batched.py`
-ignores `logprobs` / `echo` (it returns text only), `tools/serve_openai.py` answers 400 to `logprobs`. The engine side
+for the prompt tokens (vLLM's `prompt_logprobs`). **The server does not implement this today**: `tools/serve_batched.py`
+ignores `logprobs` / `echo` (it returns text only). The engine side
 is ready — `tools/qwentin_e2e.py` already reads the fp32 logits of every prefill column through the
 `qwn_paged_logits_sink` ABI — so this is a server feature, not an engine one.
 

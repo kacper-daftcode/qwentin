@@ -33,16 +33,18 @@ from its arguments unless they are already in the environment):
 | `TQ_PDL` | server: 1 | programmatic dependent launch of the fragment build + EXL3 GEMM in the decode step (`--pdl`; bitwise, −0.55…−0.61 ms/step); 2 = also the step's other kernels (measured slower at 32K) |
 | `TQ_EMBED_HOST` | server: 1 | the bf16 embedding table in pinned host RAM, rows read over PCIe (`--embed-host`; no device copy, no quantization error). Overrides `TQ_EMBED_FP8` |
 | `TQ_NO_MTP` | server: 1 unless `--spec`/`--mtp` | skip the tqf's MTP section (the bf16 head is 0.85 GB; the EXL3 one 0.21 GB) |
-| `TQ_EMBED_FP8=2` | legacy | 6-bit (E2M3) embed table on the device, −1.5 GiB (needed for the full 256k on 32 GB on the single-stream path; irrelevant with `TQ_EMBED_HOST=1`) |
-| `TQ_WIDE_ATTN_MMA=1`, `TQ_PAGED_ATTN_MMA=1` | server: on | wide / ragged tensor-core prefill and decode attention (the batched server sets `TQ_WIDE_ATTN_MMA=1` for `--page >= 128`; `TQ_PAGED_ATTN_MMA=0` = the scalar decode kernel). `TQ_WIDE_PREFILL=1` (single-stream server, default on) is read by the tools' `prefill()` (tools/mtp_spec_smoke.py), not by the engine |
-| `TQ_ATTN_MMA=1`, `TQ_ATTN_MMA_PAIR=0`, `TQ_ATTN_MMA_GROUP_MIN` / `TQ_SPEC_ATTN_LEGACY_MIN`, `TQ_ATTN_MMA_GROUP2=0`, `TQ_WIDE_CONV=0` | legacy | the single-stream path's attention / conv variants of the 2026-08 README (all default on; the =0 forms are bit-identical fallbacks) |
-| `TQ_PAGED_TOPK_PAGES` | 0 | Quest-style page top-k for the decode attention (built, measured to fail the FP8 gate below ~75 % of the pages; keep 0; not ported to the trellis pool) |
+| `TQ_EMBED_FP8` | 0 (the README's command sets 2) | the embedding table quantized on the device: 1 = per-row E4M3, 2 = 6-bit E2M3 (−1.5 GiB); irrelevant with `TQ_EMBED_HOST=1`, which overrides it |
+| `TQ_WIDE_ATTN_MMA=1`, `TQ_PAGED_ATTN_MMA=1` | server: on | wide / ragged tensor-core prefill and decode attention (the batched server sets `TQ_WIDE_ATTN_MMA=1` for `--page >= 128`; `TQ_PAGED_ATTN_MMA=0` = the scalar decode kernel) |
+| `TQ_WIDE_ATTN_QROWS` | 32 | query rows per block of the int4-K wide-prefill attention: 32 halves the L2 K/V stream per query token; 16 = the earlier one-tile kernel (bit-identical) |
+| `TQ_PAGED_TOPK_PAGES` | 0 | Quest-style page top-k for the decode attention from `TQ_PAGED_TOPK_MIN_CTX` (16384) positions on (built, measured to fail the FP8 gate below ~75 % of the pages; keep 0; not ported to the trellis pool; kept as the starting point of a trained indexer) |
 
 Debug switches (off by default, diagnostics only): `TQ_PATTN_DEBUG` (non-finite check of the prefill-attention
-partials), `TQ_EXL3_DEBUG` (GEMM work-counter check), `TQ_GRAPH_DEBUG`, `TQ_PAGED_TOPK_DEBUG`. The legacy single-stream
-path reads further `TQ_*` tuning switches of its own (docs/legacy-fp6.md); they are not part of the served interface.
+partials), `TQ_EXL3_DEBUG` (GEMM work-counter check), `TQ_GRAPH_DEBUG`, `TQ_PAGED_TOPK_DEBUG`. Pins for tools and tests:
+`TQ_PARK_RING` (1 = park sessions through the pinned host ring, 0 = the per-span pageable copy; reported by
+`/health`), `TQ_QMMA_SF_K_SPLIT` and `TQ_PAGED_GQA_SPLIT` (fixed split counts instead of the auto pickers; the pinned
+mode of `tools/spec_paged_check.py`). The engine reads no other `TQ_*` variable.
 
-<sub>Provenance: flag names and defaults are those of `src/forward_qwen.cu` at engine `b2e7a3f` (library md5 `484bdb825c36`; the kernels of `2cf671c` / `e454a29c3caf` plus the `TQ_GDN_PREFILL` default flip, CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04); the measured effects quoted per row come from the landing gates `docs/evidence/cand4-all.log` … `cand8-all.log` and `ASSUMPTIONS.md` (research repo), 2026-10-16/17, torch 2.14.0+cu130, transformers 5.17.0.</sub>
+<sub>Provenance: the flags and defaults are those `src/engine/` reads (every `getenv` is in the table or in the paragraph above); the measured effects quoted per row come from the landing gates in `docs/evidence/` (`cand4-all.log` … `cand16-all.log`) and `ASSUMPTIONS.md` (research repo), 2026-10-16…20, CUDA 13.1, driver 610.57.04.</sub>
 
 ## Server arguments
 
@@ -65,7 +67,7 @@ path reads further `TQ_*` tuning switches of its own (docs/legacy-fp6.md); they 
 | `--pdl` / `--no-pdl` | on | `TQ_PDL=1` |
 | `--wide-attn-mma` / `--no-wide-attn-mma` | on | tensor-core ragged prefill attention for the waves (`TQ_WIDE_ATTN_MMA`; needs `--page >= 128`); without it the waves use the scalar decode kernel per column (~6× slower prefill) |
 | `--timeout s`, `--model-name`, `--host`, `--port` | 300, qwentin-qwen3.6-27b-batched, 127.0.0.1, 8100 | admission wait when all slots are busy, the `model` name clients send, bind address (loopback by default), port |
-| `--api-key KEY`, `--max-body-bytes N`, `--max-tokens-cap N`, `--socket-timeout s` | unset, 32 MiB, 16384, 600 | request-side hardening, shared with `serve_openai.py` (`tools/serve_common.py`): with a key every path but `/health` needs `Authorization: Bearer KEY` (401 otherwise); bodies above the limit get 413 before being read (411 without `Content-Length`); a request's `max_tokens` above the cap is clamped and the clamp reported as `x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (finish_reason `length`); a client socket that stops sending or stops reading is closed after the timeout |
+| `--api-key KEY`, `--max-body-bytes N`, `--max-tokens-cap N`, `--socket-timeout s` | unset, 32 MiB, 16384, 600 | request-side hardening (`tools/serve_common.py`): with a key every path but `/health` needs `Authorization: Bearer KEY` (401 otherwise); bodies above the limit get 413 before being read (411 without `Content-Length`); a request's `max_tokens` above the cap is clamped and the clamp reported as `x_qwentin.max_tokens_clamped_from` / `max_tokens_cap` (finish_reason `length`); a client socket that stops sending or stops reading is closed after the timeout |
 | `--selftest`, `--bench ...` | — | staggered join/leave correctness vs single-stream; steady-state paged decode bench (`--bench-p` prompt tokens, `--bench-ns` slot counts) — both run with spec off |
 
 <sub>Provenance: `tools/serve_batched.py` at this tag (`--help` is authoritative); the defaults are the ones served on 2026-10-17 with engine `b2e7a3f` / library md5 `484bdb825c36` (CUDA 13.1 nvcc `cuda_13.1.r13.1/compiler.37061995_0`, driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0) and gated in `docs/evidence/cand8-all.log` (every default but `--gdn-prefill` already in `cand7-all.log`).</sub>
