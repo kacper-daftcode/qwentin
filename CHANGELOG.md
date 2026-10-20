@@ -48,6 +48,18 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
   bit for bit, the 27 that change are exactly the readers of the moved or removed constants, and every output is
   bitwise unchanged — the paged path on the trellis, FP4, E4M3-V and FP6 pools, spec exactness, the test decoder,
   the served line.
+- **The engine's defaults are the served line's.** `TQ_CTX` 262144 and `TQ_KV_Q4` / `TQ_KV_V4` / `TQ_KV_T4` / `TQ_PDL` /
+  `TQ_EMBED_HOST` / `TQ_WIDE_ATTN_MMA` on (were 8192 and off; the server and the tools set them): the README's serve
+  command needs no environment and its `[config]` line reads `every TQ_* switch at its default`. A script that relied
+  on the earlier defaults sets them explicitly — `tools/paged_smoke.py` now pins the int4-K / E4M3-V pool, the scalar
+  wave attention and an 8K context its single-stream comparison was written for.
+- **A config struct in the C ABI.** `src/qwentin.h` declares `qwn_config` (one field per `TQ_*` switch, generated from
+  the switch table) with `qwn_config_defaults`, `qwn_config_from_env`, `qwn_config_get` and `qwn_init_with(path, cfg)`;
+  `qwn_init(path)` is `qwn_config_from_env` + `qwn_init_with`, and `tools/qwentin_abi.py` carries the struct for ctypes
+  (`Config`, `CONFIG_FIELDS`). `tools/serve_batched.py` starts the engine through it instead of writing its arguments
+  into `os.environ`: the arguments fill every switch the environment leaves unset or empty (an explicit environment
+  value still wins; an empty one now counts as unset), and the startup line and `/health` report the engine's
+  effective settings. 55 → 59 entry points.
 
 ## [v0.11] — 2026-10-20
 

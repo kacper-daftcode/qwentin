@@ -33,7 +33,7 @@ weights do not fit 16 GB at any context; FP4 V stopped at 180K on 24 GB.
 # The 16 GB variant (measured under a 16 GiB process budget on a 5090, logs/p16-check.log): the 4.25 bpw model,
 # 2 slots (so the pinned parking ring is allocated), 400 blocks = 51K tokens -> 16 006 MiB after a full run;
 # 360 = 46K is the safe pick, 440 = 56K only if the card may sit at ~16 074 MiB. 184 tok/s @32K, 173 @49K, needle 3/3.
-CUDA_VISIBLE_DEVICES=x TQ_CTX=262144 TQ_KV_Q4=1 TQ_EMBED_FP8=2 TQ_PAGED_ATTN_MMA=1 python3 -u tools/serve_batched.py \
+CUDA_VISIBLE_DEVICES=x python3 -u tools/serve_batched.py \
   --port 8100 --max-slots 2 --num-blocks 400 --park-ram-gb 16 --timeout 3600 --model-name qwen3.8-27b \
   --tqf /path/to/qwen3_8-27b-exl3-t45-s425-mtp4.tqf --model-dir /path/to/Qwen3.8-27B --lib build-qwen/libforward_qwen.so
 

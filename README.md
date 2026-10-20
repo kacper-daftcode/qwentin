@@ -53,7 +53,7 @@ python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work -o /path/to/Qwen3.8-2
 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-opt5.75 -o /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf --mtp-exl3
 
 # serve: the served line -- every other setting is a default of serve_batched.py
-CUDA_VISIBLE_DEVICES=0 TQ_CTX=262144 TQ_KV_Q4=1 TQ_EMBED_FP8=2 TQ_PAGED_ATTN_MMA=1 python3 -u tools/serve_batched.py \
+CUDA_VISIBLE_DEVICES=0 python3 -u tools/serve_batched.py \
   --port 8100 --max-slots 12 --num-blocks 4500 --timeout 1800 --model-name qwen3.8-27b \
   --tqf /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf --model-dir /path/to/Qwen3.8-27B --lib build-qwen/libforward_qwen.so
 curl localhost:8100/v1/chat/completions -d '{"model": "qwen3.8-27b", "temperature": 0.0, "max_tokens": 64,

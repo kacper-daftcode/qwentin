@@ -78,7 +78,7 @@ TAG=${TAG:-$DATE-$COMMIT}
 WORK=$OUT_DIR/work-$TAG
 RESULT=$OUT_DIR/results-$TAG.json
 BASE=http://127.0.0.1:$PORT
-SERVED_ENV=(CUDA_VISIBLE_DEVICES="$GPU" TQ_CTX=262144 TQ_KV_Q4=1 TQ_EMBED_FP8=2 TQ_PAGED_ATTN_MMA=1)
+SERVED_ENV=(CUDA_VISIBLE_DEVICES="$GPU")    # the engine's defaults are the served line's
 
 exec 3>&1                    # fd 3 = the terminal, so dry-run lines bypass the per-step redirects and tees
 show() { local suffix=$1; shift; { printf '+'; printf ' %q' "$@"; printf ' %s\n' "$suffix"; } >&3; }
@@ -238,7 +238,7 @@ env = {
     "python": platform.python_version(), "torch": ver("torch"), "transformers": ver("transformers"),
     "safetensors": ver("safetensors"), "numpy": ver("numpy"),
     "served_line": {"max_slots": int(os.environ["MAX_SLOTS"]), "num_blocks": int(os.environ["NUM_BLOCKS"]),
-                    "env": {"TQ_CTX": "262144", "TQ_KV_Q4": "1", "TQ_EMBED_FP8": "2", "TQ_PAGED_ATTN_MMA": "1"},
+                    "env": {},
                     "server_defaults": "tools/serve_batched.py at this commit (--kv-v4 --kv-t4 --spec --dstate fp16sr --decode-steps-per-wave 1 ...)"},
 }
 server_log = read(os.path.join(W, "server.log"), "")
