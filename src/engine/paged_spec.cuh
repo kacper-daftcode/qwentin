@@ -488,8 +488,8 @@ static int run_paged_verify_core(const int *tokens, const int *col_slot, const i
 // Returns 1 when not covered (the caller runs the eager wave; the prework is idempotent).
 static int run_paged_verify_graph(const int *tokens, const int *col_slot, const int *col_pos,
                                   const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T) {
-    if (g_graph_disabled || paged_topk_pages() > 0) return 1;
-    if (!(paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
+    if (g_graph_disabled || g_cfg.paged_topk_pages > 0) return 1;
+    if (!(g_cfg.paged_attn_mma && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
           g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16)) return 1;
     int vf_maxpos = 0, tiles = 0;
     int ret = paged_verify_prep(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T, 1, &vf_maxpos, &tiles);
@@ -504,7 +504,7 @@ static int run_paged_verify_graph(const int *tokens, const int *col_slot, const 
     key = (key << 8) | (unsigned)g_attn_seg_cnt;
     key = (key << 4) | (unsigned)(g_attn_seg_qt & 3) | ((unsigned)(g_exl3_ng_max == 8) << 2) | ((unsigned)(g_split_n_override > 0) << 3);
     key = (key << 4) | (unsigned)(fuse | (g_pg_t4 << 1) | (g_pg_v4 << 2) | ((g_pg_sink != NULL) << 3));
-    key = (key << 4) | (unsigned)(paged_attn_st_enabled() & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
+    key = (key << 4) | (unsigned)(g_cfg.paged_attn_st & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
     key = (key << 8) | (g_graph_gen & 0xff);
     cudaGraphExec_t exec = graph_cache_get(key);
     if (!exec) {
@@ -516,7 +516,7 @@ static int run_paged_verify_graph(const int *tokens, const int *col_slot, const 
         if (!exec) return 1;
         key = (key & ~0xffull) | (g_graph_gen & 0xff);
         graph_cache_put(key, exec, nodes);
-        if (tq_graph_debug())
+        if (g_cfg.graph_debug)
             fprintf(stderr, "[graph] verify: captured K=%d T=%d tiles=%d Smax=%d segs=%d qt=%d maxpos=%d (%d cached)\n",
                     K, T, tiles, g_attn_col_S_max, g_attn_seg_cnt, g_attn_seg_qt, vf_maxpos, g_graph_n);
     }
@@ -553,7 +553,7 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
         next = off + n;
     }
     if (next != T) return -6;
-    int pdl = tq_pdl_enabled();
+    int pdl = g_cfg.pdl;
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
     // 32-token GEMM units, and the GEMM k-splits / attention key-splits of the slot count rather than the column
@@ -563,7 +563,7 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     g_split_n_override = K;
     g_vf_K = 0;
     int ret = 1;
-    if (tq_graph_enabled() >= 2) ret = run_paged_verify_graph(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
+    if (g_cfg.graph >= 2) ret = run_paged_verify_graph(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
     if (ret == 1) ret = run_paged_verify_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, K, T);
     g_attn_col_S = NULL; g_attn_col_S_max = 0;
     g_attn_seg_c0 = g_attn_seg_n = NULL; g_attn_seg_cnt = 0; g_attn_seg_qt = 0;
@@ -609,7 +609,7 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
         cudaMemcpyAsync(g_vf_cseg_d + c * TQ_VF_MAX_SEG, h_vf_cseg[c], (size_t)m * sizeof(int),
                         cudaMemcpyHostToDevice, g_qwen.stream);
     const int *d_cslot = g_vf_cseg_d, *d_coff = g_vf_cseg_d + TQ_VF_MAX_SEG, *d_clen = g_vf_cseg_d + 2 * TQ_VF_MAX_SEG;
-    int pdl = tq_pdl_enabled();
+    int pdl = g_cfg.pdl;
     g_pdl_small = pdl == 2;
     if (g_vf_lp) {
         // all 48 linear layers in two launches (grid.z = layer): 48 x 8 x 192 blocks fill the GPU instead of 48 x 1.13
@@ -885,14 +885,14 @@ extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, co
     for (int k = 0; k < K; k++) for (int i = 0; i < N; i++) h_mtp_ctl[3 + k][i] = positions[i] + k;
     paged_upload_tables(g_qwen.stream);
     mtp_ctl_upload(3 + K);
-    int pdl = tq_pdl_enabled();
+    int pdl = g_cfg.pdl;
     g_pdl_on = pdl != 0; g_pdl_small = pdl == 2;
     int ret = 0;
     // TQ_GRAPH: the K chained steps as one graph per (N, K, the key-split counts of the K steps: S is monotone in
     // the position and moves at most once inside K <= 16 consecutive positions -> (S_0, first step with S_0 + 1)).
     int use_graph = 0;
-    if (tq_graph_enabled() >= 2 && !g_graph_disabled && paged_topk_pages() == 0 &&
-        paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
+    if (g_cfg.graph >= 2 && !g_graph_disabled && g_cfg.paged_topk_pages == 0 &&
+        g_cfg.paged_attn_mma && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
         g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16) {
         int S0 = paged_attn_split_S(N, max_pos, 1), jump = K, Smax = S0, ok = 1;
         for (int k = 1; k < K; k++) {
@@ -908,7 +908,7 @@ extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, co
             key = (key << 8) | (unsigned)S0;
             key = (key << 8) | (unsigned)jump;
             key = (key << 4) | (unsigned)((g_pg_t4) | (g_pg_v4 << 1) | ((g_pg_sink != NULL) << 2));
-            key = (key << 4) | (unsigned)(paged_attn_st_enabled() & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
+            key = (key << 4) | (unsigned)(g_cfg.paged_attn_st & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
             key = (key << 16) | (g_graph_gen & 0xffff);
             cudaGraphExec_t exec = graph_cache_get(key);
             if (!exec) {
@@ -917,7 +917,7 @@ extern "C" int qwn_paged_mtp_draft(const int *slot_ids, const int *positions, co
                 if (exec) {
                     key = (key & ~0xffffull) | (g_graph_gen & 0xffff);
                     graph_cache_put(key, exec, nodes);
-                    if (tq_graph_debug())
+                    if (g_cfg.graph_debug)
                         fprintf(stderr, "[graph] draft: captured N=%d K=%d S0=%d jump=%d maxpos=%d (%d cached)\n", N, K, S0, jump, max_pos, g_graph_n);
                 }
             }

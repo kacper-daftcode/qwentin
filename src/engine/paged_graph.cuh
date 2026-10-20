@@ -63,14 +63,14 @@ static cudaGraphExec_t graph_capture(const char *what, Body body, int *nodes_out
         // A lazily sized buffer grew (cudaFree + cudaMalloc) inside the capture: nodes recorded before the growth
         // still name the old allocation. Drop this graph, run the step eagerly (the buffers are now sized), and
         // capture again on the next call with this key (the generation is part of every key).
-        if (tq_graph_debug())
+        if (g_cfg.graph_debug)
             fprintf(stderr, "[graph] %s: a buffer grew inside the capture (gen %u -> %u) -- eager this step, recapture next\n",
                     what, gen0, g_graph_gen);
         cudaGraphDestroy(graph);
         return NULL;
     }
     size_t nn = 0; cudaGraphGetNodes(graph, NULL, &nn);
-    if (tq_graph_debug()) {
+    if (g_cfg.graph_debug) {
         size_t ne = 0; cudaGraphGetEdges(graph, NULL, NULL, NULL, &ne);
         size_t npdl = 0;
         if (ne > 0) {
@@ -95,7 +95,7 @@ static cudaGraphExec_t graph_capture(const char *what, Body body, int *nodes_out
         g_graph_disabled = 1; return NULL;
     }
     double t2 = tq_now_ms();
-    if (tq_graph_debug()) fprintf(stderr, "[graph] %s: instantiate %.2f ms\n", what, t2 - t1);
+    if (g_cfg.graph_debug) fprintf(stderr, "[graph] %s: instantiate %.2f ms\n", what, t2 - t1);
     g_graph_capture_ms += t2 - t0;
     g_graph_captures++;
     if (nodes_out) *nodes_out = (int)nn;
@@ -117,8 +117,8 @@ extern "C" int qwn_graph_stats(long *hits, long *captures, long *evictions, int 
 // attention partials for the step's S. Then the replay, then the T4 tail.
 static int run_paged_decode_step_graph(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
     if (g_graph_disabled || !g_tok_d || !h_pin_ctl) return 1;
-    if (!paged_lm_head_wide() || paged_topk_pages() > 0) return 1;             // paths with host-side per-step work
-    if (!(paged_attn_gqa_mma_enabled() && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
+    if (!paged_lm_head_wide() || g_cfg.paged_topk_pages > 0) return 1;             // paths with host-side per-step work
+    if (!(g_cfg.paged_attn_mma && (g_pg_page & 127) == 0 && g_qwen.hd == 256 &&
           g_qwen.nh % g_qwen.nkv == 0 && g_qwen.nh / g_qwen.nkv <= 16)) return 1;   // the scalar attention picker
     int dec_maxpos = 0, ret;
     if ((ret = paged_decode_prep(slot_ids_h, positions, N, &dec_maxpos)) != 0) return ret;
@@ -139,7 +139,7 @@ static int run_paged_decode_step_graph(const int *tokens, const int *slot_ids_h,
     key = (key << 8) | (unsigned)S;
     key = (key << 8) | (unsigned)mtp_m;
     key = (key << 4) | (unsigned)(fuse | (g_mtp_on << 1) | (g_pg_t4 << 2) | (g_pg_v4 << 3));
-    key = (key << 4) | (unsigned)(paged_attn_st_enabled() & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
+    key = (key << 4) | (unsigned)(g_cfg.paged_attn_st & 3) | ((unsigned)(g_pdl_on | (g_pdl_small << 1)) << 2);
     key = (key << 4) | (unsigned)(g_pg_sink != NULL);
     key = (key << 16) | (g_graph_gen & 0xffff);
     cudaGraphExec_t exec = graph_cache_get(key);
@@ -149,7 +149,7 @@ static int run_paged_decode_step_graph(const int *tokens, const int *slot_ids_h,
         if (!exec) return 1;                                         // eager fallback (the prework is idempotent)
         key = (key & ~0xffffull) | (g_graph_gen & 0xffff);           // a buffer grown inside the capture bumped it
         graph_cache_put(key, exec, nodes);
-        if (tq_graph_debug())
+        if (g_cfg.graph_debug)
             fprintf(stderr, "[graph] decode: captured N=%d S=%d mtp_m=%d maxpos=%d (%d cached)\n", N, S, mtp_m, dec_maxpos, g_graph_n);
     }
     cudaError_t e = cudaGraphLaunch(exec, st);
@@ -165,11 +165,11 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
     if (!g_pg_ready) return -1;
     if (N < 1 || N > g_pg_maxslots) return -2;
     if (!g_qwen.kv_q4) return -3;
-    int pdl = tq_pdl_enabled();
+    int pdl = g_cfg.pdl;
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
     int ret = 1;
-    if (tq_graph_enabled()) ret = run_paged_decode_step_graph(tokens, slot_ids, positions, N);
+    if (g_cfg.graph) ret = run_paged_decode_step_graph(tokens, slot_ids, positions, N);
     if (ret == 1) ret = run_paged_decode_step_core(tokens, slot_ids, positions, N);
     g_pdl_on = g_pdl_small = 0;
     if (ret != 0) return ret;
@@ -375,7 +375,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
             if ((ret = wide_proj(&l->v_proj, g_wide_v, T)) != 0) return -93;
-            if (wide_attn_mma_enabled() && g_pg_page >= 128) {
+            if (g_cfg.wide_attn_mma && g_pg_page >= 128) {
                 if (launch_paged_attn_q4_mma_prefill(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
@@ -402,8 +402,8 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_proj_pair(&l->linear_in_b, g_wide_b, &l->linear_in_a, g_wide_a, T)) != 0) return -98;
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
-                if (tq_gdn_prefill_mode() != 0) {   // session 11: hoisted prep + register-resident chunk kernel (bitwise)
-                    int rg = launch_gdn_prefill(tq_gdn_prefill_mode(), g_pg_dstate, g_wide_lcore + (size_t)off * value_dim,
+                if (g_cfg.gdn_prefill != 0) {   // session 11: hoisted prep + register-resident chunk kernel (bitwise)
+                    int rg = launch_gdn_prefill(g_cfg.gdn_prefill, g_pg_dstate, g_wide_lcore + (size_t)off * value_dim,
                             pg_recur_slot(L, slot), g_pg_conv[L] + (size_t)slot * conv_f, g_wide_qkv + (size_t)off * conv_dim,
                             g_wide_z + (size_t)off * value_dim, g_wide_b + (size_t)off * lvh, g_wide_a + (size_t)off * lvh,
                             l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_conv1d, l->d_linear_norm, n, lvh, lkh, ld,
@@ -486,14 +486,8 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
     // Wave cap: 128 columns = the FP6 path's fast activation quantizer smem limit (the EXL3 path builds its fragments
     // per Linear and has no such limit). TQ_WAVE_MAX (session 10, prefill thread; <= 256) lifts it for the A/B of
     // 256-column waves; the trellis pool keeps one in-flight staging page per slot, so it stays at <= page there.
-    static int wave_max = -1;
-    if (wave_max < 0) {
-        const char *e = getenv("TQ_WAVE_MAX");
-        wave_max = (e && *e) ? atoi(e) : 128;
-        if (wave_max < 1) wave_max = 1;
-        if (wave_max > 256) wave_max = 256;
-        if (!(g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) && wave_max > 128) wave_max = 128;
-    }
+    int wave_max = g_cfg.wave_max;
+    if (!(g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) && wave_max > 128) wave_max = 128;
     if (T > wave_max) return -6;
     if (g_pg_t4 && T > g_pg_page) return -6;
     for (int k = 0; k < K; k++) {

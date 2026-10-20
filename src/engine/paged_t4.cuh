@@ -222,9 +222,9 @@ static void paged_t4_free(void) {
 // TQ_KV_T4_CODEBOOK = path of 4096 raw little-endian fp32. The fp16 dequant table permutes the nibble
 // order (table[e] = cb[swap nibbles 0 and 2 of e]).
 static int paged_t4_load_codebook(void) {
-    const char *path = getenv("TQ_KV_T4_CODEBOOK");
+    const char *path = g_cfg.kv_t4_codebook;
     float *cb = (float *)malloc(4096 * sizeof(float));
-    if (!path || !*path) {
+    if (!path) {
         memcpy(cb, k_t4_codebook_lloyd_kv12a, sizeof(k_t4_codebook_lloyd_kv12a));
         path = "built-in lloyd_kv12a";
     } else {
@@ -273,7 +273,7 @@ static int paged_t4_alloc(int max_slots, int num_blocks, int page) {
         cudaHostAlloc(&h_t4_jobs, (size_t)TQ_T4_MAXL * sizeof(tq_t4_job), cudaHostAllocDefault) != cudaSuccess) {
         h_t4_jobs = NULL; return -2;
     }
-    { const char *e = getenv("TQ_KV_T4_ASYNC"); g_t4_async = (e && *e) ? (atoi(e) != 0) : 1; }
+    g_t4_async = g_cfg.kv_t4_async;
     int prio_lo = 0, prio_hi = 0;                           // the side stream gets the highest priority: its CTAs
     cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);   // are scheduled ahead of the attention's and are done
     if (cudaStreamCreateWithPriority(&g_t4_stream, cudaStreamNonBlocking, prio_hi) != cudaSuccess ||   // before the GEMMs
@@ -297,26 +297,6 @@ static size_t paged_t4_pool_vec_bytes(void) { return 2 * (128 + 4); }
 // TQ_PAGED_TOPK_PAGES=0 (default) leaves the dense path bit-for-bit, no extra allocs.
 #define TQ_KMM_SCRATCH 4096
 static int h_kmm_slot[TQ_KMM_SCRATCH], h_kmm_pos[TQ_KMM_SCRATCH];
-
-static int paged_topk_pages(void) {
-    static int c = -1;
-    if (c < 0) {
-        const char *e = getenv("TQ_PAGED_TOPK_PAGES");
-        c = (e && *e) ? atoi(e) : 0;
-        if (c < 0) c = 0;
-        if (c > 4096) c = 4096;
-    }
-    return c;
-}
-static int paged_topk_min_ctx(void) {
-    static int c = -1;
-    if (c < 0) {
-        const char *e = getenv("TQ_PAGED_TOPK_MIN_CTX");
-        c = (e && *e) ? atoi(e) : 16384;
-        if (c < 0) c = 0;
-    }
-    return c;
-}
 
 static int paged_kmm_ensure(void) {
     if (g_kmm_ready) return 0;
@@ -434,7 +414,7 @@ static int paged_kmm_refresh(int layer, const int *pos_h, const int *slot_h, int
 // Every logical page of one slot, after a KV copy that bypassed the write kernel
 // (qwn_paged_load_client / qwn_paged_slot_restore).
 static int paged_kmm_rebuild_slot(int slot, int upto_pos, cudaStream_t st) {
-    if (paged_topk_pages() <= 0) return 0;
+    if (g_cfg.paged_topk_pages <= 0) return 0;
     if (paged_kmm_ensure() != 0) return -1;
     int plog = g_pg_plog;
     int nb = (upto_pos >> plog) + 1;
@@ -604,20 +584,16 @@ static int paged_topk_rank(int layer, const float *q_proj, const uint16_t *q_nor
                 + (size_t)pad * sizeof(int) + (size_t)pad;
     if (!g_topk_logged) {
         fprintf(stderr, "[paged-topk] pages=%d min_ctx=%d (count 0 = dense)\n",
-                kpages, paged_topk_min_ctx());
+                kpages, g_cfg.paged_topk_min_ctx);
         g_topk_logged = 1;
     }
     k_tq_paged_topk_rank<<<dim3(nkv, N), 256, smem, st>>>(
-        g_topk_list, g_topk_count, g_topk_cap, kpages, paged_topk_min_ctx(), pad,
+        g_topk_list, g_topk_count, g_topk_cap, kpages, g_cfg.paged_topk_min_ctx, pad,
         g_pool_kmm[layer], q_proj, q_norm_w, positions, slot_ids, g_block_table, g_pg_maxblk,
         nkv, nh, hd, nh * hd * 2, g_pg_plog, g_qwen.eps, g_qwen.rope_theta);
     // TQ_PAGED_TOPK_DEBUG=1: once per process, count and logical page ids for client 0 / kv head 0.
-    static int debug = -1, dumped = 0;
-    if (debug < 0) {
-        const char *e = getenv("TQ_PAGED_TOPK_DEBUG");
-        debug = (e && e[0] == '1') ? 1 : 0;
-    }
-    if (debug && !dumped) {
+    static int dumped = 0;
+    if (g_cfg.paged_topk_debug && !dumped) {
         int c = -1;
         cudaMemcpyAsync(&c, g_topk_count, sizeof(int), cudaMemcpyDeviceToHost, st);
         cudaStreamSynchronize(st);
@@ -644,19 +620,17 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (!g_qwen.kv_q4) return -2;                          // Q4(K) + E4M3(V) or Q4(V) tiers only
     if (max_slots < 1 || num_blocks < 1 || page < 1 || (page & (page - 1))) return -3;
     paged_free_all();
-    { const char *e = getenv("TQ_KV_V4"); g_pg_v4 = (e && atoi(e) != 0) ? 1 : 0; }
-    { const char *e = getenv("TQ_KV_T4"); g_pg_t4 = (e && atoi(e) != 0) ? 1 : 0; }
-    {   // TQ_DSTATE_BF16: 0 = fp32 recurrent state, 1 = bf16, 2 = fp16, 3 = bf16 + 8 bits (24-bit), 4 = fp16 with deterministic
-        // stochastic rounding (tq_ds_acc) -- DEFAULT 4 since 2026-10-17 (owner's decision (c): e2e-neutral at 4K-64K in prefill
-        // and pure decode, 80 instead of 155 MiB per slot = +400 blocks at the served footprint); 0 = the fp32 state (bitwise the
-        // 10-16 line). notes/session10-dstate.md.
-        const char *e = getenv("TQ_DSTATE_BF16"); int m = (e && *e) ? atoi(e) : 4;
-        if (m < 0 || m > 4) return -13;
-        g_pg_dstate = m; g_pg_ds_es = tq_ds_elem_bytes(m);
-    }
+    g_pg_v4 = g_cfg.kv_v4;
+    g_pg_t4 = g_cfg.kv_t4;
+    // TQ_DSTATE_BF16: 0 = fp32 recurrent state, 1 = bf16, 2 = fp16, 3 = bf16 + 8 bits (24-bit), 4 = fp16 with deterministic
+    // stochastic rounding (tq_ds_acc) -- DEFAULT 4 since 2026-10-17 (owner's decision (c): e2e-neutral at 4K-64K in prefill
+    // and pure decode, 80 instead of 155 MiB per slot = +400 blocks at the served footprint); 0 = the fp32 state (bitwise the
+    // 10-16 line). notes/session10-dstate.md.
+    if (g_cfg.dstate < 0 || g_cfg.dstate > 4) return -13;
+    g_pg_dstate = g_cfg.dstate; g_pg_ds_es = tq_ds_elem_bytes(g_pg_dstate);
     if (g_pg_t4 && !g_pg_v4) return -10;                   // trellis pages stage their open page as FP4 K+V
     if (g_pg_t4 && (page & 127)) return -10;                // whole 128-token pages are encoded
-    if (g_pg_t4 && paged_topk_pages() > 0) return -11;      // page summaries read FP4 K; not ported
+    if (g_pg_t4 && g_cfg.paged_topk_pages > 0) return -11;      // page summaries read FP4 K; not ported
     int plog = 0; while ((1 << plog) < page) plog++;
     g_pg_page = page; g_pg_plog = plog; g_pg_nblocks = num_blocks; g_pg_maxslots = max_slots;
     g_pg_maxblk = (g_qwen.max_seq + page - 1) / page;
@@ -729,10 +703,10 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
                 (double)nlin * recur_f * g_pg_ds_es / 1048576.0, (double)nlin * recur_f * sizeof(float) / 1048576.0,
                 (double)nlin * conv_f * sizeof(float) / 1048576.0);
     }
-    fprintf(stderr, "[paged] TQ_PAGED_ATTN_ST=%d%s\n", paged_attn_st_enabled(),
+    fprintf(stderr, "[paged] TQ_PAGED_ATTN_ST=%d%s\n", g_cfg.paged_attn_st,
             g_pg_t4 ? " (no-op with TQ_KV_T4: the trellis pool uses its own GQA kernels)"
-            : (paged_attn_st_enabled() >= 2 && g_pg_v4) ? " (fp16 int4 GQA decode / verify kernel)"
-            : (paged_attn_st_enabled() >= 2) ? " (E4M3 V: the fp16 int4 path needs TQ_KV_V4=1; base kernel, bitwise = e1ecb3a's)"
+            : (g_cfg.paged_attn_st >= 2 && g_pg_v4) ? " (fp16 int4 GQA decode / verify kernel)"
+            : (g_cfg.paged_attn_st >= 2) ? " (E4M3 V: the fp16 int4 path needs TQ_KV_V4=1; base kernel, bitwise = e1ecb3a's)"
             : " (bitwise = e1ecb3a's kernel)");
     return 0;
 }
@@ -814,7 +788,7 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
                             conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
         }
     }
-    if (paged_topk_pages() > 0) {
+    if (g_cfg.paged_topk_pages > 0) {
         if (paged_kmm_rebuild_slot(slot, upto_pos, g_qwen.stream) != 0) return -8;
     }
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -7;

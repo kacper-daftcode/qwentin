@@ -217,9 +217,7 @@ static int tqf_check_integrity(FILE *f, const char *path, uint32_t header_bytes,
                 path, (unsigned long long)on_disk, (unsigned long long)payload_bytes);
         return -41;
     }
-    const char *ve = getenv("TQ_VERIFY_TQF");
-    int verify = ve && *ve && atoi(ve) != 0;
-    if (verify) {
+    if (g_cfg.verify_tqf) {
         if (fseeko(f, (off_t)header_bytes, SEEK_SET) != 0) return -1;
         const size_t cap = (size_t)1 << 24;
         uint8_t *buf = (uint8_t *)malloc(cap);
@@ -236,7 +234,7 @@ static int tqf_check_integrity(FILE *f, const char *path, uint32_t header_bytes,
     }
     if (fseeko(f, (off_t)header_bytes, SEEK_SET) != 0) return -1;
     printf("TQF1 format v%u: payload %llu bytes as recorded, header hash OK, payload hash %s\n", version,
-           (unsigned long long)payload_bytes, verify ? "OK (TQ_VERIFY_TQF)" : "not checked (TQ_VERIFY_TQF=1)");
+           (unsigned long long)payload_bytes, g_cfg.verify_tqf ? "OK (TQ_VERIFY_TQF)" : "not checked (TQ_VERIFY_TQF=1)");
     return 0;
 }
 
@@ -342,8 +340,7 @@ static int parse_tqf(const char *path, int upload) {
     int lin_value_dim = g_qwen.linear_num_value_heads * g_qwen.linear_value_head_dim;
     int lin_conv_dim = lin_key_dim * 2 + lin_value_dim;
 
-    const char *eh = getenv("TQ_EMBED_HOST");
-    if (upload && eh && eh[0] && eh[0] != '0' && !g_qwen.tie_word_embeddings) {
+    if (upload && g_cfg.embed_host && !g_qwen.tie_word_embeddings) {
         if (read_embed_host(f, (size_t)g_qwen.V * g_qwen.H) != 0) { fclose(f); return -1; }
     } else if (read_non_quant(f, &g_qwen.d_embed, (size_t)g_qwen.V * g_qwen.H, "embed", upload) != 0) { fclose(f); return -1; }
     if (read_non_quant(f, &g_qwen.d_norm, (size_t)g_qwen.H, "norm", upload) != 0) { fclose(f); return -1; }
@@ -357,10 +354,7 @@ static int parse_tqf(const char *path, int upload) {
     g_qwen.d_embed8 = nullptr;
     g_qwen.d_embed_scale = nullptr;
     if (upload) {
-        const char *ef = getenv("TQ_EMBED_FP8");
-        int emode = 0;
-        if (ef && ef[0] && ef[0] != '0')
-            emode = (ef[0] == '2' || ef[0] == 'e' || ef[0] == 'E') ? 2 : 1;
+        int emode = g_cfg.embed_fp8;
         if (emode && g_qwen.tie_word_embeddings) {
             fprintf(stderr, "TQ_EMBED_FP8 ignored: tie_word_embeddings=TRUE (embed feeds lm_head)\n");
             emode = 0;
@@ -471,8 +465,7 @@ static int parse_tqf(const char *path, int upload) {
     // tools/convert_qwen_tqf.py. The MTP layer is one full_attention decoder layer.
     // TQ_NO_MTP=1 skips it (servers without speculative decoding, e.g. serve_batched.py):
     // the bytes are read past and the engine behaves as for a TQF without the section.
-    const char *nm = getenv("TQ_NO_MTP");
-    int no_mtp = upload && nm && nm[0] && nm[0] != '0';
+    int no_mtp = upload && g_cfg.no_mtp;
     if (g_qwen.has_mtp_section) {
         int mup = upload && !no_mtp;
         tq_layer_t *m = &g_qwen.mtp_layer;
@@ -578,36 +571,28 @@ static int ensure_attn_scores(void) {
 }
 
 extern "C" int qwn_probe(const char *path) {
+    tq_config_load();
     return parse_tqf(path, 0);
 }
 
-                                  // whose tqf scales are per-k32 (offline-marked)
-
 extern "C" int qwn_init(const char *path) {
+    tq_config_load();
+    tq_config_print(stderr, &g_cfg);
     int r = parse_tqf(path, 1);
     if (r != 0) return r;
     // AFTER parse_tqf: it memsets g_qwen, so the runtime context limit must be
     // set here (and before any ensure path allocates KV/scratch).
-    {
-        const char *e = getenv("TQ_CTX");
-        int v = e ? atoi(e) : 8192;
-        if (v < 2048) v = 2048;
-        if (v > TQ_MAX_SEQ) v = TQ_MAX_SEQ;
-        g_qwen.max_seq = v;
-        fprintf(stderr, "context limit: %d tokens (TQ_CTX, cap %d)\n", v, TQ_MAX_SEQ);
+    g_qwen.max_seq = g_cfg.ctx;
+    fprintf(stderr, "context limit: %d tokens (TQ_CTX, cap %d)\n", g_qwen.max_seq, TQ_MAX_SEQ);
+    g_qwen.kv_q4 = g_cfg.kv_q4;
+    if (g_qwen.kv_q4 && g_qwen.hd != 256) {
+        fprintf(stderr, "TQ_KV_Q4=1 requires hd==256 (got %d) -- disabled\n", g_qwen.hd);
+        g_qwen.kv_q4 = 0;
     }
-    {
-        const char *e4 = getenv("TQ_KV_Q4");
-        g_qwen.kv_q4 = (e4 && atoi(e4) != 0) ? 1 : 0;
-        if (g_qwen.kv_q4 && g_qwen.hd != 256) {
-            fprintf(stderr, "TQ_KV_Q4=1 requires hd==256 (got %d) -- disabled\n", g_qwen.hd);
-            g_qwen.kv_q4 = 0;
-        }
-        g_qwen.kv_fp8 = g_qwen.kv_q4;   // V rows + scales ride the FP8 machinery
-        if (g_qwen.kv_q4)
-            fprintf(stderr, "KV prefix cache: K int4 asym g32 + Hadamard rotation, "
-                            "V E4M3 + pow2 scale (TQ_KV_Q4=1); (scale,zp) groups fp16\n");
-    }
+    g_qwen.kv_fp8 = g_qwen.kv_q4;   // V rows + scales ride the FP8 machinery
+    if (g_qwen.kv_q4)
+        fprintf(stderr, "KV prefix cache: K int4 asym g32 + Hadamard rotation, "
+                        "V E4M3 + pow2 scale (TQ_KV_Q4=1); (scale,zp) groups fp16\n");
     return 0;
 }
 

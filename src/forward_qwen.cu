@@ -3,10 +3,11 @@
  * unit behind the qwn_* C ABI, built from the parts in src/engine/ in the order below (a unity build: the parts
  * share statics and are not standalone headers). It loads .tqf model files (docs/TQF_FORMAT.md) and is driven by
  * tools/serve_batched.py (paged KV pool, continuous batching, speculative decoding). How it works:
- * docs/ARCHITECTURE.md; environment flags: docs/FLAGS.md.
+ * docs/ARCHITECTURE.md; environment flags: docs/FLAGS.md (all parsed in engine/config.cuh).
  */
 #include "qwentin.h"
 #include "engine/base.cuh"
+#include "engine/config.cuh"
 #include "engine/kv_cache.cuh"
 #include "engine/t4_kv.cuh"
 #include "engine/attn_prefill.cuh"

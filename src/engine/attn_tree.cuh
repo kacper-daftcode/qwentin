@@ -70,11 +70,6 @@ __device__ __forceinline__ void tq_pdl_enter(void) { tq_pdl_trigger(); tq_pdl_wa
 // (g_pdl_on); TQ_PDL=2 also the step's other kernels (g_pdl_small), which measured slower at 32K: their CTAs,
 // resident early and waiting, cost more than the launch latency they hide.
 static int g_pdl_on = 0, g_pdl_small = 0;
-static int tq_pdl_enabled(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_PDL"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0; }
-    return v;
-}
 template <typename... KArgs, typename... Args>
 static void tq_launch(bool pdl, void (*kern)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st,
                       Args... args) {
@@ -98,16 +93,6 @@ static void tq_launch(bool pdl, void (*kern)(KArgs...), dim3 grid, dim3 block, s
 // gain over the eager spec round, and the verify key varies with the wave's column count -> more captures).
 // DEFAULT 1 since 2026-10-17 (owner's decision (g), with TQ_GEMM_FORK: -0.35 ms per step at every N / context,
 // bitwise); TQ_GRAPH=0 = the eager launch sequence.
-static int tq_graph_enabled(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_GRAPH"); v = (e && *e) ? atoi(e) : 1; if (v < 0) v = 0; }
-    return v;
-}
-static int tq_graph_debug(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_GRAPH_DEBUG"); v = (e && *e) ? atoi(e) : 0; }
-    return v;
-}
 static unsigned g_graph_gen = 1;
 static void graph_cache_clear(void);
 static void graph_invalidate(void) { g_graph_gen++; graph_cache_clear(); }

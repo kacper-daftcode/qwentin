@@ -10,23 +10,12 @@ static int use_qmma_sf(void) {
     return (g_qwen.flags & TQ_FLAG_BLOCK_SCALED_E2M3) != 0;
 }
 
-static int qmma_sf_k_split(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("TQ_QMMA_SF_K_SPLIT");
-        cached = env ? atoi(env) : 0; // 0 => auto (per-projection)
-        if (env && cached < 1) cached = 1;
-        if (cached > 8) cached = 8;
-    }
-    return cached;
-}
-
 // Per-projection K-split for single (non-fused) QMMA.SF GEMVs. Small-Mt
 // projections (o_proj/down_proj, Mt=320 => only ~2 blocks/SM unsplit) need more
 // splits to fill the GPU, while large ones (lm_head, Mt=15520) need none and
 // would only pay extra reduction cost. A fixed TQ_QMMA_SF_K_SPLIT overrides this.
 static int qmma_sf_k_split_auto(int Mt, int Kt) {
-    int fixed = qmma_sf_k_split();
+    int fixed = g_cfg.qmma_sf_k_split;
     if (fixed >= 1) return fixed;
     int best = 1;
     for (int s = 8; s >= 1; s >>= 1) {

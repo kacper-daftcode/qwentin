@@ -104,12 +104,7 @@ static void park_ring_free(void) {
     g_park_ready = 0;
 }
 static int g_park_ring_mode = -1;                  // -1 = from TQ_PARK_RING (default 1), else qwn_park_ring_set
-static int park_ring_enabled(void) {
-    static int c = -1;
-    if (g_park_ring_mode >= 0) return g_park_ring_mode;
-    if (c < 0) { const char *e = getenv("TQ_PARK_RING"); c = (e && *e) ? (atoi(e) != 0) : 1; }
-    return c;
-}
+static int park_ring_enabled(void) { return g_park_ring_mode >= 0 ? g_park_ring_mode : g_cfg.park_ring; }
 // Test ABI: 1 = pinned staging ring, 0 = the per-span pageable path (analysis/park_bench.py A/B).
 extern "C" int qwn_park_ring_set(int on) { g_park_ring_mode = on ? 1 : 0; return 0; }
 static int park_ring_ensure(void) {
@@ -359,7 +354,7 @@ extern "C" int qwn_paged_slot_restore(int slot, int upto_pos, const void *host, 
     if (g_pg_t4) h_slot_encl[slot] = upto_pos + 1;
     // Summaries are a function of K and are not in the parking blob. The restored
     // blocks are new physical ids, so rebuild before the next decode step ranks them.
-    if (paged_topk_pages() > 0) {
+    if (g_cfg.paged_topk_pages > 0) {
         if (paged_kmm_rebuild_slot(slot, upto_pos, g_qwen.stream) != 0) return -7;
     }
     return 0;

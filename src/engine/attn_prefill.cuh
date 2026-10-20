@@ -1178,11 +1178,6 @@ __global__ void __launch_bounds__(256) k_tq_pattn_merge(
 // 128-column wave at 32K, 67.6 -> 34.2 at 128K; e2e dKL within the CI at 4K / 32K on two seeds, spec exactness ALL PASS,
 // needle 6/6; notes/session11-pattn.md); 3 / 4 / 5 = fp16-accumulate variants (opt-in: a position-dependent +0.00005 dKL
 // at >= 24K); 2 = instrumentation.
-static int pattn_gqa_mode(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_PATTN_GQA"); c = (e && *e) ? atoi(e) : 1; }
-    return c;
-}
 static float *g_pattn_part = NULL;
 static size_t g_pattn_part_f = 0;
 static int g_pattn_sms = 0;
@@ -1213,7 +1208,7 @@ static int launch_pattn_t4(float *out, const float *q_proj, const uint16_t *q_no
     }
     // TQ_PATTN_GQA: 1 = fp32 accumulate, Q in registers; 2 = Q half in smem (QH); 3 = QH + fp16-accumulate Q.K^T (AQ);
     // 4 = QH + AQ + fp16-accumulate P.V (AP); 5 = QH + AP only
-    const int mode = pattn_gqa_mode();
+    const int mode = g_cfg.pattn_gqa;
     static int attr_done = 0;
     if (!attr_done) {
         if (cudaFuncSetAttribute(k_tq_pattn_t4<6, 0, 0, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, TQ_PA_SMEM0) != cudaSuccess ||
@@ -1236,7 +1231,7 @@ static int launch_pattn_t4(float *out, const float *q_proj, const uint16_t *q_no
     }
 #undef TQ_PATTN_LAUNCH
     k_tq_pattn_merge<6><<<dim3(nkv * nblk * 8), 256, 0, st>>>(out, q_proj, n, nblk, S, q_m, attn_m, g_pattn_part);
-    if (getenv("TQ_PATTN_DEBUG")) {                     // scan the partials of this launch for non-finite values
+    if (g_cfg.pattn_debug) {                            // scan the partials of this launch for non-finite values
         static int shown = 0;
         if (shown < 4) {
             shown++;
@@ -1283,20 +1278,5 @@ static int ensure_wide_attn_part(size_t floats) {
     if (cudaMalloc(&g_wide_attn_part, floats * sizeof(float)) != cudaSuccess) return -1;
     g_wide_attn_part_f = floats;
     return 0;
-}
-
-// Query rows per attention block on the Q4 wide-prefill path: 32 (QT=2, default)
-// halves the L2 K/V stream per query token on the L2-bound kernel; 16 = legacy
-// (escape: TQ_WIDE_ATTN_QROWS=16).
-static int wide_attn_qrows(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_WIDE_ATTN_QROWS"); c = (e && atoi(e) == 16) ? 16 : 32; }
-    return c;
-}
-
-static int wide_attn_mma_enabled(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_WIDE_ATTN_MMA"); c = (e && atoi(e)) ? 1 : 0; }
-    return c;
 }
 

@@ -630,22 +630,12 @@ static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
 // (the fragment buffer is read-only, the outputs distinct), so the small k/v_proj GEMMs (80 of 680 blocks) and every
 // member's tail fill the GPU instead of serializing. Same kernels, same grids, same k-splits -> bitwise; each side
 // member gets its own k-split partial buffer (the shared one would race) and, as every launch, its own counter slot.
-static int tq_gemm_fork_enabled(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_GEMM_FORK"); v = (e && *e) ? (atoi(e) != 0) : 1; }
-    return v;
-}
 // TQ_GEMM_FORK_MAXN (session 11, wave-sched thread; default 64): the fork only up to this N. At decode / verify
 // sizes the members underfill the GPU and the fork pays (-0.35 ms per step with the graph); at the 128-column
 // prefill wave every member is a full one-block-per-SM pass (gate + up: 2 x 136 blocks on 170 SMs), the side
 // member only runs when the main one retires (175 us concurrent vs 2 x 90 serial = no overlap), and the join
 // breaks the PDL chain -- measured 0.0 ms either way (notes/session11-sched.md), so the wave runs its groups
-// serially: one stream, no join, the idle SMs of each pass free for the low-priority encoder (TQ_T4_SCHED).
-static int tq_gemm_fork_maxn(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("TQ_GEMM_FORK_MAXN"); v = (e && *e) ? atoi(e) : 64; if (v < 0) v = 0; }
-    return v;
-}
+// serially: one stream, no join, the idle SMs of each pass free for the trellis encoder's side stream.
 static float *g_wproj_part_side[2] = {NULL, NULL}; static size_t g_wproj_part_side_bytes[2] = {0, 0};
 static int g_exl3_part_sel = 0;                     // 0 = the main partial buffer, 1..2 = side member i's
 static cudaStream_t g_fork_st[2] = {NULL, NULL};
@@ -713,9 +703,7 @@ static int exl3_unit_ng(int N, int MB) {
     // Measured 10-16 (GPU 2, 550 W, trellis stack): KB=5 GEMMs 99 -> 87 us, KB=6 74.5 -> 67.6, KB=7 unchanged;
     // 128-column wave at 32K 69.7 -> 66.1 ms (-5.1 %), at 128K 120.0 -> 116.9 (-2.6 %); bitwise (per-Linear vs the
     // 64-token units at N = 128 / 130 / 256, prefill-mode e2e). =0 restores the 64-token units.
-    static int ng16 = -1;
-    if (ng16 < 0) { const char *f = getenv("TQ_EXL3_WIDE_NG16"); ng16 = (f && *f) ? (atoi(f) != 0) : 1; }
-    if (ng16 && N >= 128 && units16 >= 32) return 16;
+    if (g_cfg.exl3_wide_ng16 && N >= 128 && units16 >= 32) return 16;
     if (units16 >= 1024) return 16;
     int units8 = MB * ((N + 63) / 64);
     if (units8 >= 64) return 8;
@@ -734,7 +722,7 @@ static int exl3_unit_ng(int N, int MB) {
 // many clients; the attention launches T x S blocks instead of the fewer a T-column step would pick).
 static int g_split_n_override = 0;
 static int exl3_pick_splits(int cap, int units, int Kt16, int N, int M, int KB, int *per_out) {
-    int fixed = qmma_sf_k_split();
+    int fixed = g_cfg.qmma_sf_k_split;
     int ks;
     if (g_split_n_override > 0) N = g_split_n_override;
     if (fixed >= 1) ks = fixed;
@@ -799,9 +787,7 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
     int *ctr = g_exl3_ctr + (size_t)(g_exl3_ctr_next++ % TQ_EXL3_CTR_SLOTS) * TQ_EXL3_CTR_STRIDE;
     tq_launch(g_pdl_on, k_tq_exl3_wide_gemm<KB, NG>, dim3(grid), dim3(256), 0, st, out, pout, split_stride,
               w->d_exl3_trellis, bp, w->d_exl3_svh, M, Kt16, N, (Gt + 1) / 2, g_base, ntg, ks, per, ctr);
-    static int dbg = -1;
-    if (dbg < 0) dbg = getenv("TQ_EXL3_DEBUG") != NULL;
-    if (dbg) {   // counters must be back at zero after every launch
+    if (g_cfg.exl3_debug) {   // counters must be back at zero after every launch
         int h[2 + 64];
         cudaStreamSynchronize(st);
         cudaMemcpy(h, ctr, sizeof(h), cudaMemcpyDeviceToHost);
@@ -892,9 +878,7 @@ static int exl3_wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (!g_exl3_x || g_exl3_K != K || g_exl3_N < N) return -110;
     if (w->exl3_kbits == 0) {
         if (!w->d_exl3_bf16) return -111;
-        static int r4 = -1;
-        if (r4 < 0) { const char *e = getenv("TQ_EXL3_BF16_R4"); r4 = (e && *e) ? (atoi(e) != 0) : 1; }
-        if (r4 && N > 16 && (M & 3) == 0 && (K & 1023) == 0)
+        if (g_cfg.exl3_bf16_r4 && N > 16 && (M & 3) == 0 && (K & 1023) == 0)
             k_tq_exl3_bf16_wide_r4<<<dim3(M / 4, (N + 7) / 8), 1024, 0, g_qwen.stream>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
         else
             k_tq_exl3_bf16_wide<<<dim3(M, (N + 7) / 8), 1024, 0, g_qwen.stream>>>(out, w->d_exl3_bf16, g_exl3_x, M, K, N);
@@ -917,7 +901,7 @@ static int wide_proj_group(const tq_qmma_weight_t *const *ws, float *const *outs
     }
     size_t need_w = 0;
     int r = exl3_build_frags(ws, n, N, &need_w);
-    if (r == 0 && tq_gemm_fork_enabled() && N <= tq_gemm_fork_maxn() && fork_streams_ok()) {
+    if (r == 0 && g_cfg.gemm_fork && N <= g_cfg.gemm_fork_maxn && fork_streams_ok()) {
         // members 1.. on the side streams, concurrently with member 0 (fork after the fragments, join before the
         // next op of the main stream: the consumer and the next PDL launch wait for every member)
         cudaStream_t ms = g_qwen.stream;

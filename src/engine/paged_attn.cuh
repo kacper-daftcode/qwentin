@@ -534,13 +534,8 @@ __global__ void __launch_bounds__(256, TQ_AST_MINB) k_tq_paged_attn_q4_gqa_mma_s
 // verify == decode, -1.5 ms per step at 32K N = 8; TQ_PAGED_ATTN_ST=1 reverts to the kernel that is bitwise e1ecb3a's.
 // The page-list (Quest) path and E4M3 V always use the base kernel; with TQ_KV_T4 the trellis pool runs its own GQA
 // kernels and this knob is a no-op (see launch_paged_attn_q4).
-static int paged_attn_st_enabled(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_PAGED_ATTN_ST"); c = (e && *e) ? atoi(e) : 3; if (c < 0 || c > 3) c = 3; }
-    return c;
-}
 // The effective TQ_PAGED_ATTN_ST (for the server's startup line).
-extern "C" int qwn_paged_attn_st(void) { return paged_attn_st_enabled(); }
+extern "C" int qwn_paged_attn_st(void) { return g_cfg.paged_attn_st; }
 
 // ===== Segment-aware GQA attention for the verify wave (task 10, stage 5 performance item (a)) =====
 // One block = (kv head, segment of up to QT*16/group consecutive columns of ONE slot, key split): the slot's
@@ -1908,19 +1903,13 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
 //        32K client instead of +5.2 (HBM bound ~0.5 ms)
 //   128K N=1 37.1 -> 19.6, N=2 58.8 -> 22.6; +3.0 ms per 128K client instead of +21.7 (bound ~1.9)
 //   -> ~0.023 us per context token per client per step (was 0.165).
-static int paged_attn_gqa_mma_enabled(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_PAGED_ATTN_MMA"); c = (e && *e) ? (atoi(e) != 0) : 1; }
-    return c;
-}
 
 // key splits for the GQA MMA decode kernel: enough (nkv x N x S) blocks to cover the SMs ~2x,
 // each split >= 2 super-tiles, at most 64 (the merge reads S partials per head).
 // TQ_PAGED_GQA_SPLIT=s pins the split (clamped by the context only, so a column's partition is the
 // same at any N: the bitwise verify-vs-decode check of analysis/spec_paged_check.py). Default auto.
 static int paged_gqa_split_S(int N, int pos_max) {
-    static int forced = -2;
-    if (forced == -2) { const char *e = getenv("TQ_PAGED_GQA_SPLIT"); forced = (e && *e) ? atoi(e) : -1; }
+    const int forced = g_cfg.paged_gqa_split;
     if (g_split_n_override > 0) N = g_split_n_override;
     int nst = (pos_max + 128) >> 7;
     int sm = paged_sm_count();
@@ -1951,8 +1940,7 @@ static int paged_attn_f16_cap(int qt, int kf16) {
     return c;
 }
 static int paged_gqa_split_S_f16(int N, int pos_max, int qt, int kf16) {
-    static int forced = -2;
-    if (forced == -2) { const char *e = getenv("TQ_PAGED_GQA_SPLIT"); forced = (e && *e) ? atoi(e) : -1; }
+    const int forced = g_cfg.paged_gqa_split;
     if (g_split_n_override > 0) N = g_split_n_override;
     int nst = (pos_max + 128) >> 7;
     int blocks0 = g_qwen.nkv * N;
@@ -1972,11 +1960,6 @@ static int g_pg_t4 = 0;                         // TQ_KV_T4 (trellis pool, below
 // needle 6/6 at 32K / 128K); the fp16 operands alone were speed-neutral (the kernel is LSU-bound: table-lookup bank
 // conflicts 3.4 wavefronts/LDS, 3x the FP4 kernel's global load requests), the V staging (TQ_T4_VSTAGE) made it
 // 335 -> 277 us per layer at 32K N=8 (-1.0 ms per step vs the bf16 kernels; FP4 + ST3 = 249 us).
-static int paged_attn_t4_f16_enabled(void) {
-    static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_T4_ATTN_F16"); c = (e && *e) ? (atoi(e) != 0) : 1; }
-    return c;
-}
 // resident-block capacity of the T4 fp16 kernel (QT = 1's: decode and verify share one picker, so a column's split
 // count -- and bits -- is the same in both)
 static int paged_attn_t4_cap(void) {
@@ -1989,8 +1972,7 @@ static int paged_attn_t4_cap(void) {
     return c;
 }
 static int paged_gqa_split_S_cap(int N, int pos_max, int cap) {
-    static int forced = -2;
-    if (forced == -2) { const char *e = getenv("TQ_PAGED_GQA_SPLIT"); forced = (e && *e) ? atoi(e) : -1; }
+    const int forced = g_cfg.paged_gqa_split;
     if (g_split_n_override > 0) N = g_split_n_override;
     int nst = (pos_max + 128) >> 7;
     int blocks0 = g_qwen.nkv * N;
@@ -2000,8 +1982,8 @@ static int paged_gqa_split_S_cap(int N, int pos_max, int cap) {
     return S < 1 ? 1 : S;
 }
 static int paged_attn_split_S(int N, int pos_max, int qt) {
-    int st = paged_attn_st_enabled();
-    if (g_pg_t4) return paged_attn_t4_f16_enabled() ? paged_gqa_split_S_cap(N, pos_max, paged_attn_t4_cap()) : paged_gqa_split_S(N, pos_max);
+    int st = g_cfg.paged_attn_st;
+    if (g_pg_t4) return g_cfg.t4_attn_f16 ? paged_gqa_split_S_cap(N, pos_max, paged_attn_t4_cap()) : paged_gqa_split_S(N, pos_max);
     return (st >= 2 && g_pg_v4) ? paged_gqa_split_S_f16(N, pos_max, qt, st == 3) : paged_gqa_split_S(N, pos_max);
 }
 
@@ -2041,8 +2023,6 @@ static int *g_kmm_slot_d = NULL, *g_kmm_pos_d = NULL;
 static int g_kmm_ready = 0;
 static int *g_topk_list = NULL, *g_topk_count = NULL;
 static int g_topk_cap = 0, g_topk_k_alloc = 0;
-static int paged_topk_pages(void);
-static int paged_topk_min_ctx(void);
 static int paged_kmm_refresh(int layer, const int *pos_h, const int *slot_h, int n, cudaStream_t st);
 static int paged_topk_rank(int layer, const float *q_proj, const uint16_t *q_norm_w,
                            const int *positions, const int *slot_ids, int N, int max_pos,
@@ -2172,16 +2152,16 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
                    slot_ids, block_table, max_blocks, page, page_log, st, t4_layer);
     if (t4 && wave_seg_slot &&          // prefill (scalar path) / verify wave: the wave's columns -> trellis for this layer
         paged_t4_encode_wave_layer(wave_seg_slot, wave_seg_off, wave_seg_len, pos_host, wave_K, t4_layer, st) != 0) return -5;
-    int kpages = paged_topk_pages();
+    int kpages = g_cfg.paged_topk_pages;
     if (kpages > 0 && pos_host && slot_host) {
         if (paged_kmm_refresh(layer, pos_host, slot_host, N, st) != 0) return -3;
     }
     int nblk = (max_pos >> page_log) + 1;
     // Full coverage and short contexts take the dense walk. Ranking them only adds a launch.
-    int use_topk = do_topk && kpages > 0 && nblk > kpages && max_pos + 1 >= paged_topk_min_ctx()
-                   && paged_attn_gqa_mma_enabled()
+    int use_topk = do_topk && kpages > 0 && nblk > kpages && max_pos + 1 >= g_cfg.paged_topk_min_ctx
+                   && g_cfg.paged_attn_mma
                    && (page & 127) == 0 && hd == 256 && nh % nkv == 0 && nh / nkv <= 16;
-    if (paged_attn_gqa_mma_enabled() && (page & 127) == 0 && hd == 256 && nh % nkv == 0 && nh / nkv <= 16) {
+    if (g_cfg.paged_attn_mma && (page & 127) == 0 && hd == 256 && nh % nkv == 0 && nh / nkv <= 16) {
         int S;
         if (use_topk) {
             int budget = kpages + 3;
@@ -2197,7 +2177,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
         const int *col_S = NULL;
         if (g_attn_col_S && !use_topk) { col_S = g_attn_col_S; S = g_attn_col_S_max; }   // per-column S (verify)
         if (S > 1 && ensure_attn_partials((size_t)nh * N * S) != 0) { S = 1; col_S = NULL; }
-        const int st_mode = paged_attn_st_enabled();
+        const int st_mode = g_cfg.paged_attn_st;
         if (st_mode >= 2 && !use_topk && g_pg_v4 && !t4 && batched_q4s_elem_bytes() == 2) {
             // fp16 int4 path (TQ_PAGED_ATTN_ST=2: P.V; 3: + K/Q): the decode step as N one-column segments, the
             // verify wave as its slot sub-segments -- one kernel, so verify == decode bitwise.
@@ -2215,7 +2195,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
             if (S > 1) paged_attn_merge(out, q_proj, positions, N, S, st, col_S);
             return cudaGetLastError() == cudaSuccess ? 0 : -1;
         }
-        if (t4 && !use_topk && paged_attn_t4_f16_enabled()) {
+        if (t4 && !use_topk && g_cfg.t4_attn_f16) {
             // TQ_KV_T4 fp16 path (attention third pass on the trellis pool): the decode step as N one-column segments,
             // the verify wave as its slot sub-segments -- one kernel, so verify == decode bitwise
             const bool seg = col_S && g_attn_seg_cnt > 0;
@@ -2346,7 +2326,7 @@ static int launch_paged_attn_q4_mma_prefill(
     // Prefill attention stays dense. Summaries of the pages this wave wrote are refreshed
     // so a later pure decode step can rank them. Decode columns inside a mixed wave are
     // covered here too (they share this KV write).
-    if (paged_topk_pages() > 0 && col_pos_host && col_slot_host) {
+    if (g_cfg.paged_topk_pages > 0 && col_pos_host && col_slot_host) {
         if (paged_kmm_refresh(layer, col_pos_host, col_slot_host, T, st) != 0) return -3;
     }
     for (int k = 0; k < K; k++) {
@@ -2354,15 +2334,16 @@ static int launch_paged_attn_q4_mma_prefill(
         // 32-row query tiles (QT=2) like the single-stream wide path: the kernel is L2-bound on
         // the K/V super-tile stream, so two tiles per block halve that traffic per query token
         // (the ragged path ran QT=1 until 2026-09-22: 128K prefill 115 s vs 85 s single-stream).
-        // Segments shorter than 32 rows (decode columns in mixed waves, short follow-ups) keep QT=1.
-        int qr = (wide_attn_qrows() == 32 && n > 16) ? 32 : 16;
+        // Segments shorter than 32 rows (decode columns in mixed waves, short follow-ups) keep QT=1, and so does every
+        // segment with TQ_WIDE_ATTN_QROWS=16.
+        int qr = (g_cfg.wide_attn_qrows == 32 && n > 16) ? 32 : 16;
         int nqt = (n + qr - 1) / qr;
         int part_f = 2 * qr + qr * 256;
         // key-split by this segment's own prefix depth (its last column's slot pos);
         // segments run sequentially on one stream, so the partial slab is reused
         int max_pos = col_pos_host ? col_pos_host[off + n - 1] : -1;
         // session 11: the GQA-grouped fp16 kernel for trellis segments of >= 32 columns (TQ_PATTN_GQA=1)
-        if (t4 && pattn_gqa_mode() > 0 && n >= 32 && max_pos >= 0 &&
+        if (t4 && g_cfg.pattn_gqa > 0 && n >= 32 && max_pos >= 0 &&
             launch_pattn_t4(out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w, k4_pool, v8_pool,
                             positions + off, slot, block_table, max_blocks, page, page_log, n, max_pos, t4p, st) == 0)
             continue;

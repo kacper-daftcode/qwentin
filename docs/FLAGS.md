@@ -8,43 +8,77 @@ restore each previous served line bit for bit.
 
 ## Engine environment flags
 
-Environment flags read by the engine (`src/forward_qwen.cu` and its `src/engine/` parts; the server sets several of them
-from its arguments unless they are already in the environment):
+The engine reads these switches once, in `qwn_init`: `src/engine/config.cuh` parses all of them into one struct and no
+other part of the engine reads the environment, so a process sets them before it loads a model. One rule for every
+switch: unset or empty = the default; otherwise the integer value (`atoi`), on / off for a boolean switch (any non-zero
+value is on); an integer outside a switch's range is clamped, or replaced as the table in `config.cuh` says (e.g.
+`TQ_PAGED_ATTN_ST=7` reads as 3, `TQ_GDN_PREFILL=9` as 0). `qwn_init` prints the switches that differ from their
+defaults in one `[config]` line on stderr; the served line's is `[config] TQ_CTX=262144 TQ_KV_Q4=1 TQ_KV_V4=1 TQ_KV_T4=1
+TQ_EMBED_HOST=1 TQ_EMBED_FP8=2 TQ_PDL=1 TQ_WIDE_ATTN_MMA=1 (the other 26 TQ_* switches at their defaults)`. The server
+sets several switches from its arguments unless they are already in the environment; the Default column gives the
+engine's default and, where it differs, what the served line runs.
+
+### Configuration
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `TQ_CTX` | 262144 | max context per session (the engine cap) |
-| `TQ_KV_Q4=1` | — | int4 K paged pool (required by the batched server) |
-| `TQ_KV_V4` | server: 1 | V stored like K: FWHT-256-rotated int4, asymmetric per 32 channels (20.0 KiB/token); required by `TQ_KV_T4` (`--kv-v4`) |
-| `TQ_KV_T4` | server: 1 | 4-bit trellis-coded K+V for every committed token, 16.5 KiB/token; the open page is staged exact (`--kv-t4`). `TQ_KV_T4_ASYNC` (1): prefill waves attend their own columns exact and encode on a side stream (=0 reproduces the exllamav3 simulation exactly) |
+| `TQ_CTX` | 8192; served 262144 | max context per session, clamped to [2048, 262144] (the engine cap) |
+| `TQ_KV_Q4` | 0; served 1 | int4 K paged pool (required by the batched server) |
+| `TQ_KV_V4` | 0; server 1 | V stored like K: FWHT-256-rotated int4, asymmetric per 32 channels (20.0 KiB/token); required by `TQ_KV_T4` (`--kv-v4`) |
+| `TQ_KV_T4` | 0; server 1 | 4-bit trellis-coded K+V for every committed token, 16.5 KiB/token; the open page is staged exact (`--kv-t4`) |
 | `TQ_KV_T4_CODEBOOK` | unset | a file of 4096 raw fp32 entries that replaces the built-in codebook (`--kv-t4-codebook`); unset = the Lloyd-trained `lloyd_kv12a` compiled into the engine (`src/engine/kv_t4_codebook.inc`, generated from `tools/codebooks/lloyd_kv12a.f32`) |
+| `TQ_DSTATE_BF16` | 4 | DeltaNet recurrent state storage: 0 fp32 (155 MiB/slot, the 10-16 line bitwise), 1 bf16 (fails the yardstick), 2 fp16 RNE (fails long pure decode), 3 bf16 + 8 bits (24-bit, neutral), 4 fp16 with deterministic stochastic rounding (80 MiB/slot, neutral everywhere measured; `--dstate fp16sr`); `qwn_paged_init` refuses other values |
+| `TQ_EMBED_HOST` | 0; server 1 | the bf16 embedding table in pinned host RAM, rows read over PCIe (`--embed-host`; no device copy, no quantization error). Overrides `TQ_EMBED_FP8` |
+| `TQ_EMBED_FP8` | 0; the README's command sets 2 | the embedding table quantized on the device: 1 = per-row E4M3, 2 = 6-bit E2M3 (−1.5 GiB); irrelevant with `TQ_EMBED_HOST=1`, which overrides it |
+| `TQ_NO_MTP` | 0; server 1 unless `--spec`/`--mtp` | skip the tqf's MTP section (the bf16 head is 0.85 GB; the EXL3 one 0.21 GB) |
 | `TQ_VERIFY_TQF` | 0 | 1 = also hash the whole payload of a format-v2 `.tqf` at load and refuse a mismatch (one extra read, ~20 s for 21 GB); the header hash and the recorded payload size are checked on every load (docs/TQF_FORMAT.md) |
+| `TQ_PDL` | 0; server 1 | programmatic dependent launch of the fragment build + EXL3 GEMM in the decode step (`--pdl`; bitwise, −0.55…−0.61 ms/step); 2 = also the step's other kernels (measured slower at 32K) |
+| `TQ_WIDE_ATTN_MMA` | 0; server 1 | tensor-core ragged prefill attention (the batched server sets it for `--page >= 128`; without it the waves use the scalar decode kernel per column, ~6× slower prefill) |
+| `TQ_PAGED_ATTN_MMA` | 1 | tensor-core GQA decode attention; 0 = the scalar decode kernel |
+| `TQ_GDN_PREFILL` | 1 | the 48 gated-DeltaNet layers of a paged prefill wave through a hoisted prep kernel + a register-resident chunk kernel (`--gdn-prefill`; engine `b2e7a3f`, session 11): the state-independent work once per wave instead of per sub-chunk, the recurrent state in registers across the 16 sub-chunks, same FMA chains / contractions / SR seeds → bitwise with the 10-16 kernels on every gate. DeltaNet 14.95 → 2.76 ms per 128-column wave, the wave 65.7 → 55.0 ms at 32K and 116.5 → 106.0 ms at 128K; served-line TTFT 15.9 → 13.3 s @32K, 86.6 → 77.0 s @128K (`docs/evidence/cand8-all.log`); decode / verify / commit untouched. 0 = the 10-16 kernels (`--no-gdn-prefill`); 2 / 3 = the 8-warp / 2-warp variants (bitwise, slower) |
+
+### Off-switches and opt-in experiments
+
+A non-default value restores an earlier served line bit for bit (the row says which) or runs a measured variant that
+is not the served one.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
 | `TQ_T4_ATTN_F16` | 1 | the trellis pool's decode step and verify wave run the fp16-operand segment kernel with cp.async-staged V codes (one kernel for both; −1.0 ms/step at 32K N = 8); 0 = the bf16 per-column + segment kernels (the 10-15 path, bit for bit) |
 | `TQ_PAGED_ATTN_ST` | 3 | FP4 / E4M3 pools only (a no-op under `TQ_KV_T4`): 0 base GQA decode kernel, 1 staged-V kernel (bitwise = base), 2 fp16 P·V, 3 also fp16 K dequant and Q (−1.5 ms/step at 32K N = 8, verify == decode) |
 | `TQ_GRAPH` | 1 | the paged decode step as a CUDA graph (captured per N / key split / MTP columns / flags, LRU of instantiated graphs; a buffer grown inside a capture drops the graph and recaptures); 2 = also the verify wave and the MTP draft (measured: no gain, keep off); 0 = eager |
 | `TQ_GEMM_FORK` | 1 | the 2nd/3rd Linear of an input-sharing group (k/v after q, z after qkv, up after gate) on side streams concurrently with the first; same kernels, grids, k-splits → bitwise. With `TQ_GRAPH=1`: −0.35 ms/step at every N and context |
 | `TQ_GEMM_FORK_MAXN` | 64 | the GEMM fork only up to N columns: decode steps and verify waves (N ≤ 64) keep it, the 128-column prefill wave runs its gate / up groups on one stream (bitwise, neutral on the wave); 1000000 = fork at every N, the previous behaviour |
-| `TQ_DSTATE_BF16` | 4 | DeltaNet recurrent state storage: 0 fp32 (155 MiB/slot, the 10-16 line bitwise), 1 bf16 (fails the yardstick), 2 fp16 RNE (fails long pure decode), 3 bf16 + 8 bits (24-bit, neutral), 4 fp16 with deterministic stochastic rounding (80 MiB/slot, neutral everywhere measured; `--dstate fp16sr`) |
 | `TQ_EXL3_WIDE_NG16` | 1 | 128-token EXL3 GEMM units at one block per SM for every Linear with ≥ 32 of them (k/v_proj keep 32-token units): −5.1 % per 32K prefill wave, −2.6 % at 128K, bitwise; 0 = 64-token units |
 | `TQ_EXL3_BF16_R4` | 1 | the bf16 DeltaNet `in_proj_b/a` at prefill N: 4 rows per block, shuffle tree (same partial sums → bitwise), −1.1 % per wave; 0 = the one-row kernel |
-| `TQ_GDN_PREFILL` | 1 | the 48 gated-DeltaNet layers of a paged prefill wave through a hoisted prep kernel + a register-resident chunk kernel (`--gdn-prefill`; engine `b2e7a3f`, session 11): the state-independent work once per wave instead of per sub-chunk, the recurrent state in registers across the 16 sub-chunks, same FMA chains / contractions / SR seeds → bitwise with the 10-16 kernels on every gate. DeltaNet 14.95 → 2.76 ms per 128-column wave, the wave 65.7 → 55.0 ms at 32K and 116.5 → 106.0 ms at 128K; served-line TTFT 15.9 → 13.3 s @32K, 86.6 → 77.0 s @128K (`docs/evidence/cand8-all.log`); decode / verify / commit untouched. 0 = the 10-16 kernels (`--no-gdn-prefill`); 2 / 3 = the 8-warp / 2-warp variants (bitwise, slower) |
 | `TQ_PATTN_GQA` | 1 | the trellis pool's paged prefill attention as one GQA-grouped tensor-core kernel with fp32 accumulation (since v0.10, main `9c0a046`): attention 17.0 → 9.3 ms per 128-column wave at 32K, 67.6 → 34.2 ms at 128K; served-line TTFT 13.3 → 11.8 s @32K, 77.0 → 60.4 s @128K. Not bitwise (a different tiling of the same fp32 online softmax): e2e within the 95 % CI at 4K and 32K, spec exactness ALL PASS, needle 6/6 (`docs/evidence/cand9-all.log`). 0 = the per-head bf16 kernel of v0.10 bit for bit; 3 / 4 / 5 = fp16-accumulate variants (opt-in, +0.00005 KL at ≥ 24K); 2 = instrumentation |
-| `TQ_WAVE_MAX` | 128 | prefill wave column cap (≤ 256, EXL3 only, for the 256-column A/B; not bitwise by design — half the k-splits). The trellis pool keeps one in-flight staging page per slot, so it stays ≤ 128 there |
-| `TQ_PDL` | server: 1 | programmatic dependent launch of the fragment build + EXL3 GEMM in the decode step (`--pdl`; bitwise, −0.55…−0.61 ms/step); 2 = also the step's other kernels (measured slower at 32K) |
-| `TQ_EMBED_HOST` | server: 1 | the bf16 embedding table in pinned host RAM, rows read over PCIe (`--embed-host`; no device copy, no quantization error). Overrides `TQ_EMBED_FP8` |
-| `TQ_NO_MTP` | server: 1 unless `--spec`/`--mtp` | skip the tqf's MTP section (the bf16 head is 0.85 GB; the EXL3 one 0.21 GB) |
-| `TQ_EMBED_FP8` | 0 (the README's command sets 2) | the embedding table quantized on the device: 1 = per-row E4M3, 2 = 6-bit E2M3 (−1.5 GiB); irrelevant with `TQ_EMBED_HOST=1`, which overrides it |
-| `TQ_WIDE_ATTN_MMA=1`, `TQ_PAGED_ATTN_MMA=1` | server: on | wide / ragged tensor-core prefill and decode attention (the batched server sets `TQ_WIDE_ATTN_MMA=1` for `--page >= 128`; `TQ_PAGED_ATTN_MMA=0` = the scalar decode kernel) |
-| `TQ_WIDE_ATTN_QROWS` | 32 | query rows per block of the int4-K wide-prefill attention: 32 halves the L2 K/V stream per query token; 16 = the earlier one-tile kernel (bit-identical) |
-| `TQ_PAGED_TOPK_PAGES` | 0 | Quest-style page top-k for the decode attention from `TQ_PAGED_TOPK_MIN_CTX` (16384) positions on (built, measured to fail the FP8 gate below ~75 % of the pages; keep 0; not ported to the trellis pool; kept as the starting point of a trained indexer) |
+| `TQ_WAVE_MAX` | 128 | prefill wave column cap (1…256, EXL3 only, for the 256-column A/B; not bitwise by design — half the k-splits). The trellis pool keeps one in-flight staging page per slot, so it stays ≤ 128 there |
+| `TQ_WIDE_ATTN_QROWS` | 32 | query rows per block of the int4-K wide-prefill attention: 32 halves the L2 K/V stream per query token; 16 = the earlier one-tile kernel (bit-identical); other values read as 32 |
+| `TQ_KV_T4_ASYNC` | 1 | trellis pool: prefill waves attend their own columns exact and encode them on a side stream; 0 = encode synchronously per layer (reproduces the exllamav3 simulation exactly) |
+| `TQ_PAGED_TOPK_PAGES` | 0 | Quest-style page top-k for the decode attention, this many pages (≤ 4096) from `TQ_PAGED_TOPK_MIN_CTX` positions on (built, measured to fail the FP8 gate below ~75 % of the pages; keep 0; not ported to the trellis pool; kept as the starting point of a trained indexer) |
+| `TQ_PAGED_TOPK_MIN_CTX` | 16384 | the context from which `TQ_PAGED_TOPK_PAGES` applies |
 
-Debug switches (off by default, diagnostics only): `TQ_PATTN_DEBUG` (non-finite check of the prefill-attention
-partials), `TQ_EXL3_DEBUG` (GEMM work-counter check), `TQ_GRAPH_DEBUG`, `TQ_PAGED_TOPK_DEBUG`. Pins for tools and tests:
-`TQ_PARK_RING` (1 = park sessions through the pinned host ring, 0 = the per-span pageable copy; reported by
-`/health`), `TQ_QMMA_SF_K_SPLIT` and `TQ_PAGED_GQA_SPLIT` (fixed split counts instead of the auto pickers; the pinned
-mode of `tools/spec_paged_check.py`). The engine reads no other `TQ_*` variable.
+### Pins for tools and tests
 
-<sub>Provenance: the flags and defaults are those `src/engine/` reads (every `getenv` is in the table or in the paragraph above); the measured effects quoted per row come from the landing gates in `docs/evidence/` (`cand4-all.log` … `cand16-all.log`) and `ASSUMPTIONS.md` (research repo), 2026-10-16…20, CUDA 13.1, driver 610.57.04.</sub>
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `TQ_PARK_RING` | 1 | 1 = park sessions through the pinned host ring, 0 = the per-span pageable copy (reported by `/health`; `qwn_park_ring_set` overrides it at run time) |
+| `TQ_QMMA_SF_K_SPLIT` | 0 = auto | a fixed k-split count (1…8) for the FP6 GEMVs and the EXL3 GEMMs instead of the auto pickers (the pinned mode of `tools/spec_paged_check.py`) |
+| `TQ_PAGED_GQA_SPLIT` | −1 = auto | a fixed key-split count (≥ 1) for the GQA decode attention instead of the auto pickers (the same) |
+
+### Diagnostics
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `TQ_PATTN_DEBUG` | 0 | scan the prefill-attention partials of the first launches for non-finite values |
+| `TQ_EXL3_DEBUG` | 0 | check the EXL3 GEMM work counters after every launch (synchronizes) |
+| `TQ_GRAPH_DEBUG` | 0 | log the CUDA-graph captures (decode step, verify wave, draft), their instantiation times and the steps that fall back to eager |
+| `TQ_PAGED_TOPK_DEBUG` | 0 | log the page top-k selection of client 0 once per process |
+
+<sub>Provenance: the switches, defaults and ranges are the table in `src/engine/config.cuh` (`tests/test_config.py` checks
+that every switch has exactly one row here and pins the parse rule); the measured effects quoted per row come from the
+landing gates in `docs/evidence/` (`cand4-all.log` … `cand18-all.log`) and `ASSUMPTIONS.md` (research repo),
+2026-10-16…20, CUDA 13.1, driver 610.57.04.</sub>
 
 ## Server arguments
 
