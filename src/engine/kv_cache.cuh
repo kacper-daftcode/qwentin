@@ -95,30 +95,23 @@ static __device__ __forceinline__ void tq_fwht256_warp(float x[8], int lane) {
 }
 
 // ===== TQ_KV_Q4 K (scale, zp) group storage helpers =====
-// The d_k_q4s buffer holds (scale, zp) pairs as fp16 (default) or fp32 (escape
-// hatch). To keep every signature `float*`, these reinterpret the base by the
-// runtime type. q4s_adv advances a (tagged) base by `n` scale-elements; q4s_at
-// loads element i; q4s_put stores. Only compose q4s_adv outputs with q4s_at/_put
-// (never raw float* arithmetic on the result).
+// The d_k_q4s buffers hold (scale, zp) pairs as fp16 behind `float *` signatures. q4s_adv advances a base by `n`
+// elements; q4s_at loads element i; q4s_put stores. Only compose q4s_adv outputs with q4s_at / _pair / _put (never raw
+// float * arithmetic on the result).
 static __device__ __forceinline__ const float *q4s_adv(const float *p, size_t n) {
-    return gc_kv_q4_fp32s ? (p + n) : (const float *)((const __half *)p + n);
+    return (const float *)((const __half *)p + n);
 }
 static __device__ __forceinline__ float q4s_at(const float *p, size_t i) {
-    return gc_kv_q4_fp32s ? p[i] : __half2float(((const __half *)p)[i]);
+    return __half2float(((const __half *)p)[i]);
 }
-// One group's (scale, zp) pair in a single load (the pair is adjacent in both
-// storage types). Bit-identical values to two q4s_at calls; halves the number
-// of scattered scale loads in the attention hot loop.
+// One group's (scale, zp) pair in a single load: the same values as two q4s_at calls, half the scattered scale loads
+// in the attention hot loop.
 static __device__ __forceinline__ float2 q4s_pair(const float *p, size_t g2) {
-    if (gc_kv_q4_fp32s) {
-        return *(const float2 *)(p + g2);
-    }
     __half2 h = *(const __half2 *)((const __half *)p + g2);
     return __half22float2(h);
 }
 static __device__ __forceinline__ void q4s_put(float *p, size_t i, float v) {
-    if (gc_kv_q4_fp32s) p[i] = v;
-    else ((__half *)p)[i] = __float2half(v);
+    ((__half *)p)[i] = __float2half(v);
 }
 
 // Group-asymmetric int4 quantizer: one value per thread (256-thread block,

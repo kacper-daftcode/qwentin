@@ -42,11 +42,6 @@
 // E2M3 weights x E4M3 activations), 0 for the default E4M3 weight path.
 __constant__ int gc_weight_e2m3 = 0;
 
-// Unread. Deleting them moves the bank-3 offsets of the constants below and with them the SASS of every kernel that
-// reads those; remove them together with the q4s_* fp32 branch (gc_kv_q4_fp32s) under a bitwise gate.
-__constant__ int gc_use_ldsm = 0;
-__constant__ int gc_use_p2p = 0;
-
 // TQ_EMBED_FP8: token-embedding table stored quantized at load (lookup-only --
 // valid ONLY when tie_word_embeddings=FALSE, so the table never feeds the lm_head
 // matmul). Published once at load; the lookup kernels branch on gc_embed_mode.
@@ -56,11 +51,6 @@ __constant__ int gc_use_p2p = 0;
 __constant__ int gc_embed_mode = 0;
 __constant__ const uint8_t *gc_embed8 = nullptr;
 __constant__ const float *gc_embed_scale = nullptr;
-
-// TQ_KV_Q4 K-cache (scale, zp) group params: fp16 storage. Nothing sets this to 1 any more (the TQ_KV_Q4_FP32S
-// switch is gone); the q4s_* helpers keep their fp32 branch until a bitwise-gated change removes it from every kernel
-// that inlines them.
-__constant__ int gc_kv_q4_fp32s = 0;
 
 typedef struct {
     int M, K, Mt, Kt;
