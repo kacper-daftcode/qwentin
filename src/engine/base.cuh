@@ -38,25 +38,6 @@
 // The MTP section's 8 projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3) instead of bf16.
 #define TQ_FLAG_MTP_EXL3 (1u << 12)
 
-// Commit-by-pointer-swap: rounds with N <= 8 alternate archive halves (slots
-// 0-7 / 8-15), so the accepted leaf's state slab can BECOME the live state
-// (zero-copy commit); the next round writes the other half and cannot clobber it.
-static int g_spec_slot_base = 0;        // archive half (0 or 8) used by the current round
-static int g_spec_live_in_archive = 0;  // live DeltaNet pointers parked in the archive
-#ifndef TQ_SPEC_MAX_N
-#define TQ_SPEC_MAX_N 16       // max batched verify nodes/round (16 = 2 m16n8 column groups).
-                               // MEASURED dead-end (roadmap D stopgap):
-                               // -DTQ_SPEC_MAX_N=32 + TQ_PREFILL_CHUNK=32 gives +50% prefill
-                               // (695->1032 tok/s @2k; lever is REAL) BUT the tree-attention
-                               // verify (k_tq_spec_attn_tree_mma) uses a single 16-slot m16
-                               // archive tile -> chains >~20 overflow it and CORRUPT the
-                               // long-context state (needle 0/3 garbage @8k; CH<=20 still OK).
-                               // Not a transparent cap; also perturbs branching-tree decode
-                               // numerics (max_abs 19) and scales every d_spec_* buffer (prod
-                               // GPU6 @256k has ~0.45 GiB margin). Wide prefill needs a DEDICATED
-                               // N-wide kernel (D.1), not this bump. Keep the default at 16.
-#endif
-
 // Set once at load time: 1 if QMMA weights are dense 6-bit E2M3 (mixed-format
 // E2M3 weights x E4M3 activations), 0 for the default E4M3 weight path.
 __constant__ int gc_weight_e2m3 = 0;
@@ -138,10 +119,8 @@ typedef struct {
     tq_qmma_weight_t linear_in_z;
     tq_qmma_weight_t linear_out;
 
-    float *d_linear_conv_state;       // LIVE state (may point into the spec archive after a swap-commit)
+    float *d_linear_conv_state;       // the test decoder's DeltaNet state (the paged path keeps its own per slot)
     float *d_linear_recurrent_state;
-    float *d_linear_conv_state_owned;     // original allocations (free target,
-    float *d_linear_recurrent_state_owned; // un-swap destination)
     float *d_k_cache;
     float *d_v_cache;
     // E4M3 rows + pow2 scale per (pos, kv_head) (TQ_KV_Q4: the V rows; K goes to d_k_cache4 below). When active the

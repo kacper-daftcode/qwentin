@@ -1,17 +1,6 @@
 // RMSNorm and activation-quantize kernels, the dequant GEMVs and the PDL / CUDA-graph launch helpers.
 // Part of the forward_qwen.cu unity build: included in order, not a standalone header.
 
-// ===== Batched tree attention (one launch per full-attn layer, all N nodes) =====
-// Replaces the per-node k_tq_full_attn_decode loop + per-node KV-archive copies.
-// Split in two launches so sibling/ancestor KV has no intra-grid ordering:
-//   (1) kv_prep writes every node's normed+roped k and v straight into the
-//       per-(layer,node) archive (the verify never touches the real KV cache;
-//       the 1-read commit re-places the accepted path's KV from the archive).
-//   (2) attn_tree attends: positions <= base come from the committed cache,
-//       tree positions come from the node's ancestor chain in the archive.
-// Bit-identical floats and reduction order vs k_tq_full_attn_decode (the cache
-// round-trip is replaced by the archive holding the same values).
-
 // __launch_bounds__(1024, 1) on the whole stripe-reduce rmsnorm/argmax family below:
 // every kernel is always launched at exactly 1024 threads/block, and on nvcc 12.9
 // ptxas allocates up to 80 regs/thread for these -- 80 x 1024 exceeds the 64K-register

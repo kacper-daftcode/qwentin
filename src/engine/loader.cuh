@@ -74,8 +74,8 @@ extern "C" void qwn_free(void) {
         if (l->d_linear_dt_bias) cudaFree(l->d_linear_dt_bias);
         if (l->d_linear_norm) cudaFree(l->d_linear_norm);
         if (l->d_linear_conv1d) cudaFree(l->d_linear_conv1d);
-        if (l->d_linear_conv_state_owned) cudaFree(l->d_linear_conv_state_owned);
-        if (l->d_linear_recurrent_state_owned) cudaFree(l->d_linear_recurrent_state_owned);
+        if (l->d_linear_conv_state) cudaFree(l->d_linear_conv_state);
+        if (l->d_linear_recurrent_state) cudaFree(l->d_linear_recurrent_state);
         if (l->d_k_cache) cudaFree(l->d_k_cache);
         if (l->d_v_cache) cudaFree(l->d_v_cache);
         if (l->d_k_cache8) cudaFree(l->d_k_cache8);
@@ -747,13 +747,11 @@ static int ensure_decode_state(void) {
                 cudaError_t err = cudaMalloc(&l->d_linear_conv_state, conv_bytes);
                 if (err != cudaSuccess) return -1;
                 g_qwen.device_bytes += conv_bytes;
-                l->d_linear_conv_state_owned = l->d_linear_conv_state;
             }
             if (!l->d_linear_recurrent_state) {
                 cudaError_t err = cudaMalloc(&l->d_linear_recurrent_state, state_bytes);
                 if (err != cudaSuccess) return -2;
                 g_qwen.device_bytes += state_bytes;
-                l->d_linear_recurrent_state_owned = l->d_linear_recurrent_state;
             }
         } else if (g_qwen.layer_types[i] == TQ_LAYER_FULL_ATTENTION) {
             if (g_qwen.kv_fp8) {
@@ -819,12 +817,6 @@ extern "C" int qwn_reset_state(void) {
     for (int i = 0; i < g_qwen.L; i++) {
         tq_layer_t *l = &g_qwen.layers[i];
         if (g_qwen.layer_types[i] == TQ_LAYER_LINEAR_ATTENTION) {
-            // a swap-commit may have parked the live pointers in the archive;
-            // a reset re-canonicalizes them to the owned buffers
-            l->d_linear_conv_state = l->d_linear_conv_state_owned;
-            l->d_linear_recurrent_state = l->d_linear_recurrent_state_owned;
-            g_spec_live_in_archive = 0;
-            g_spec_slot_base = 0;
             cudaMemsetAsync(l->d_linear_conv_state, 0,
                             (size_t)lin_conv_dim * g_qwen.linear_conv_kernel_dim * sizeof(float),
                             g_qwen.stream);

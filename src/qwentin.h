@@ -36,7 +36,7 @@ int qwn_qmma_count(void);
 int qwn_f32_count(void);
 int qwn_reset_state(void);
 
-/* engine/forward_single.cuh */
+/* engine/decode_oracle.cuh */
 int qwn_wide_gemm_check(int which, int N, float *max_abs_diff);
 int qwn_wide_gemm_bench(int which, int N, int iters, double *t_wide_ms, double *t_pertoken_ms);
 int qwn_decode(int token_id, int pos);
