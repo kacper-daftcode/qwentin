@@ -1,0 +1,29 @@
+bank-3 offsets read in OLD by any kernel: 0x0, 0xc, 0x10, 0x18, 0x20
+ok  code        old 0x20               new -              _Z18k_tq_paged_attn_q4ILi0ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_iiiiiiiiff10tq_t4_pool
+ok  code        old 0x20               new -              _Z18k_tq_paged_attn_q4ILi1ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_iiiiiiiiff10tq_t4_pool
+ok  code        old 0x20               new -              _Z18k_tq_wide_attn_mmaILi4ELi1ELi0ELi0EEvPfPKfPKtS2_S2_PKhS2_S6_S2_PKiiS8_iiiiiiiiiffS0_10tq_t4_pool
+ok  code        old 0x20               new -              _Z18k_tq_wide_attn_mmaILi4ELi1ELi1ELi0EEvPfPKfPKtS2_S2_PKhS2_S6_S2_PKiiS8_iiiiiiiiiffS0_10tq_t4_pool
+ok  code        old 0x20               new -              _Z18k_tq_wide_attn_mmaILi4ELi2ELi0ELi0EEvPfPKfPKtS2_S2_PKhS2_S6_S2_PKiiS8_iiiiiiiiiffS0_10tq_t4_pool
+ok  code        old 0x20               new -              _Z18k_tq_wide_attn_mmaILi4ELi2ELi1ELi0EEvPfPKfPKtS2_S2_PKhS2_S6_S2_PKiiS8_iiiiiiiiiffS0_10tq_t4_pool
+ok  code        old 0x20               new -              _Z20k_tq_paged_kmm_pagesPfPKhPKfPKiS5_iS5_iiiii
+ok  code        old 0x20               new -              _Z21k_tq_full_attn_decodePfPKfS1_S1_PKtS3_S_S_PhS_S4_S_S4_S_iiiiffS_i
+ok  code        old 0x20               new -              _Z24k_tq_paged_attn_q4_splitILi0ELi0EEvPKfPKtPKhS1_S5_S1_PKiS7_S7_iiiiiiiiffPfS8_10tq_t4_pool
+ok  code        old 0x20               new -              _Z24k_tq_paged_attn_q4_splitILi1ELi0EEvPKfPKtPKhS1_S5_S1_PKiS7_S7_iiiiiiiiffPfS8_10tq_t4_pool
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_f16ILi1ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_f16ILi1ELi1EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_f16ILi2ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_f16ILi2ELi1EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_mmaILi0ELi0ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_iiiiiiiiiffS0_S0_S8_S8_iS8_10tq_t4_p
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_mmaILi0ELi1ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_iiiiiiiiiffS0_S0_S8_S8_iS8_10tq_t4_p
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_mmaILi1ELi0ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_iiiiiiiiiffS0_S0_S8_S8_iS8_10tq_t4_p
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_mmaILi1ELi1ELi0EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_iiiiiiiiiffS0_S0_S8_S8_iS8_10tq_t4_p
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_segILi0ELi1EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_segILi0ELi2EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_segILi1ELi1EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z26k_tq_paged_attn_q4_gqa_segILi1ELi2EEvPfPKfPKtPKhS2_S6_S2_PKiS8_S8_S8_S8_S8_iiiiiiiiiiffS0_S0_
+ok  code        old 0x20               new -              _Z27k_tq_paged_attn_kv_write_q4ILi0ELi0EEvPhPfS0_S1_PKfS3_PKtPKiS7_S7_iiiiiiffPti
+ok  code        old 0x20               new -              _Z27k_tq_paged_attn_kv_write_q4ILi1ELi0EEvPhPfS0_S1_PKfS3_PKtPKiS7_S7_iiiiiiffPti
+ok  code        old 0x20               new -              _Z29k_tq_paged_attn_q4_gqa_mma_stPfPKfPKtPKhS1_S5_S1_PKiS7_S7_iiiiiiiiiffS_S_S7_
+ok  offset+regalloc old 0xc,0x10,0x18      new 0x4,0x8,0x10   _Z17k_tq_embed_lookupPfPKtii
+ok  offset+regalloc old 0xc,0x10,0x18      new 0x4,0x8,0x10   _Z20k_tq_embed_lookup_nkPfPKtPKii
+[bank3] 27 kernels differ: 0 offset only, 0 offset+regs, 2 offset+regalloc, 25 code (all read a removed constant: True); unexplained: 0

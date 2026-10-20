@@ -1,0 +1,92 @@
+[cand19-all] start 14:11:35; cand 87abd799229f = 74e5d5e engine: the three placeholder constants of bank 3 fo; served eb62621e576b
+== gate 0: ruff + pytest, the exported ABI   14:11:35
+[1;32mAll checks passed![0m
+65 passed, 2 skipped in 0.82s
+67 passed in 0.83s
+   exported qwn_*: 55, qwentin.h: 55
+[gate0] PASS
+== gate 1: per-kernel SASS + bitwise vs the served library   14:11:37
+kernels: old 211, new 211, common 211; identical 184, different 27
+   bank-3 offsets read in OLD by any kernel: 0x0, 0xc, 0x10, 0x18, 0x20
+   [bank3] 27 kernels differ: 0 offset only, 0 offset+regs, 2 offset+regalloc, 25 code (all read a removed constant: True); unexplained: 0
+[plab] N=3 cand-1209 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1209 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (v2 file), cand-1209 vs served: bitwise True (25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1209 vs served: bitwise True (16 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K + 32K   14:14:23
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: the test decoder (FP6 file), old vs new   14:15:41
+[oracle] 14 tensors (1800 teacher-forced argmax, greedy continuations, paged logits after the oracle's KV): bitwise True
+   paged_smoke:   -> 8/8 argmax match   -> 7/8 seed match; wave T=108 cols, 1 weight-read for all clients 
+   paged_smoke: the same token lines
+     client 0: gen=64 leading-match-vs-single=1/64  text=' changed over time. It is a field that is both a par
+     client 1: gen=64 leading-match-vs-single=64/64  text=' state of a particle. For a free particle in one di
+     client 2: gen=64 leading-match-vs-single=64/64  text=' if n == 0:\n        return 0\n    elif n == 1:\n  
+     client 3: gen=64 leading-match-vs-single=56/64  text=' simple dough made from flour, water, yeast, salt, 
+     client 4: gen=64 leading-match-vs-single=21/64  text=' variety of methods, including weather stations, sa
+     client 5: gen=64 leading-match-vs-single=23/64  text=' Third Estate, representing the common people, decl
+     client 6: gen=64 leading-match-vs-single=21/64  text=' a loss function that measures how far the networkâ
+     client 7: gen=64 leading-match-vs-single=20/64  text=' cell. It is the site of cellular respiration, wher
+[gate3] PASS
+== gate 4: FP6 on the batched path   14:18:01
+[plab] FP6 file, Q4 pool, N=3: cand-1209 vs served bitwise True (25 tensors)
+[plab] FP6 file, Q4 pool, N=8: cand-1209 vs served bitwise True (25 tensors)
+   [   32k depth=0.95 rep=0] PASS prompt=32596 ttft=13.073s e2e=13.271s ans='FF-699212-PR' exp=['FF-699
+   [   32k depth=0.50 rep=0] PASS prompt=32596 ttft=13.054s e2e=13.219s ans='UI-672763-WB' exp=['UI-672
+   [   32k depth=0.05 rep=0] PASS prompt=32602 ttft=13.057s e2e=13.239s ans='ZU-821600-AR' exp=['ZU-821
+   FP6 server: needle 3/3, the same answers as the served library
+[gate4] PASS
+== gate 5: THE SERVED LINE (v2 file), pure defaults   14:20:38
+   server up after 10 s, pid 296321, 29894 MiB
+   576000 pooled tokens
+   [config] TQ_CTX=262144 TQ_KV_Q4=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_EMBED_HOST=1 TQ_EMBED_FP8=2 TQ_PDL=1 TQ_WIDE_ATTN_MMA=1 (the other 26 TQ_* switches at their defaults)
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.758s e2e=11.803s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.742s e2e=11.785s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.75s e2e=11.815s ans='ZU-821600-AR' exp=['ZU-8216
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=60.269s e2e=60.32s ans='HE-215844-MW' exp=['HE-215
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.313s e2e=60.365s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.353s e2e=60.403s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[ab-vs-cand18] prompts identical True; texts identical to cand18 (the served library, same file): on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 176.6 (min 176.6, max 176.6), aggregate 176.6; 300 tokens in 1.8s; rounds 79 steps 79 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 81.0 (min 73.8, max 85.1), aggregate 633.7; 2400 tokens in 4.7s; rounds 138 steps 138 tokens/round
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1, texts = cand18: 1; speed rc 0
+[gate5] PASS
+== gate 6: the off-switch matrix (logs/cand19-matrix.log, GPU 1)   14:27:26
+   [matrix] t4-attn-f16-0: bitwise (25 tensors); [config] line as expected (TQ_T4_ATTN_F16=0): 1
+   [matrix] graph-0: bitwise (25 tensors); [config] line as expected (TQ_GRAPH=0): 1
+   [matrix] gemm-fork-0: bitwise (25 tensors); [config] line as expected (TQ_GEMM_FORK=0): 1
+   [matrix] dstate-0: bitwise (25 tensors); [config] line as expected (TQ_DSTATE_BF16=0): 1
+   [matrix] pdl-0: bitwise (25 tensors); [config] line as expected (!TQ_PDL=): 1
+   [matrix] pdl-2: bitwise (25 tensors); [config] line as expected (TQ_PDL=2): 1
+   [matrix] pins: bitwise (25 tensors); [config] line as expected (TQ_QMMA_SF_K_SPLIT=4 TQ_PAGED_GQA_SPLIT=8): 1
+   [matrix] embed-fp8-2: bitwise (25 tensors); [config] line as expected (TQ_EMBED_FP8=2): 1
+   [matrix] embed-fp8-1: bitwise (25 tensors); [config] line as expected (TQ_EMBED_FP8=1): 1
+   [matrix] verify-tqf: bitwise (25 tensors); [config] line as expected (TQ_VERIFY_TQF=1): 1
+   [matrix] codebook-file: bitwise (25 tensors); [config] line as expected (TQ_KV_T4_CODEBOOK=/mnt/nvme/qwen256k/qwentin-bank3/tools/codebooks/lloyd_kv12a.f32): 1
+   [matrix] fp4-st3: bitwise (25 tensors); [config] line as expected (!TQ_KV_T4=): 1
+   [matrix] fp4-st1: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=1): 1
+   [matrix] fp4-st0: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=0): 1
+   [matrix] fp4-st2: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=2): 1
+   [matrix] fp4-mma-0: bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_MMA=0): 1
+   [matrix] fp4-topk: bitwise (25 tensors); [config] line as expected (TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0): 1
+   [matrix] fp6-mtp-head: bitwise (25 tensors); [config] line as expected (!TQ_NO_MTP=): 1
+   [matrix] gdn-prefill-0: bitwise (16 tensors); [config] line as expected (TQ_GDN_PREFILL=0): 1
+   [matrix] pattn-gqa-0-qrows-16: bitwise (16 tensors); [config] line as expected (TQ_PATTN_GQA=0 TQ_WIDE_ATTN_QROWS=16): 1
+   [matrix] t4-async-0: bitwise (16 tensors); [config] line as expected (TQ_KV_T4_ASYNC=0): 1
+   [matrix] exl3-ng16-0: bitwise (16 tensors); [config] line as expected (TQ_EXL3_WIDE_NG16=0): 1
+   [matrix] exl3-bf16-r4-0: bitwise (16 tensors); [config] line as expected (TQ_EXL3_BF16_R4=0): 1
+   [matrix] gemm-fork-maxn: bitwise (16 tensors); [config] line as expected (TQ_GEMM_FORK_MAXN=1000000): 1
+   [matrix] fp4-ctx-qrows-16: bitwise (16 tensors); [config] line as expected (TQ_WIDE_ATTN_QROWS=16): 1
+   [matrix] fp4-ctx: bitwise (16 tensors); [config] line as expected (!TQ_KV_T4=): 1
+   [matrix] e4m3v: bitwise (25 tensors); [config] line as expected (!TQ_KV_V4=): 1
+   [matrix] e4m3v-ctx: bitwise (16 tensors); [config] line as expected (!TQ_KV_V4=): 1
+   [matrix] example: [config] TQ_CTX=262144 TQ_KV_Q4=1 TQ_KV_V4=1 TQ_EMBED_HOST=1 TQ_EMBED_FP8=2 TQ_NO_MTP=1 TQ_PDL=1 TQ_WIDE_ATTN_MMA=1 TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0 (the other 24 TQ_* switches at their defaults)
+   [matrix] bf16 MTP head (FP6 file, TQ_NO_MTP=0), both read past: served 'MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)', candidate 'MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)'
+   [matrix] 28 cells, 0 failed   14:23:50
+   [matrix] PASS
+[gate6] PASS
+== ALL PASS   14:27:26  (landing: build-qwen/ := the candidate, main := cand-1209 (ff), patches 0120-0121)

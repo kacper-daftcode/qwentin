@@ -42,6 +42,12 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 - Gate (`docs/evidence/cand18-all.log`, `cand18-matrix.log`): host code only — all 211 kernels keep their SASS bit
   for bit; the served line, spec exactness, the test decoder and an FP6 file as before, and 25 cells with switches
   off their defaults bitwise against the previous library under the same environment.
+- **The last placeholder constants are gone**: `gc_use_ldsm`, `gc_use_p2p` (never read) and `gc_kv_q4_fp32s` (never
+  set since the `TQ_KV_Q4_FP32S` switch went), with the dead fp32 branch of the `q4s_*` helpers. Gate
+  (`docs/evidence/cand19-all.log`, `cand19-matrix.log`, `cand19-bank3.log`): 184 of the 211 kernels keep their SASS
+  bit for bit, the 27 that change are exactly the readers of the moved or removed constants, and every output is
+  bitwise unchanged — the paged path on the trellis, FP4, E4M3-V and FP6 pools, spec exactness, the test decoder,
+  the served line.
 
 ## [v0.11] — 2026-10-20
 
