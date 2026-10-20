@@ -1,0 +1,5 @@
+[diag-128k] start 08:04:12; library 158edd067533
+   server up (TQ_PATTN_GQA=0), pid 54011
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 129.9 (min 129.9, max 129.9), aggregate 129.9; 300 tokens in 2.5s; rounds 91 steps 91 tokens/round 3.29; ttft p50 0.23s; cached [130972]
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 166.9 (min 166.9, max 166.9), aggregate 166.9; 300 tokens in 1.9s; rounds 84 steps 84 tokens/round 3.56; ttft p50 0.08s; cached [32668]
+[diag-128k] done 08:05:58

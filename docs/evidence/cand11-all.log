@@ -1,0 +1,44 @@
+[cand11-all] start 16:26:24; cand 4a42c129072d = 364aa9c engine: the residual-stream hook's names -- qwn_ot_* -> qwn_rm; served 5734b39678c6 = d842e36 CI: the nvcc compile job runs it
+== gate 0: ruff + pytest   16:26:24
+[1;32mAll checks passed![0m
+34 passed in 0.69s
+[gate0] PASS
+== gate 1: bitwise vs the served binary   16:26:25
+[plab] N=3 cand-1202 vs served: bitwise True (max |d| 0, 25 tensors)
+[plab] N=8 cand-1202 vs served: bitwise True (max |d| 0, 25 tensors)
+[plab] N=3 cand-1202 + TQ_GEMM_FORK_MAXN=1000000 vs served: bitwise True (max |d| 0, 25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1202 vs served: bitwise True (max |d| 0, 16 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K + 32K   16:28:29
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE, pure defaults   16:29:47
+   server up after 10 s, pid 1530457, 29894 MiB
+   codebook built-in lloyd_kv12a
+   576000 pooled tokens
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.668s e2e=11.713s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.625s e2e=11.668s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.627s e2e=11.692s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.61s e2e=59.66s ans='HE-215844-MW' exp=['HE-215844-MW'] 
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=59.67s e2e=59.721s ans='AB-416549-JJ' exp=['AB-416549-JJ'] 
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=59.682s e2e=59.733s ans='ND-297860-GH' exp=['ND-297860-GH'] 
+wall 214.6s, 6 probes
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2647 tokens in 20.7s = 128.0 tok/s (concurrency 1); per-request mean 127.5 tok/s; rounds 779, tokens/round 3.39
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2647 tokens in 43.5s = 60.9 tok/s (concurrency 1); per-request mean 60.5 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 177.3 (min 177.3, max 177.3), aggregate 177.3; 300 tokens in 1.8s; rounds 79 s
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 80.8 (min 73.4, max 85.5), aggregate 633.9; 2400 tokens in 4.6s; rounds 137 st
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1; speed rc 0
+[gate3] PASS
+== gate 4: residual-stream hook through qwn_rmap_*   16:36:32
+armed layers [37, 38] at scale 0.3 from runs/cand11/rmap-synth.json (H=5120)
+layer 37: max|diff|=3.164e-07  (rel 3.891e-08, ref|max|=8.131)  effect|max|=0.0783
+layer 38: max|diff|=4.229e-07  (rel 4.708e-08, ref|max|=8.984)  effect|max|=0.0601
+PARITY OK
+[gate4] PASS
+== ALL PASS   16:36:39
+[cand11-all] land by hand: [ -f /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.d842e36 ] || cp -p /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.d842e36; cp -p /mnt/nvme/qwen256k/qwentin-hyg/build-qwen-hyg/libforward_qwen.so.cand1202 /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so; git -C /mnt/nvme/qwen256k/qwentin merge --ff-only cand-1202;
+[cand11-all]   touch /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so (after the merge); (cd /mnt/nvme/qwen256k/qwentin && git format-patch -q --start-number 99 d842e36..HEAD -o ../patches/)

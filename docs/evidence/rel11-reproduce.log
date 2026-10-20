@@ -1,0 +1,94 @@
+[rel11-reproduce] start 08:05:13; worktree dd6d21e engine: ten experiment switches of the served path r
+[reproduce] build: /usr/local/cuda-13.1/bin/nvcc -> /mnt/nvme/qwen256k/qwentin-rel11/build-qwen-repro
+[reproduce] model check: tools/inspect_tqf.py /mnt/nvme/models/qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf
+format_version: 2
+flags: 0x00001c1d (fp8_qmma_weights, source_bf16_non_quant, dropped_vision, dropped_mtp, has_mtp_section, exl3_weights, mtp_exl3)
+exl3_bitrates (trellis Linears incl. MTP): K=4: 10 (2.4 %), K=5: 104 (25.4 %), K=6: 228 (55.7 %), K=7: 65 (15.9 %), K=8: 2 (0.5 %)
+payload_match: True
+header hash: OK
+payload hash (BLAKE2b-256 72e856ce85f4366f...): OK
+verdict production FP6 (flags 0x1|0x20|0x100|0x400 + payload): FAIL -- EXL3 trellis weights, not FP6 (this is a batched-server file; see the EXL3 + MTP verdict)
+verdict EXL3 + MTP (flags 0x800|0x400|0x1000 + payload):     PASS -- EXL3 trellis weights + EXL3 MTP layer: tools/serve_batched.py --spec reads it
+[reproduce] serve: http://127.0.0.1:8148, 12 slots, 4500 blocks
+[reproduce] waiting for http://127.0.0.1:8148/health
+[reproduce] server up after 10 s (pid 55429)
+batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/slot; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED_AT
+   process 29894 MiB after startup
+[reproduce] needle: 32K x 0.95 / 0.5 / 0.05, 3 decoys
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.782s e2e=11.826s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.757s e2e=11.8s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.764s e2e=11.829s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+wall 35.5s, 3 probes
+[reproduce] spec A/B: 10 prompts x 300 tokens, spec on vs off
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2518 tokens in 20.4s = 123.4 tok/s (concurrency 1); per-request mean 122.9 tok/s; rounds 785, tokens/round 3.19
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2518 tokens in 41.4s = 60.9 tok/s (concurrency 1); per-request mean 59.9 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[reproduce] speed: 32K, N = 1 and 8, spec on and off
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 114.6 (min 114.6, max 114.6), aggregate 114.6; 300 tokens in 2.7s; rounds 122 steps 122 tokens/round 2.45; ttft p50 0.08s; cached [32668]
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 74.7 (min 69.8, max 82.2), aggregate 596.9; 2400 tokens in 4.8s; rounds 137 steps 137 tokens/round 17.46; ttft p50 0.26s; cached [32668, 32668, 32668, 32668, 32668, 32668, 32668, 32668]
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 65.1 (min 65.1, max 65.1), aggregate 65.1; 300 tokens in 4.7s; rounds 0 steps 299 tokens/round None; ttft p50 0.06s; cached [32668]
+[speed] ctx=32768 N=8 spec=off: per-stream tok/s p50 48.0 (min 47.0, max 50.0), aggregate 383.6; 2400 tokens in 7.1s; rounds 0 steps 339 tokens/round None; ttft p50 0.28s; cached [32668, 32668, 32668, 32668, 32668, 32668, 32668, 32668]
+   process 30290 MiB after the runs
+[reproduce] stopping server pid 55429
+[reproduce] collect -> /mnt/nvme/qwen256k/runs/rel11/results-rel11-own.json
+{
+ "needle_pass": "3/3",
+ "needle_ttft_s": [
+  11.782,
+  11.757,
+  11.764
+ ],
+ "spec_ab_identical": "10/10",
+ "speed_32k_p50_tps": {
+  "N=1 spec=on": 114.6,
+  "N=8 spec=on": 74.7,
+  "N=1 spec=off": 65.1,
+  "N=8 spec=off": 48.0
+ }
+}
+wrote /mnt/nvme/qwen256k/runs/rel11/results-rel11-own.json (work files in /mnt/nvme/qwen256k/runs/rel11/work-rel11-own)
+[rel11-reproduce] run 1 (corpus = this repository) rc 0 08:12:40
+[reproduce] build skipped; LIB=/mnt/nvme/qwen256k/qwentin-rel11/build-qwen-repro/libforward_qwen.so
+[reproduce] serve: http://127.0.0.1:8148, 12 slots, 4500 blocks
+[reproduce] waiting for http://127.0.0.1:8148/health
+[reproduce] server up after 10 s (pid 60443)
+batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/slot; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED_AT
+   process 29894 MiB after startup
+[reproduce] needle: 32K x 0.95 / 0.5 / 0.05, 3 decoys
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.843s e2e=11.888s ans='FF-699212-PR' exp=['FF-699212-PR'] 
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.812s e2e=11.855s ans='UI-672763-WB' exp=['UI-672763-WB'] 
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.815s e2e=11.88s ans='ZU-821600-AR' exp=['ZU-821600-AR'] 
+wall 35.7s, 3 probes
+[reproduce] spec A/B: 10 prompts x 300 tokens, spec on vs off
+[ab] on: {'spec_on': True, 'spec_k': 'auto'}
+[ab] on: 10 prompts, 2647 tokens in 20.3s = 130.1 tok/s (concurrency 1); per-request mean 130.3 tok/s; rounds 779, tokens/round 3.39
+[ab] off: {'spec_on': False, 'spec_k': 'auto'}
+[ab] off: 10 prompts, 2647 tokens in 43.3s = 61.1 tok/s (concurrency 1); per-request mean 60.7 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[reproduce] speed: 32K, N = 1 and 8, spec on and off
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 175.8 (min 175.8, max 175.8), aggregate 175.8; 300 tokens in 1.8s; rounds 79 steps 79 tokens/round 3.78; ttft p50 0.08s; cached [32668]
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 79.4 (min 73.5, max 83.8), aggregate 629.0; 2400 tokens in 4.7s; rounds 136 steps 136 tokens/round 17.59; ttft p50 0.30s; cached [32668, 32668, 32668, 32668, 32668, 32668, 32668, 32668]
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 65.1 (min 65.1, max 65.1), aggregate 65.1; 300 tokens in 4.7s; rounds 0 steps 299 tokens/round None; ttft p50 0.07s; cached [32668]
+[speed] ctx=32768 N=8 spec=off: per-stream tok/s p50 47.8 (min 46.8, max 50.0), aggregate 383.4; 2400 tokens in 7.1s; rounds 0 steps 341 tokens/round None; ttft p50 0.25s; cached [32668, 32668, 32668, 32668, 32668, 32668, 32668, 32668]
+   process 30286 MiB after the runs
+[reproduce] stopping server pid 60443
+[reproduce] collect -> /mnt/nvme/qwen256k/runs/rel11/results-rel11-vllm.json
+{
+ "needle_pass": "3/3",
+ "needle_ttft_s": [
+  11.843,
+  11.812,
+  11.815
+ ],
+ "spec_ab_identical": "10/10",
+ "speed_32k_p50_tps": {
+  "N=1 spec=on": 175.8,
+  "N=8 spec=on": 79.4,
+  "N=1 spec=off": 65.1,
+  "N=8 spec=off": 47.8
+ }
+}
+wrote /mnt/nvme/qwen256k/runs/rel11/results-rel11-vllm.json (work files in /mnt/nvme/qwen256k/runs/rel11/work-rel11-vllm)
+[rel11-reproduce] run 2 (corpus = the vLLM checkout) rc 0 08:18:26

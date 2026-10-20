@@ -1,0 +1,7 @@
+[rel11-v010] start 08:09:25; v0.11 158edd067533, v0.10 484bdb825c36
+[plab] N=3 v0.11 + TQ_PATTN_GQA=0 vs v0.10: bitwise True (max |d| 0, 25 tensors)
+[plab] N=3 v0.11 defaults vs v0.10: bitwise True (max |d| 0) -- informational
+[plab] N=8 v0.11 + TQ_PATTN_GQA=0 vs v0.10: bitwise True (max |d| 0, 25 tensors)
+[plab] N=8 v0.11 defaults vs v0.10: bitwise True (max |d| 0) -- informational
+[rel11-v010] PASS
+[rel11-v010] done 08:10:36

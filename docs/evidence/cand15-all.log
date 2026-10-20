@@ -1,0 +1,31 @@
+[cand15-all] start 07:15:43; cand 158edd067533 = dd6d21e engine: ten experiment switches of the served path removed, th; served a3731a9854bd
+== gate 0: ruff + pytest   07:15:43
+[1;32mAll checks passed![0m
+41 passed, 2 skipped in 0.79s
+43 passed in 0.80s
+[gate0] PASS
+== gate 1: per-kernel SASS + bitwise vs the served library   07:15:44
+kernels: old 398, new 398, common 398; identical 398, different 0
+[plab] N=3 cand-1206 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1206 vs served: bitwise True (25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1206 vs served: bitwise True (16 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K + 32K   07:17:56
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE, pure defaults   07:19:13
+   server up after 10 s, pid 32417, 29894 MiB
+   576000 pooled tokens
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.672s e2e=11.716s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.64s e2e=11.683s ans='UI-672763-WB' exp=['UI-6727
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.64s e2e=11.704s ans='ZU-821600-AR' exp=['ZU-8216
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.668s e2e=59.719s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=59.77s e2e=59.821s ans='AB-416549-JJ' exp=['AB-416
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=59.815s e2e=59.866s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 177.1 (min 177.1, max 177.1), aggregate 177.1; 300 tokens 
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 79.8 (min 74.2, max 87.0), aggregate 631.5; 2400 tokens in
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1; speed rc 0
+[gate3] PASS
+== ALL PASS   07:25:58  (landing waits for the owner's approval of the removal batch)

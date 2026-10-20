@@ -1,0 +1,41 @@
+[cand14-all] start 17:09:09; cand a3731a9854bd = 0d647f9 docs: TQ_GEMM_FORK_MAXN in FLAGS.md (the default of 9ed986e ha; served 4a42c129072d
+== gate 0: ruff + pytest (CPU, then with the candidate library)   17:09:09
+[1;32mAll checks passed![0m
+41 passed, 2 skipped in 0.79s
+43 passed in 0.80s
+[gate0] PASS
+== gate 1: per-kernel SASS + bitwise   17:09:11
+kernels: old 398, new 398, common 398; identical 398, different 0
+[plab] N=3 cand-1205 vs served (v1 file): bitwise True (25 tensors)
+[plab] N=8 cand-1205 vs served (v1 file): bitwise True (25 tensors)
+[plab] N=3 the v2 file vs the v1 file (cand-1205): bitwise True (25 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K   17:10:30
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE on the v1 file, pure defaults   17:10:49
+   server (v1) up after 10 s, pid 1624160, 29894 MiB
+   TQF1 format v1: no recorded payload size or hashes (a re-conversion writes v2)
+   576000 pooled tokens
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.66s e2e=11.705s ans='FF-699212-PR' exp=['FF-6992
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.64s e2e=11.683s ans='UI-672763-WB' exp=['UI-6727
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.644s e2e=11.708s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.662s e2e=59.713s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=59.686s e2e=59.737s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=59.727s e2e=59.778s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 177.3 (min 177.3, max 177.3), aggregate 177.3; 300 tokens 
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 81.9 (min 73.8, max 85.3), aggregate 638.5; 2400 tokens in
+[gate3] PASS
+== gate 4: the server on the v2 file; qwn_probe with TQ_VERIFY_TQF=1   17:17:34
+   server (v2) up after 10 s, pid 1627917, 29894 MiB
+   TQF1 format v2: payload 21260594576 bytes as recorded, header hash OK, payload hash not checked (TQ_VERIFY_TQF
+   576000 pooled tokens
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.678s e2e=11.723s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.65s e2e=11.693s ans='UI-672763-WB' exp=['UI-6727
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.651s e2e=11.715s ans='ZU-821600-AR' exp=['ZU-821
+TQF1 format v2: payload 21260594576 bytes as recorded, header hash OK, payload hash OK (TQ_VERIFY_TQF)
+[gate4] PASS
+== ALL PASS   17:18:41
+[cand14-all] land by hand: [ -f /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.364aa9c ] || cp -p /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so.364aa9c; git -C /mnt/nvme/qwen256k/qwentin merge --ff-only cand-1205; re-make build-qwen/,
+[cand14-all]   check its SASS against /mnt/nvme/qwen256k/qwentin-hyg4/build-qwen-hyg4/libforward_qwen.so.cand1205, cp -p /mnt/nvme/qwen256k/qwentin-hyg4/build-qwen-hyg4/libforward_qwen.so.cand1205 /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so && touch /mnt/nvme/qwen256k/qwentin/build-qwen/libforward_qwen.so; (cd /mnt/nvme/qwen256k/qwentin && git format-patch -q --start-number 102 364aa9c..HEAD -o ../patches/)

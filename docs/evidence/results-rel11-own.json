@@ -1,0 +1,403 @@
+{
+ "environment": {
+  "date_utc": "2026-10-20T08:12:39Z",
+  "tag": "rel11-own",
+  "commit": "dd6d21eb06b9296387fc504bd08dc575bea8ee49",
+  "commit_dirty": false,
+  "lib": "/mnt/nvme/qwen256k/qwentin-rel11/build-qwen-repro/libforward_qwen.so",
+  "lib_md5": "45cb462773de85707f38d2520800abc9",
+  "tqf": "/mnt/nvme/models/qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf",
+  "tqf_bytes": 21260594836,
+  "model_dir": "/mnt/nvme/models/Qwen3.8-27B-FP8",
+  "corpus": "/mnt/nvme/qwen256k/qwentin-rel11",
+  "gpu_index": "1",
+  "gpu": "NVIDIA GeForce RTX 5090, 32607 MiB, 550.00 W",
+  "driver": "610.57.04",
+  "nvcc": "/usr/local/cuda-13.1/bin/nvcc",
+  "nvcc_version": [
+   "Cuda compilation tools, release 13.1, V13.1.115",
+   "Build cuda_13.1.r13.1/compiler.37061995_0"
+  ],
+  "python": "3.14.4",
+  "torch": "2.14.0+cu130",
+  "transformers": "5.17.0",
+  "safetensors": "0.8.0",
+  "numpy": "2.5.3",
+  "served_line": {
+   "max_slots": 12,
+   "num_blocks": 4500,
+   "env": {
+    "TQ_CTX": "262144",
+    "TQ_KV_Q4": "1",
+    "TQ_EMBED_FP8": "2",
+    "TQ_PAGED_ATTN_MMA": "1"
+   },
+   "server_defaults": "tools/serve_batched.py at this commit (--kv-v4 --kv-t4 --spec --dstate fp16sr --decode-steps-per-wave 1 ...)"
+  }
+ },
+ "inspect_tqf": "== TQF1 header ==\npath: /mnt/nvme/models/qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf\nsize: 21260594836\nheader_bytes: 260\nformat_version: 2\nflags: 0x00001c1d (fp8_qmma_weights, source_bf16_non_quant, dropped_vision, dropped_mtp, has_mtp_section, exl3_weights, mtp_exl3)\nblock_scaled_qmma: False\nblock_scaled_rowmajor: False\nblock_scaled_qmma_wordmajor: False\nblock_scaled_e2m3: False\nsparse_24_e2m3: False\nhas_mtp_section: True\nexl3_weights: True\nmtp_exl3: True\nmodel_family: 1\nnon_quant_dtype: 2\nhidden_size: 5120\nintermediate_size: 17408\nnum_hidden_layers: 64\nvocab_size: 248320\nattention heads/kv/head_dim: 24/4/256\nlinear heads/dims: k=16x128, v=48x128, conv=4\nrms_norm_eps: 9.999999974752427e-07\nrope_theta: 10000000.0\npartial_rotary_factor: 0.25\nmrope_interleaved: 1\nmrope_section: (11, 11, 10)\ntie_word_embeddings: 0\ntext_only: 1\nhas_vision_config: 1\nhas_mtp: 1\nlayer_types: [1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2]\nlayer_type_counts: {1: 48, 2: 16}\ntensor_kind_counts: {'non_quant': 258, 'qm8': 497, 'f32': 96, 'mtp_non_quant': 7, 'mtp_qm8': 8}\nexl3_bitrates (trellis Linears incl. MTP): K=4: 10 (2.4 %), K=5: 104 (25.4 %), K=6: 228 (55.7 %), K=7: 65 (15.9 %), K=8: 2 (0.5 %)\nexl3_codebooks: {'mul1': 409}\nexl3_bf16_linears (kept unquantized by the checkpoint): 96\n\n== Payload validation ==\nexpected_payload_bytes: 21260594576\nactual_payload_bytes: 21260594576\npayload_match: True\n\n== Integrity ==\npayload_bytes (recorded): 21260594576 -- match\nheader hash: OK\npayload hash (BLAKE2b-256 72e856ce85f4366f...): OK\n\n== Verdicts ==\nverdict production FP6 (flags 0x1|0x20|0x100|0x400 + payload): FAIL -- EXL3 trellis weights, not FP6 (this is a batched-server file; see the EXL3 + MTP verdict)\nverdict EXL3 + MTP (flags 0x800|0x400|0x1000 + payload):     PASS -- EXL3 trellis weights + EXL3 MTP layer: tools/serve_batched.py --spec reads it\n",
+ "server_startup_line": "batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/slot; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4 today: the trellis pool runs its own GQA kernels); decode steps per mixed wave 1",
+ "process_mib_after_runs": "process 30290 MiB after the runs",
+ "server_error_lines": 0,
+ "needle": {
+  "config": {
+   "base_url": "http://127.0.0.1:8148",
+   "model": "qwen3.8-27b",
+   "lengths": "32768",
+   "depths": "0.95,0.5,0.05",
+   "needles": 1,
+   "decoys": 3,
+   "repeats": 1,
+   "concurrency": 1,
+   "max_tokens": 48,
+   "corpus": "/mnt/nvme/qwen256k/qwentin-rel11",
+   "tokenizer": "/mnt/nvme/models/Qwen3.8-27B-FP8",
+   "chat_kwargs": "{\"enable_thinking\": false}",
+   "timeout": 3600.0,
+   "seed": 1,
+   "out": "/mnt/nvme/qwen256k/runs/rel11/work-rel11-own/needle.json"
+  },
+  "results": [
+   {
+    "length": 32768,
+    "depths": [
+     0.95
+    ],
+    "rep": 0,
+    "ok": true,
+    "status": 200,
+    "pass": true,
+    "hits": [
+     true
+    ],
+    "expected": [
+     "FF-699212-PR"
+    ],
+    "answer": "FF-699212-PR",
+    "ttft_s": 11.782,
+    "e2e_s": 11.826,
+    "prompt_tokens": 32596,
+    "error": ""
+   },
+   {
+    "length": 32768,
+    "depths": [
+     0.5
+    ],
+    "rep": 0,
+    "ok": true,
+    "status": 200,
+    "pass": true,
+    "hits": [
+     true
+    ],
+    "expected": [
+     "UI-672763-WB"
+    ],
+    "answer": "UI-672763-WB",
+    "ttft_s": 11.757,
+    "e2e_s": 11.8,
+    "prompt_tokens": 32596,
+    "error": ""
+   },
+   {
+    "length": 32768,
+    "depths": [
+     0.05
+    ],
+    "rep": 0,
+    "ok": true,
+    "status": 200,
+    "pass": true,
+    "hits": [
+     true
+    ],
+    "expected": [
+     "ZU-821600-AR"
+    ],
+    "answer": "ZU-821600-AR",
+    "ttft_s": 11.764,
+    "e2e_s": 11.829,
+    "prompt_tokens": 32602,
+    "error": ""
+   }
+  ]
+ },
+ "spec-ab": {
+  "prompts": [
+   "Repository snapshot:\n\n### FILE: tools/serve_batched.py\n#!/usr/bin/env python3\n\"\"\"Roadmap E milestone 3.2 + 3.3: continuous-batching scheduler + multi-client OpenAI server.\n\nA single engine thread owns the CUDA engine (paged Q4 KV pool). HTTP handler threads only\ntokenize, submit a Request, and wait on its completion event. The engine thread runs a\ncontinuous-batching loop:\n  - ADMIT queued requests into free slots (prefill the prompt single-stream, snapshot into the\n    slot's paged blocks via qwn_paged_load_client = the validated bring-up path), subject to\n    admission control (free slot + enough free pool blocks).\n  - DECODE one paged step over ALL active slots (qwn_paged_decode_step), push each slot's new\n    token to its request, advance positions, and DETACH finished requests (EOS / max_tokens),\n    returning their blocks to the pool.\n\nDecodes are batched (the throughput win). Short prompts are batched into one ragged prefill wave;\na long prompt is prefilled in <=128-column waves that carry the active slots' decode steps as\n1-token final segments (--mixed-prefill, default), so decoders keep producing one token per wave\nwhile the long prompt prefills at ~full speed (--no-mixed-prefill alternates waves and decode\nsteps; --prefill-waves-per-step 0 restores the blocking whole-prompt prefill). Default-off\nrelative to the single-stream serve_openai.py; this is a SEPARATE server.\n\nModes:\n  --selftest     : staggered join/leave correctness vs single-stream + aggregate tok/s (no HTTP)\n  (default)      : run the OpenAI server on --port\n\nRun (GPU7, prod Q4):\n  CUDA_VISIBLE_DEVICES=7 TQ_CTX=8192 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --selftest\n  CUDA_VISIBLE_DEVICES=7 TQ_CTX=131072 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --port 8100\n\nDefaults since 10-16 (owner, HANDOFF Decisions 16): --kv-v4 --kv-t4 (trellis-4 K+V, 16.5 KiB/token), --spec (the paged\nMTP drafter; needs the --mtp-exl3 tqf, e.g. qwen3_8-27b-exl3-opt5.75-mtp4.tqf, else it warns and runs plain decode) and\nthe engine's TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4). Since 10-17 also --dstate fp16sr (DeltaNet state in fp16 with\ndeterministic stochastic rounding, 80 MiB/slot) and --decode-steps-per-wave 1, with the engine defaults TQ_T4_ATTN_F16=1\nTQ_GRAPH=1 TQ_GEMM_FORK=1. The served line on one 32 GB RTX 5090: 12 slots, --num-blocks 4500 (576K pooled tokens;\n~5000 = 640K with --no-spec). --no-kv-t4 / --no-spec / TQ_PAGED_ATTN_ST=1 revert to the 10-13 stack; TQ_T4_ATTN_F16=0\nTQ_GRAPH=0 TQ_GEMM_FORK=0 --dstate fp32 --decode-steps-per-wave 0 --num-blocks 4100 restore the 10-16 line bit for bit.\n\"\"\"\nfrom __future__ import annotations\nimport argparse, ctypes, json, os, sys, threading, time, queue, uuid\nfrom http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\nHERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\nWAVE_MAX = 128   # prefill wave column cap = the fast activation quantizer's smem limit\n\nsys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\nfrom serve_common import (BodyError, add_hardening_args, apply_socket_timeout, auth_ok, clamp_fields,  # noqa: E402\n                          clamp_max_tokens, read_json_body, unauthorized_body)\n\n\ndef load_lib(path):\n    L = ctypes.CDLL(path)\n    L.qwn_init.argtypes = [ctypes.c_char_p]; L.qwn_init.restype = ctypes.c_int\n    L.qwn_hidden_size.restype = ctypes.c_int\n    L.qwn_reset_state.restype = ctypes.c_int\n    L.qwn_decode.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_decode.restype = ctypes.c_int\n    L.qwn_paged_init.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]; L.qwn_paged_init.restype = ctypes.c_int\n    L.qwn_paged_free.restype = ctypes.c_int\n    L.qwn_paged_reset_slot.argtypes = [ctypes.c_int]; L.qwn_paged_reset_slot.restype = ctypes.c_int\n    L.qwn_paged_load_client.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_load_client.restype = ctypes.c_int\n    L.qwn_paged_decode_step.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3 + [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]\n    L.qwn_paged_decode_step.restype = ctypes.c_int\n    L.qwn_paged_stats.argtypes = [ctypes.POINTER(ctypes.c_int)] * 4; L.qwn_paged_stats.restype = ctypes.c_int\n    L.qwn_paged_prefill_batch.argtypes = [ctypes.POINTER(ctypes.c_int)] * 7 + [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]\n    L.qwn_paged_prefill_batch.restype = ctypes.c_int\n    L.qwn_prefill_chunk.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]\n    L.qwn_prefill_chunk.restype = ctypes.c_int\n    L.qwn_free.restype = None\n    # session parking (slot KV blocks + DeltaNet state <-> host buffer); older builds lack these\n    try:\n        L.qwn_paged_slot_bytes.argtypes = [ctypes.c_int]; L.qwn_paged_slot_bytes.restype = ctypes.c_size_t\n        L.qwn_paged_slot_save.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]\n        L.qwn_paged_slot_save.restype = ctypes.c_int\n\n\nContinue this file: write the next function that would naturally follow, with a docstring.",
+   "Repository snapshot:\n\n### FILE: tests/test_tqf_hash.py\n\"\"\"The engine's BLAKE2b-256 (qwn_tqf_blake2b256, the .tqf integrity hash) equals hashlib's around the 128-byte block\nedges. Needs a built library: $QWENTIN_LIB or build-qwen/libforward_qwen.so (skipped otherwise, e.g. in the CPU CI).\"\"\"\n\nfrom __future__ import annotations\n\nimport ctypes\nimport hashlib\nimport os\n\nimport pytest\n\nROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\nLIB = os.environ.get(\"QWENTIN_LIB\", os.path.join(ROOT, \"build-qwen\", \"libforward_qwen.so\"))\n\n\n@pytest.mark.skipif(not os.path.exists(LIB), reason=\"no built libforward_qwen.so\")\ndef test_blake2b256_matches_hashlib():\n    lib = ctypes.CDLL(LIB)\n    lib.qwn_tqf_blake2b256.restype = ctypes.c_int\n    lib.qwn_tqf_blake2b256.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]\n    data = bytes((i * 131 + 7) & 0xFF for i in range(1 << 17))\n    for n in (0, 1, 63, 64, 127, 128, 129, 255, 256, 257, 1000, 1 << 17):\n        out = (ctypes.c_uint8 * 32)()\n        assert lib.qwn_tqf_blake2b256(data[:n], n, out) == 0\n        assert bytes(out) == hashlib.blake2b(data[:n], digest_size=32).digest(), n\n\n\ndef _tiny_v1_header(flags: int = 0x1c1d) -> bytes:\n    import struct\n    import sys\n    sys.path.insert(0, os.path.join(ROOT, \"tools\"))\n    import inspect_tqf as it\n    fixed = struct.pack(it.FIXED_HEADER_FMT, flags, 1, 2, 64, 128, 2, 256, 2, 1, 32, 2, 16, 16, 16, 4, 4096,\n                        1e-6, 10000.0, 0.25, 0, 0, 0, 0, 0, 1, 1, 1)\n    return b\"TQF1\" + struct.pack(\"<I\", 8 + len(fixed) + 2) + fixed + bytes([1, 2])\n\n\n@pytest.mark.skipif(not os.path.exists(LIB), reason=\"no built libforward_qwen.so\")\ndef test_loader_refuses_bad_v2_files(tmp_path, monkeypatch):\n    \"\"\"qwn_probe (parse without upload, no GPU needed) on crafted files: each defect gets its own code.\"\"\"\n    import struct\n    import sys\n    sys.path.insert(0, os.path.join(ROOT, \"tools\"))\n    import inspect_tqf as it\n    lib = ctypes.CDLL(LIB)\n    lib.qwn_probe.restype = ctypes.c_int\n    lib.qwn_probe.argtypes = [ctypes.c_char_p]\n    payload = bytes(4096)\n    good = it.seal_header(it.add_extension(_tiny_v1_header()), len(payload), hashlib.blake2b(payload, digest_size=32).digest())\n    ext = len(good) - it.EXT_SIZE\n\n    def probe(name, header, body=payload):\n        p = tmp_path / name\n        p.write_bytes(header + body)\n        return lib.qwn_probe(str(p).encode())\n\n    def resealed(version=2, ext_bytes=it.EXT_SIZE, flags=None):\n        h = bytearray(it.add_extension(_tiny_v1_header(flags if flags is not None else 0x1c1d)))\n        h[ext:ext + 8] = struct.pack(\"<II\", version, ext_bytes)\n        h = it.seal_header(bytes(h), len(payload), hashlib.blake2b(payload, digest_size=32).digest())\n        h = bytearray(h); h[ext:ext + 8] = struct.pack(\"<II\", version, ext_bytes)       # seal_header rewrote them\n        h[ext + 48:ext + 80] = it.header_hash(bytes(h), ext)\n        return bytes(h)\n\n    assert probe(\"short.tqf\", good, payload[:-1]) == -41\n    flipped = bytearray(good); flipped[8 + 4 * 15] ^= 1                                 # max_position_embeddings\n    assert probe(\"hdr.tqf\", bytes(flipped)) == -42\n    assert probe(\"v3.tqf\", resealed(version=3)) == -40\n    assert probe(\"flags.tqf\", resealed(flags=0x1c1d | (1 << 20))) == -44\n    assert probe(\"ext.tqf\", resealed(ext_bytes=96)) == -45\n    monkeypatch.setenv(\"TQ_VERIFY_TQF\", \"1\")\n    assert probe(\"payload.tqf\", good, bytes([1]) + payload[1:]) == -43\n    assert probe(\"ok.tqf\", good) not in (-40, -41, -42, -43, -44, -45)    # passes the checks, then the tiny payload fails\n\n\n### FILE: tools/residual_map_check.py\n#!/usr/bin/env python3\n\"\"\"Parity check of the engine-side residual-stream hook (qwn_rmap_hook_add / k_tq_rmap_hook2).\n\nArms the maps file exactly like serve_openai.py --residual-map would, then drives\nqwn_rmap_apply_debug with random residual rows and compares the device result against the\nfp64 numpy reference of the same affine map (tools/residual_map.py apply_reference):\n\n    y = P^T (x - mu);  z = (A - I)^T y;  x += scale * (shift + P z)\n\nUsage:\n    python3 tools/residual_map_check.py --lib build-qwen/libforward_qwen.so \\\n        --tqf /path/to/model.tqf --residual-map maps.json [--layers 37,38] [--scale 0.3]\n\nExit 0 = parity within fp32 reduction tolerance (1e-3 absolute) on every checked layer.\nRun it on every new maps file before serving it; GPU required (the hook runs on\n\nExplain what this code does in detail, then point out two possible bugs.",
+   "Repository snapshot:\n\n### FILE: CHANGELOG.md\n# Changelog\n\nReleases are git tags; the numbers of a release are pinned at its tag and backed by a log in\n[`docs/evidence/`](docs/evidence/README.md) (every gate log names the engine commit and the library md5 it ran).\nMeasurement dates are UTC. \"Bitwise\" means the lever reproduces the previous kernels' outputs bit for bit\n(`tools/paged_logit_ab.py`, max |d| 0), so it was landed on speed alone; everything else went through the quality\nyardstick of [`docs/QUALITY.md`](docs/QUALITY.md).\n\n## [Unreleased]\n\n- **Prefill attention on the trellis pool** (`TQ_PATTN_GQA=1`, default since 2026-10-17, main `9c0a046`): one\n  GQA-grouped tensor-core kernel with fp32 accumulation instead of the per-head bf16 kernel \u2014 attention 17.0 \u2192 9.3 ms\n  per 128-column wave at 32K, 67.6 \u2192 34.2 ms at 128K; served-line **TTFT 13.3 \u2192 11.8 s @32K, 77.0 \u2192 60.4 s @128K**.\n  Not bitwise (a different tiling of the same fp32 softmax): e2e within the 95 % CI at 4K and 32K, spec exactness ALL\n  PASS, needle 6/6, A/B 10/10 (`docs/evidence/cand9-all.log`); `TQ_PATTN_GQA=0` = the v0.10 kernel bit for bit.\n- **The trellis-KV codebook is compiled into the engine** (`src/engine/kv_t4_codebook.inc`, generated from\n  `tools/codebooks/lloyd_kv12a.f32` by `tools/gen_codebook_inc.py` and checked by `tests/test_codebook_inc.py`).\n  `TQ_KV_T4_CODEBOOK` / `--kv-t4-codebook` only override it; the engine's fallback to the measurement box's path is\n  gone. Same values, bitwise (`docs/evidence/cand10-all.log`).\n- README cut to the pitch, the table, a quick start and the docs index; its details moved to `docs/FLAGS.md`\n  (endpoints, the startup line) and `docs/evidence/README.md` (`bench/reproduce.sh` options, build reproducibility).\n- **The engine in 26 parts**: `src/forward_qwen.cu` includes `src/engine/*.cuh` in order \u2014 still one translation unit,\n  per-kernel SASS identical to the unsplit file. Tools that use the engine source as prompt text read it through\n  `tools/engine_text.py`; `tests/test_unity_build.py` checks the part list.\n- **`src/qwentin.h`**: the 137 `qwn_*` entry points as a C header (generated by `tools/gen_qwentin_h.py`), included\n  first by the translation unit, so a definition that drifts from its declaration does not compile; the same\n  signatures for ctypes in `tools/qwentin_abi.py` (`bind(lib)`). `tests/test_qwentin_abi.py` checks both are current\n  and that the 210 hand-written ctypes declarations in `tools/` agree with the header (it found `qwn_free` declared\n  as returning int in three tools; it is void).\n- `TQ_GEMM_FORK_MAXN` (default 64): the concurrent GEMM groups only up to N = 64 \u2014 decode steps and verify waves keep\n  them, the 128-column prefill wave runs its gate / up groups on one stream (bitwise, neutral on the wave;\n  `TQ_GEMM_FORK_MAXN=1000000` = the previous behaviour).\n- The residual-stream hook's entry points are `qwn_rmap_hook_add` / `_hook_count` / `_set_scale` / `_apply_debug`; the\n  2026-08 `qwn_ot_*` names stay as aliases for one release. Stale comments (the file header, June/July dates) and\n  never-called code (the single-stream spec path's graph experiment, an unused fork kernel) removed.\n- **`.tqf` format version 2**: the converter appends an 80-byte header extension with the payload size and BLAKE2b-256\n  hashes of the payload and of the header (sealed last, so an interrupted conversion is refused). The engine checks\n  the header hash and the size on every load, the payload hash with `TQ_VERIFY_TQF=1` (~20 s for 21 GB), and refuses\n  a newer format, a truncated copy, a corrupted header or payload and unknown flags with distinct codes (-40 \u2026 -45);\n  `tools/inspect_tqf.py --verify` does the same offline. Version-1 files load as before; re-converting the served\n  `-mtp4.tqf` gives the same payload byte for byte plus the extension (docs/TQF_FORMAT.md).\n- Ten experiment switches of the served path removed, their defaults hard-coded (bitwise: today's behaviour is the\n  default branch): the sweep overrides `TQ_PATTN_S`, `TQ_WIDE_ATTN_SPLIT`, `TQ_EXL3_WIDE_NG`, `TQ_PAGED_SPLIT`,\n  `TQ_BFRAG_BDIM`; the never-adopted opt-in `TQ_VF_NG8`; `TQ_VF_SPLIT_BY_SLOTS` (its other value broke the\n  spec-exactness guarantee); and the bitwise-either-way `TQ_VF_COMMIT_FUSED`, `TQ_VF_SEG_ATTN`, `TQ_FUSE_NORM`. None was\n  documented or used by a tool. Debug switches are now listed in docs/FLAGS.md.\n- Tools: the default `--lib` is this repository's `build-qwen/libforward_qwen.so` (was a path on the development box),\n  and both servers require `--tqf` / `--model-dir` instead of defaulting to files that do not exist.\n\n## [v0.10] \u2014 2026-10-17\n\nThe 2026-10 served stack: **Qwen3.8-27B on one RTX 5090 (32 GB), 576K pooled context tokens across 12 sessions at FP8\nquality, speculative decoding on every stream**, through the batched OpenAI-compatible server (`tools/\n\nRefactor the longest function in this snapshot for readability and show the result.",
+   "Repository snapshot:\n\n### FILE: tools/convert.py\n#!/usr/bin/env python3\n\"\"\"Convert HuggingFace model to qwentin GGUF format.\n\nQuantizes linear layer weights to FP8 (E4M3), FP6 (E2M3), or Sparse FP6\nand repacks them into QMMA tensor core fragment layout for direct consumption\nby the SM120 GEMV kernels.\n\nUsage:\n    python convert.py meta-llama/Llama-2-7b-hf --quant f6  -o llama-7b-f6.gguf\n    python convert.py meta-llama/Llama-2-7b-hf --quant f8  -o llama-7b-f8.gguf\n    python convert.py meta-llama/Llama-2-7b-hf --quant sf6 -o llama-7b-sf6.gguf\n\"\"\"\n\nimport argparse\nimport os\nimport struct\nimport sys\n\nimport numpy as np\n\n# GGUF constants\nGGUF_MAGIC = 0x46475547  # \"GGUF\"\nGGUF_VERSION = 3\nGGUF_TYPE_F32    = 0\nGGUF_TYPE_F16    = 1\nGGUF_TYPE_F8_E4M3  = 100\nGGUF_TYPE_F6_E2M3  = 101\nGGUF_TYPE_SF6_E2M3 = 102\n\n\n# ---------------------------------------------------------------------------\n# FP6 E2M3 conversion (NumPy vectorized)\n# ---------------------------------------------------------------------------\n\n_E2M3_ABS = None   # sorted positive representable magnitudes\n_E2M3_CODE = None  # uint8 code for each magnitude\n_E2M3_MID = None   # midpoints between consecutive magnitudes (round-to-nearest)\n\n\ndef _e2m3_tables():\n    \"\"\"Build the 32 positive E2M3 magnitudes and their codes once.\"\"\"\n    global _E2M3_ABS, _E2M3_CODE, _E2M3_MID\n    if _E2M3_ABS is None:\n        vals, codes = [], []\n        for e in range(4):          # e=0 subnormal, e=1..3 normal (bias 1)\n            for m in range(8):\n                if e == 0:\n                    v = m / 8.0\n                    c = m\n                else:\n                    v = (1.0 + m / 8.0) * (2.0 ** (e - 1))\n                    c = (e << 3) | m\n                vals.append(v)\n                codes.append(c)\n        v = np.asarray(vals, dtype=np.float32)\n        c = np.asarray(codes, dtype=np.uint8)\n        order = np.argsort(v)\n        _E2M3_ABS = v[order]\n        _E2M3_CODE = c[order]\n        _E2M3_MID = ((_E2M3_ABS[:-1] + _E2M3_ABS[1:]) * 0.5).astype(np.float32)\n    return _E2M3_ABS, _E2M3_CODE, _E2M3_MID\n\n\ndef float_to_e2m3(x):\n    \"\"\"Convert float array to E2M3 (6-bit) values, returned as uint8.\n\n    Round-to-nearest via a lookup table over the 32 representable magnitudes:\n    no per-element log2/floor/pow, which is ~10x faster on large weights and is\n    what makes on-load (FIFO) packing of a 27B model practical.\n    \"\"\"\n    x = np.asarray(x, dtype=np.float32)\n    sign = (x < 0).astype(np.uint8)\n    ax = np.clip(np.abs(x), 0.0, 7.5)\n    _, codes, mid = _e2m3_tables()\n    idx = np.searchsorted(mid, ax)            # nearest representable magnitude\n    result = codes[idx].astype(np.uint8)\n    return (sign << 5) | result\n\n\ndef float_to_e4m3(x):\n    \"\"\"Convert float array to E4M3 (E4M3FN) codes, returned as uint8.\n\n    Standard OCP/CUDA ``float8_e4m3fn``: 1 sign / 4 exponent (bias 7) / 3 mantissa,\n    using the FULL normal range up to 448 = S.1111.110 (biased exponent up to 15),\n    round-to-nearest-even on the mantissa, subnormals in the exponent-0 field, and\n    saturation of out-of-range magnitudes to 448. The NaN encodings (S.1111.111)\n    are never produced for finite inputs. Decodes exactly via the engine's\n    tq_e4m3_to_float. (Previously the biased exponent was clipped to 14, capping the\n    max representable at ~240 and clipping the largest weight in every 448-scaled\n    block -> ~20% relL2 round-trip error on weights with outliers.)\n    \"\"\"\n    x = np.asarray(x, dtype=np.float32)\n    sign = (x < 0).astype(np.uint8)\n    ax = np.abs(x).astype(np.float64)\n    ax = np.where(np.isfinite(ax), ax, 448.0)   # inf/nan -> max finite\n\n    result = np.zeros(ax.shape, dtype=np.uint8)\n    MIN_NORMAL = 2.0 ** -6                       # smallest normal = 0.015625\n\n    # Subnormal region (exponent field 0): step 2^-9, mantissa 0..7. A rounded\n    # mantissa of 8 carries up to the smallest normal (code 0x08).\n    sub = ax < MIN_NORMAL\n    m_sub = np.rint(ax[sub] / (2.0 ** -9))       # round-half-to-even, 0..8\n    result[sub] = np.clip(m_sub, 0, 8).astype(np.uint8)\n\n    # Normal region: value = (1 + m/8) * 2^(b-7), biased exponent b in 1..15.\n    norm = ~sub\n    a = ax[norm]\n    e = np.floor(np.log2(a)).astype(np.int64)    # unbiased exponent\n    biased = e + 7\n    m = np.rint(a / np.exp2(e.astype(np.float64)) * 8.0) - 8.0   # RNE mantissa, 0..8\n    carry = m >= 8.0                             # mantissa\n\nWrite unit tests (pytest) for the most important function in this snapshot.",
+   "Implement an LRU cache class in Python with O(1) get/put and explain the design.",
+   "Repository snapshot:\n\n### FILE: src/engine/spec_driver.cuh\n// the single-stream spec-forward graph, n-gram drafter, spec round driver and wide prefill forward.\n// Part of the forward_qwen.cu unity build: included in order, not a standalone header.\n\n// =================== Spec-forward CUDA graph ===================\n// Graph-compatible spec_forward: reads token IDs from d_spec_tokens and positions\n// from d_spec_positions (device arrays) instead of host-side arguments. The tree\n// topology (parent/depth/N) is FIXED across replays.\n\nstatic int ensure_spec_graph_params(int N) {\n    if (!g_qwen.d_spec_tokens) {\n        cudaError_t err = cudaMalloc(&g_qwen.d_spec_tokens, (size_t)TQ_SPEC_MAX_N * sizeof(int));\n        if (err != cudaSuccess) return -1;\n        g_qwen.device_bytes += (size_t)TQ_SPEC_MAX_N * sizeof(int);\n    }\n    if (!g_qwen.d_spec_positions) {\n        cudaError_t err = cudaMalloc(&g_qwen.d_spec_positions, (size_t)TQ_SPEC_MAX_N * sizeof(int));\n        if (err != cudaSuccess) return -2;\n        g_qwen.device_bytes += (size_t)TQ_SPEC_MAX_N * sizeof(int);\n    }\n    return 0;\n}\n\nstatic int set_spec_graph_params(const int *tok, const int *posv, int N) {\n    int ret = ensure_spec_graph_params(N);\n    if (ret != 0) return ret;\n    cudaError_t err = cudaMemcpyAsync(g_qwen.d_spec_tokens, tok, (size_t)N * sizeof(int),\n                                      cudaMemcpyHostToDevice, g_qwen.stream);\n    if (err != cudaSuccess) return -3;\n    err = cudaMemcpyAsync(g_qwen.d_spec_positions, posv, (size_t)N * sizeof(int),\n                          cudaMemcpyHostToDevice, g_qwen.stream);\n    if (err != cudaSuccess) return -4;\n    return 0;\n}\n\nextern \"C\" int qwn_capture_spec_forward(const int *tok, const int *parent, const int *depth,\n                                        const int *posv, int N) {\n    if (!g_qwen.initialized) return -1;\n    if (N < 1 || N > TQ_SPEC_MAX_N) return -2;\n    destroy_spec_graph();\n    int ret = ensure_spec_buffers();\n    if (ret != 0) return ret;\n\n    // warmup + capture the EAGER verify itself: one implementation for eager and\n    // graph (bit-identical numerics); all its H2D sources are static staging.\n    ret = run_spec_forward_n(tok, parent, depth, posv, N, g_qwen.L);\n    if (ret != 0) return ret;\n    cudaError_t err = cudaStreamSynchronize(g_qwen.stream);\n    if (err != cudaSuccess) return -20;\n\n    err = cudaStreamBeginCapture(g_qwen.stream, cudaStreamCaptureModeGlobal);\n    if (err != cudaSuccess) {\n        fprintf(stderr, \"spec cudaStreamBeginCapture failed: %s\\n\", cudaGetErrorString(err));\n        return -21;\n    }\n    ret = run_spec_forward_n(tok, parent, depth, posv, N, g_qwen.L);\n    if (ret != 0) {\n        cudaStreamEndCapture(g_qwen.stream, &g_qwen.spec_graph);\n        destroy_spec_graph();\n        return ret;\n    }\n    err = cudaStreamEndCapture(g_qwen.stream, &g_qwen.spec_graph);\n    if (err != cudaSuccess) {\n        fprintf(stderr, \"spec cudaStreamEndCapture failed: %s\\n\", cudaGetErrorString(err));\n        destroy_spec_graph();\n        return -22;\n    }\n    err = cudaGraphInstantiate(&g_qwen.spec_graph_exec, g_qwen.spec_graph, 0);\n    if (err != cudaSuccess) {\n        fprintf(stderr, \"spec cudaGraphInstantiate failed: %s\\n\", cudaGetErrorString(err));\n        destroy_spec_graph();\n        return -23;\n    }\n    g_qwen.spec_graph_ready = 1;\n    g_qwen.spec_graph_N = N;\n    return 0;\n}\n\nextern \"C\" int qwn_spec_forward_graph(const int *tok, const int *parent, const int *depth,\n                                      const int *posv, int N, int *out_argmax, float *out_hidden) {\n    if (!g_qwen.initialized) return -1;\n    if (N < 1 || N > TQ_SPEC_MAX_N) return -2;\n    if (!g_qwen.spec_graph_ready || !g_qwen.spec_graph_exec) {\n        int ret = qwn_capture_spec_forward(tok, parent, depth, posv, N);\n        if (ret != 0) return ret;\n    }\n    if (N != g_qwen.spec_graph_N) return -3;\n    int ret = set_spec_graph_params(tok, posv, N);\n    if (ret != 0) return ret;\n    cudaError_t err = cudaGraphLaunch(g_qwen.spec_graph_exec, g_qwen.stream);\n    if (err != cudaSuccess) {\n        fprintf(stderr, \"spec cudaGraphLaunch failed: %s\\n\", cudaGetErrorString(err));\n        return -4;\n    }\n    if (out_hidden) {\n        if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -5;\n        cudaMemcpy(out_hidden, g_qwen.d_spec_norm, (size_t)N * g_qwen.H * sizeof(float), cudaMemcpyDeviceToHost);\n    }\n    return spec_argmax(N, out_argmax);\n}\n\n// 1-read commit: after a verify run_spec_forward_n over the tree, advance the REAL\n// committed state to the accepted path WITHOUT a 2nd forward. Copies the accepted\n// leaf's archived per-(layer,node) DeltaNet recur/conv into the live state, and\n// re-places the accepted path nodes' archived attn KV into their cache slots (DFS\n// verify left each shared slot holding the last branch, not the accepted one).\n//   path_nodes[j] = verify DFS node index of the j-th path node (0=root .. m-1=leaf)\n//   path_pos[j]   = that node's absolute KV slot (base_pos+1+j)\n// The caller then snapshots live -> slot0 (qwn_delta_state_save(0)).\nextern \"C\" int qwn_spec_commit(const int *path_nodes, const int *path_pos, int m) {\n    if (!g_qwen.initialized) return -1;\n    if (m < 1 || m > TQ_SPEC_MAX_N) return -\n\nExplain what this code does in detail, then point out two possible bugs.",
+   "Repository snapshot:\n\n### FILE: src/forward_qwen.cu\n/*\n * forward_qwen.cu - the qwentin engine: Qwen3.6/3.8 27B (gated DeltaNet + GQA) on SM120 GPUs, one CUDA translation\n * unit behind the qwn_* C ABI, built from the parts in src/engine/ in the order below (a unity build: the parts\n * share statics and are not standalone headers). It loads .tqf model files (docs/TQF_FORMAT.md) and is driven by\n * tools/serve_batched.py (paged KV pool, continuous batching, speculative decoding) and the legacy single-stream\n * tools/serve_openai.py. How it works: docs/ARCHITECTURE.md; environment flags: docs/FLAGS.md.\n */\n#include \"qwentin.h\"\n#include \"engine/base.cuh\"\n#include \"engine/kv_cache.cuh\"\n#include \"engine/t4_kv.cuh\"\n#include \"engine/attn_group.cuh\"\n#include \"engine/attn_prefill.cuh\"\n#include \"engine/attn_tree.cuh\"\n#include \"engine/quant_bfrag.cuh\"\n#include \"engine/gemm_wide.cuh\"\n#include \"engine/spec_persistent.cuh\"\n#include \"engine/load_quant.cuh\"\n#include \"engine/loader.cuh\"\n#include \"engine/forward_single.cuh\"\n#include \"engine/mtp.cuh\"\n#include \"engine/spec_persistent_host.cuh\"\n#include \"engine/deltanet_prefill.cuh\"\n#include \"engine/spec_driver.cuh\"\n#include \"engine/exl3.cuh\"\n#include \"engine/batched_decode.cuh\"\n#include \"engine/paged_pool.cuh\"\n#include \"engine/paged_attn.cuh\"\n#include \"engine/paged_t4.cuh\"\n#include \"engine/parking.cuh\"\n#include \"engine/paged_graph.cuh\"\n#include \"engine/paged_spec.cuh\"\n#include \"engine/chunked_prefill.cuh\"\n#include \"engine/tests.cuh\"\n\n\n### FILE: CHANGELOG.md\n# Changelog\n\nReleases are git tags; the numbers of a release are pinned at its tag and backed by a log in\n[`docs/evidence/`](docs/evidence/README.md) (every gate log names the engine commit and the library md5 it ran).\nMeasurement dates are UTC. \"Bitwise\" means the lever reproduces the previous kernels' outputs bit for bit\n(`tools/paged_logit_ab.py`, max |d| 0), so it was landed on speed alone; everything else went through the quality\nyardstick of [`docs/QUALITY.md`](docs/QUALITY.md).\n\n## [Unreleased]\n\n- **Prefill attention on the trellis pool** (`TQ_PATTN_GQA=1`, default since 2026-10-17, main `9c0a046`): one\n  GQA-grouped tensor-core kernel with fp32 accumulation instead of the per-head bf16 kernel \u2014 attention 17.0 \u2192 9.3 ms\n  per 128-column wave at 32K, 67.6 \u2192 34.2 ms at 128K; served-line **TTFT 13.3 \u2192 11.8 s @32K, 77.0 \u2192 60.4 s @128K**.\n  Not bitwise (a different tiling of the same fp32 softmax): e2e within the 95 % CI at 4K and 32K, spec exactness ALL\n  PASS, needle 6/6, A/B 10/10 (`docs/evidence/cand9-all.log`); `TQ_PATTN_GQA=0` = the v0.10 kernel bit for bit.\n- **The trellis-KV codebook is compiled into the engine** (`src/engine/kv_t4_codebook.inc`, generated from\n  `tools/codebooks/lloyd_kv12a.f32` by `tools/gen_codebook_inc.py` and checked by `tests/test_codebook_inc.py`).\n  `TQ_KV_T4_CODEBOOK` / `--kv-t4-codebook` only override it; the engine's fallback to the measurement box's path is\n  gone. Same values, bitwise (`docs/evidence/cand10-all.log`).\n- README cut to the pitch, the table, a quick start and the docs index; its details moved to `docs/FLAGS.md`\n  (endpoints, the startup line) and `docs/evidence/README.md` (`bench/reproduce.sh` options, build reproducibility).\n- **The engine in 26 parts**: `src/forward_qwen.cu` includes `src/engine/*.cuh` in order \u2014 still one translation unit,\n  per-kernel SASS identical to the unsplit file. Tools that use the engine source as prompt text read it through\n  `tools/engine_text.py`; `tests/test_unity_build.py` checks the part list.\n- **`src/qwentin.h`**: the 137 `qwn_*` entry points as a C header (generated by `tools/gen_qwentin_h.py`), included\n  first by the translation unit, so a definition that drifts from its declaration does not compile; the same\n  signatures for ctypes in `tools/qwentin_abi.py` (`bind(lib)`). `tests/test_qwentin_abi.py` checks both are current\n  and that the 210 hand-written ctypes declarations in `tools/` agree with the header (it found `qwn_free` declared\n  as returning int in three tools; it is void).\n- `TQ_GEMM_FORK_MAXN` (default 64): the concurrent GEMM groups only up to N = 64 \u2014 decode steps and verify waves keep\n  them, the 128-column prefill wave runs its gate / up groups on one stream (bitwise, neutral on the wave;\n  `TQ_GEMM_FORK_MAXN=1000000` = the previous behaviour).\n- The residual-stream hook's entry points are `qwn_rmap_hook_add` / `_hook_count` / `_set_scale` / `_apply_debug`; the\n  2026-08 `qwn_ot_*` names stay as aliases for one release. Stale comments (the file header, June/July dates) and\n  never-called code (the single-stream spec path's graph experiment, an unused fork kernel) removed.\n- **`.tqf` format version 2**: the converter appends an 80-byte header extension with the payload size and BLAKE2b-256\n  hashes of the payload and of the header (sealed last, so an interrupted conversion is refused). The engine checks\n  the header hash and\n\nRefactor the longest function in this snapshot for readability and show the result.",
+   "Repository snapshot:\n\n### FILE: docs/NOTES.md\n# Notes \u2014 the 2026-10 build: where the memory went, what was taken from DeepSeek-V4.1, how the served stack performs\n\nThese were the front pages of the 2026-10-17 README. At v0.10 the README became a release page (three lines of pitch,\none table, the reproduction) and the narrative moved here, **as written on 2026-10-17 for engine `2cf671c`** \u2014 the\n2026-10 served stack: EXL3 opt-5.75 weights + the 4-bit trellis-coded KV + speculative decoding on the batched server.\n\nOne number changed after these notes were written: the gated-DeltaNet prefill kernels (`TQ_GDN_PREFILL=1`, engine\n`b2e7a3f`, landed 2026-10-17 16:45 UTC) took the cold time to first token from 15.9 / 86.6 s to **13.3 / 77.0 s** at\n32K / 128K (`docs/evidence/cand8-all.log` gate 3). Every TTFT quoted below is the earlier value; every other number is\nunchanged \u2014 decode runs the same kernels bit for bit (gate 1 of that log). The table pinned at v0.10 is the one in\nthe top-level [README](../README.md); the cell-by-cell provenance is [`docs/evidence/README.md`](evidence/README.md).\n\nSections: the TL;DR (the memory accounting on one 32 GB card, the speed side, what was taken from DeepSeek-V4.1) \u00b7\nthe summary block and its sources \u00b7 why it's interesting (the full comparison table with the 2026-08 FP6 column, read\nhonestly) \u00b7 the quality protocol in short \u00b7 the performance of the served stack (the speed table, the mixed load, the\nlever accounting).\n\n## TL;DR \u2014 what is new in the 2026-10 build, and where the memory went\n\n**A 27B model with 576K tokens of live context on one 32 GB consumer GPU, at FP8 quality, with\nspeculative decoding on every stream.** The official FP8 checkpoint of this model does not even\nfit the card (it OOMs after loading 27.5 GiB of weights); stock vLLM with NVFP4 weights holds\n147\u2013179K tokens on it at an order of magnitude more KL. Same card, same model \u2014 this is how the\nmemory was found:\n\n| | bf16 / stock | qwentin 2026-10 | how |\n|---|---|---|---|\n| Weights | 54 GB bf16 \u00b7 27.5 GiB FP8 (does not fit) | **18.5 GiB at FP8 quality** | EXL3 **trellis-coded weights** (5.75 bpw, exllamav3 checkpoint) decoded straight on the tensor cores; 6-bit lm_head; the embedding table lives in host RAM |\n| KV cache | ~70 KiB/token bf16 (~35 fp8) | **16.5 KiB/token** | our own 4-bit **trellis-coded KV cache**: a 12-bit-state bitshift trellis with a Lloyd-trained codebook, encoded by a 5.8 M-tiles/s CUDA Viterbi during prefill, decoded inside the attention kernel \u2014 passes the FP8 gate where plain int4 / FP4 K+V does not |\n| Recurrent state, per session (48 gated-DeltaNet layers) | 155 MiB fp32 (vLLM: 163 MB per request) | **80 MiB** | fp16 with deterministic stochastic rounding \u2014 plain fp16 drifts over a long decode, bf16 fails the gate; this one is indistinguishable from fp32 at 64K |\n| Idle sessions | resident in VRAM | **parked in host RAM** at 37\u201345 GB/s | a pinned staging ring; a 32K session leaves or returns in ~16\u201319 ms, so a follow-up turn costs ~nothing |\n| Speculative drafter | 0.85 GB bf16 MTP head | **0.25 GB** | the model's own multi-token-prediction head, EXL3-quantized at 4 bpw; the verified output is bit for bit the plain decode's |\n| **Total** | | **29.9 GB for 12 sessions, each up to 256K** | |\n\n<sub>Provenance: engine `2cf671c` (`src/forward_qwen.cu`; later commits are docs / tools), library `build-qwen/libforward_qwen.so` md5 `e454a29c3caf`, CUDA 13.1 (nvcc `cuda_13.1.r13.1/compiler.37061995_0`), driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0, measured 2026-10-17 \u2014 `docs/evidence/cand7-all.log` gate 3 (29 894 MiB; the startup line's 16.50 KiB/token and 80 MiB/slot); the bf16 / stock column: `docs/evidence/baselines-vllm-20261017.md`; the parking GB/s and the drafter's 0.25 GB: `ASSUMPTIONS.md` of the research repo. Cell-by-cell map: `docs/evidence/README.md`.</sub>\n\nThe speed side came from the same toolbox: speculative decoding through the paged batched server\n(2.6\u00d7 per stream), fp16 staged trellis attention, the decode step as one CUDA graph with concurrent\nGEMM groups, 128-token prefill GEMM units \u2014 **167 tok/s per stream at 32K, 133 at 128K, 12 sessions\nin flight.** The one place stock vLLM wins is cold prefill (3\u20135\u00d7 lower time to first token, see the\ntable below) \u2014 that is the next target.\n\n**What we took from DeepSeek-V4.1.** We read the V4.1-Flash report as a recipe for VRAM-cheap long\ncontext and tested, with numbers\n\nWrite unit tests (pytest) for the most important function in this snapshot.",
+   "Repository snapshot:\n\n### FILE: src/engine/base.cuh\n// includes, limits and file flags, the engine state (g_qwen), numeric helpers.\n// Part of the forward_qwen.cu unity build: included in order, not a standalone header.\n\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <thread>\n#include <vector>\n\n#define TQ_MAX_LAYERS 64\n#define TQ_LAYER_LINEAR_ATTENTION 1\n#define TQ_LAYER_FULL_ATTENTION 2\n#define TQ_DTYPE_FP16 1\n#define TQ_DTYPE_BF16 2\n#define TQ_ARGMAX_BLOCKS 1024\n#define TQ_OPTIMISTIC_TOPK_MAX 16\n// Hard CAP for sequence length (static host scratch, clamp for TQ_CTX).\n// Runtime limit lives in g_qwen.max_seq (default 8192): attention scores moved\n// from smem to a global scratch (bit-exact: same loops/order, other storage),\n// so the old 48KB-smem ceiling is gone. KV fp32: 16k=+2.1GB, 32k=+4.3GB; long\n// contexts need TQ_KV_FP8 (32KB/pos) or 4-bit KV. The cap below is the model's\n// native max_position_embeddings (Qwen3.6: 262144); the real working limit is\n// still TQ_CTX (g_qwen.max_seq), which gates every cache/scratch allocation.\n#define TQ_MAX_SEQ 262144\n#define TQ_FLAG_BLOCK_SCALED_QMMA (1u << 5)\n#define TQ_FLAG_BLOCK_SCALED_ROWMAJOR (1u << 6)\n#define TQ_FLAG_BLOCK_SCALED_QMMA_WORDMAJOR (1u << 7)\n#define TQ_FLAG_BLOCK_SCALED_E2M3 (1u << 8)\n#define TQ_FLAG_SPARSE_24_E2M3 (1u << 9)\n#define TQ_FLAG_HAS_MTP (1u << 10)\n// Linear weights are EXL3 trellis records copied from an exllamav3 checkpoint (see\n// tools/convert_qwen_tqf.py write_exl3_record); dequantized per 16x16 tile at run time.\n#define TQ_FLAG_EXL3_WEIGHTS (1u << 11)\n// The MTP section's 8 projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3) instead of bf16.\n#define TQ_FLAG_MTP_EXL3 (1u << 12)\n#define TQ_MTP_TOPK_MAX 64\n#define TQ_MTP_MAX_DEPTH 15  // max MTP covering-tree depth (16-slot KV archive: root + 15)\n\n// Commit-by-pointer-swap: rounds with N <= 8 alternate archive halves (slots\n// 0-7 / 8-15), so the accepted leaf's state slab can BECOME the live state\n// (zero-copy commit); the next round writes the other half and cannot clobber it.\nstatic int g_spec_slot_base = 0;        // archive half (0 or 8) used by the current round\nstatic int g_spec_commit_swap = 0;      // this round's commit may pointer-swap\nstatic int g_spec_live_in_archive = 0;  // live DeltaNet pointers parked in the archive\nstatic int g_spec_state_skip_round = 0; // chain items skip non-fork slab writes; commit replays\nstatic int g_spec_pub_h[16];            // host copy of the round's fork-publication mask\nstatic int g_spec_npub_nodes = 0;       // round had a valid pub mask (seg fuse active)\nstatic void hist_reset(void);           // n-gram drafter history (defined with the drafter)\n#define TQ_DELTA_SNAP_SLOTS 6  // DeltaNet state snapshot slots for tree-verify forking (Step 3)\n#ifndef TQ_SPEC_MAX_N\n#define TQ_SPEC_MAX_N 16       // max batched verify nodes/round (16 = 2 m16n8 column groups).\n                               // MEASURED dead-end (roadmap D stopgap):\n                               // -DTQ_SPEC_MAX_N=32 + TQ_PREFILL_CHUNK=32 gives +50% prefill\n                               // (695->1032 tok/s @2k; lever is REAL) BUT the tree-attention\n                               // verify (k_tq_spec_attn_tree_mma) uses a single 16-slot m16\n                               // archive tile -> chains >~20 overflow it and CORRUPT the\n                               // long-context state (needle 0/3 garbage @8k; CH<=20 still OK).\n                               // Not a transparent cap; also perturbs branching-tree decode\n                               // numerics (max_abs 19) and scales every d_spec_* buffer (prod\n                               // GPU6 @256k has ~0.45 GiB margin). Wide prefill needs a DEDICATED\n                               // N-wide kernel (D.1), not this bump. Keep the default at 16.\n#endif\n#define TQ_SPEC_MAX_GROUPS ((TQ_SPEC_MAX_N + 7) / 8)   // n-tile groups of 8 columns each\n\n// Set once at load time: 1 if QMMA weights are dense 6-bit E2M3 (mixed-format\n// E2M3 weights x E4M3 activations), 0 for the default E4M3 weight path.\n__constant__ int gc_weight_e2m3 = 0;\n\n// TQ_LDSM (PROBE, default OFF): feed the persistent MLP GEMV operand-A through\n// the SM120 hardware FP6 unpack (ldmatrix.m8n16.x4.b6x16_p32 / LDSM.U6) instead\n// of the software LOP3 unpack. When enabled, the MLP dense-E2M3 weights are\n// repacked at load into LDSM-natural (\"matrix row\") order (same 384 B/tile, same\n// codes), and the part-1 kernel stages each k-tile to SMEM and ldmatrix's it into\n// the exact same operand-A fragment the dense path produces (bit-identical MMA).\n// The default path is untouched (separate kernel instantiation, no extra SMEM).\n__constant__ int gc_use_ldsm = 0;\n\n// TQ_PERSIST_P2P (PROBE, default OFF): replace the part-1 gemv2->\n\nContinue this file: write the next function that would naturally follow, with a docstring.",
+   "Write a C function that parses an IPv4 address string into a uint32_t, with error handling."
+  ],
+  "res": {
+   "on": [
+    {
+     "text": "```python\n    except AttributeError:\n        pass\n    try:\n        L.qwn_paged_slot_restore.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]\n        L.qwn_paged_slot_restore.restype = ctypes.c_int\n    except AttributeError:\n        pass\n    return L\n\n\nclass Request:\n    \"\"\"A single client request tracked by the scheduler.\"\"\"\n    __slots__ = ('id', 'prompt_ids', 'max_tokens', 'stop_ids', 'done', 'result_ids', 'error', 'created_at')\n\n    def __init__(self, prompt_ids, max_tokens, stop_ids=None):\n        self.id = str(uuid.uuid4())\n        self.prompt_ids = prompt_ids\n        self.max_tokens = max_tokens\n        self.stop_ids = stop_ids or []\n        self.done = threading.Event()\n        self.result_ids = []\n        self.error = None\n        self.created_at = time.time()\n\n\nclass BatchedEngine:\n    \"\"\"Owns the CUDA engine and runs the continuous-batching loop in a dedicated thread.\"\"\"\n\n    def __init__(self, lib, model_path, num_slots, num_blocks, ctx_len, kv_q4, kv_v4, kv_t4,\n                 spec, mtp_path, dstate, decode_steps_per_wave, mixed_prefill, prefill_waves_per_step,\n                 t4_at",
+     "tokens": 300,
+     "s": 2.2016022205352783
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis repository snapshot contains two distinct Python files related to a custom inference engine (likely for Qwen models) that uses a custom file format (`.tqf`) and a shared library (`libforward_qwen.so`).\n\n### 1. `tests/test_tqf_hash.py`\n\nThis file contains pytest tests to verify the integrity and correctness of the `.tqf` file format and its associated C library functions.\n\n**Key Components:**\n\n*   **Library Loading:** It attempts to load `libforward_qwen.so` from an environment variable `QWENTIN_LIB` or a default build path. If the library is missing, tests are skipped.\n*   **`test_blake2b256_matches_hashlib`:**\n    *   Verifies that the C function `qwn_tqf_blake2b256` produces the same output as Python's `hashlib.blake2b` (with `digest_size=32`).\n    *   It tests various input lengths, specifically focusing on block boundaries (128 bytes) to ensure the C implementation handles block padding and finalization correctly.\n*   **`test_loader_refuses_bad_v2_files`:**\n    *   This is a more complex test that validates the `qwn_probe` function, which parses `.tqf` files without uploading them to a GPU.\n    *   It constructs a valid \"tiny",
+     "tokens": 300,
+     "s": 2.5661795139312744
+    },
+    {
+     "text": "Based on the provided snapshot, there is **no source code** (such as C, C++, Python, or CUDA files) included in the text. The snapshot consists solely of `CHANGELOG.md`, which contains release notes, feature descriptions, and documentation references.\n\nTherefore, it is **not possible** to refactor a function because no functions are present in the provided text.\n\nIf you have the actual source code file (e.g., `src/forward_qwen.cu`, `tools/engine_text.py`, or another file mentioned in the changelog), please provide it, and I will be happy to identify the longest function and refactor it for readability.",
+     "tokens": 134,
+     "s": 1.3990287780761719
+    },
+    {
+     "text": "I'll analyze the snapshot to identify the most important function and write comprehensive unit tests for it.\n\nThe most important function here is `float_to_e4m3` \u2014 it's the core quantization routine, has the most complex logic (subnormal/normal regions, RNE rounding, carry handling, saturation), and the docstring explicitly notes a previous bug that was fixed (exponent clipping). Let me first check the repo structure to place the test appropriately.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls -la && echo \"---\" && find . -name \"test_*.py\" -o -name \"*_test.py\" | head -20 && echo \"---\" && cat pyproject.toml 2>/dev/null | head -40\n</parameter>\n<parameter=description>\nInspect repo layout and existing tests\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 189,
+     "s": 1.7473170757293701
+    },
+    {
+     "text": "# LRU Cache Implementation in Python\n\n## Design Overview\n\nAn LRU (Least Recently Used) cache requires **O(1)** time complexity for both `get` and `put` operations. The key insight is combining two data structures:\n\n1. **Hash Map (Dictionary)**: Maps keys to nodes for O(1) lookup.\n2. **Doubly Linked List**: Maintains the order of usage, with the most recently used item at the head and the least recently used at the tail.\n\n### Why this combination?\n- The hash map gives us O(1) access to any key.\n- The doubly linked list allows O(1) insertion at the head, removal from the tail, and removal of any node (given a reference to it).\n- Each node in the linked list stores both the key and value, so when we remove a node from the list, we can also remove it from the hash map.\n\n```\nHead <-> [MRU] <-> ... <-> [LRU] <-> Tail\n         \u2191                          \u2191\n    most recently used      least recently used\n```\n\n## Implementation\n\n```python\nclass Node:\n    \"\"\"Doubly linked list node storing key-value pair.\"\"\"\n    __slots__ = ('key', 'value', 'prev', 'next')\n\n    def __init__(self, key=0, value=0):\n        self.key = key\n        self.value = value\n",
+     "tokens": 300,
+     "s": 1.8761389255523682
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis code implements a **speculative decoding** mechanism for a Qwen-based LLM inference engine on CUDA. Speculative decoding works by having a smaller \"drafter\" model propose multiple candidate tokens (a \"tree\" of possibilities), and then a larger \"target\" model verifies them in a single forward pass. If the target model accepts the proposed tokens, they are committed to the output; otherwise, the first rejected token is used to continue generation.\n\n### Key Components\n\n1. **CUDA Graph Capture for Speculative Forward Pass**\n   - `qwn_capture_spec_forward`: Captures a CUDA graph of the speculative verification forward pass. This allows the entire verification computation (which involves processing a tree of candidate tokens) to be replayed efficiently with minimal CPU overhead.\n   - The graph is captured in \"global\" mode, meaning all memory accesses are recorded. The tree topology (parent pointers, depths, number of nodes N) is **fixed** at capture time.\n   - Before capture, a warmup run is performed to ensure all kernels are compiled and memory is allocated.\n\n2. **Graph Replay with Dynamic Token/Position Inputs**\n   - `qwn_spec_forward_graph`: Replays the captured graph. Since the tree topology is fixed, only the **token IDs** and **positions** change between replays. These are copied to pre-allocated device buffers (`d_spec_tokens`, `d_spec_positions`) via `set_spec_graph",
+     "tokens": 300,
+     "s": 2.808797836303711
+    },
+    {
+     "text": "Based on the provided snapshot, the file `src/forward_qwen.cu` is a **unity build** (a single translation unit) that includes numerous `.cuh` files. The actual implementation of the functions resides in those included files (e.g., `engine/forward_single.cuh`, `engine/batched_decode.cuh`, etc.), which are **not provided** in the snapshot.\n\nHowever, the snapshot *does* provide the **header comment** and the **include structure** of `src/forward_qwen.cu`. The \"longest function\" in the visible code is effectively the **file header comment block** itself, which is a dense, multi-paragraph description of the engine's architecture, dependencies, and usage.\n\nSince we cannot refactor the actual CUDA kernel code (as it's not in the snapshot), I will refactor the **header comment** for readability, breaking it down into logical sections with clear formatting. This is the only \"function-like\" block of text available to refactor in the provided snapshot.\n\n### Refactored Header Comment for `src/forward_qwen.cu`\n\n```c\n/*\n * forward_qwen.cu\n *\n * The qwentin engine: Qwen3.6/3.8 27B (gated DeltaNet + GQA) on SM120 GPUs.\n *\n * Architecture:\n *   - Single CUDA translation unit (unity build) behind the qwn",
+     "tokens": 300,
+     "s": 2.4052131175994873
+    },
+    {
+     "text": "I'll start by exploring the repository to understand what code actually exists, since the snapshot only shows a documentation file.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls -la && echo \"---GIT---\" && git log --oneline -20 2>/dev/null | head -40\n</parameter>\n<parameter=description>\nList repo root and recent git history\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 95,
+     "s": 1.0321130752563477
+    },
+    {
+     "text": "```c\n// TQ_PERSIST_P2P (PROBE, default OFF): replace the part-1 gemv2->\n// part-2 gemv2 pipeline with a persistent kernel that keeps the MLP weights\n// resident in L2 cache across the two stages, reducing DRAM traffic for\n// small-batch inference. When enabled, the MLP GEMV is split into two\n// persistent kernels: one for the first half of the hidden dimension and one\n// for the second half, with a grid-wide barrier between them. The weights\n// are loaded once into L2 and reused, avoiding redundant DRAM reads.\n// This is a probe feature and is disabled by default.\n__constant__ int gc_use_persist_p2p = 0;\n\n// TQ_KV_FP8 (PROBE, default OFF): store KV cache in FP8 (E4M3) instead of\n// FP16/BF16 to reduce memory bandwidth and capacity. When enabled, the KV\n// cache is stored as FP8 with per-head scaling factors. The attention\n// kernels are modified to dequantize on-the-fly. This is a probe feature\n// and is disabled by default.\n__constant__ int gc_use_kv_fp8 = 0;\n\n// TQ_4BIT_KV (PROBE, default OFF): store KV cache in 4-bit quantized format\n// to further reduce memory footprint.",
+     "tokens": 300,
+     "s": 2.6489200592041016
+    },
+    {
+     "text": "```c\n#include <stdint.h>\n#include <string.h>\n#include <stdlib.h>\n#include <errno.h>\n\n/**\n * Parses an IPv4 address string (e.g., \"192.168.1.1\") into a uint32_t.\n * The resulting uint32_t is in network byte order (big-endian), where the\n * first octet is the most significant byte.\n *\n * @param str  Pointer to the null-terminated IPv4 address string.\n * @param out  Pointer to a uint32_t where the parsed address will be stored.\n * @return     0 on success, -1 on error.\n */\nint parse_ipv4(const char *str, uint32_t *out) {\n    if (str == NULL || out == NULL) {\n        return -1;\n    }\n\n    uint32_t result = 0;\n    int octet_count = 0;\n    const char *p = str;\n\n    while (1) {\n        // Parse one octet\n        char *endptr;\n        errno = 0;\n        long val = strtol(p, &endptr, 10);\n\n        // Check for errors\n        if (errno != 0) {\n            return -1;\n        }\n        if (endptr == p) {\n            //",
+     "tokens": 300,
+     "s": 1.717132568359375
+    }
+   ],
+   "off": [
+    {
+     "text": "```python\n    except AttributeError:\n        pass\n    try:\n        L.qwn_paged_slot_restore.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]\n        L.qwn_paged_slot_restore.restype = ctypes.c_int\n    except AttributeError:\n        pass\n    return L\n\n\nclass Request:\n    \"\"\"A single client request tracked by the scheduler.\"\"\"\n    __slots__ = ('id', 'prompt_ids', 'max_tokens', 'stop_ids', 'done', 'result_ids', 'error', 'created_at')\n\n    def __init__(self, prompt_ids, max_tokens, stop_ids=None):\n        self.id = str(uuid.uuid4())\n        self.prompt_ids = prompt_ids\n        self.max_tokens = max_tokens\n        self.stop_ids = stop_ids or []\n        self.done = threading.Event()\n        self.result_ids = []\n        self.error = None\n        self.created_at = time.time()\n\n\nclass BatchedEngine:\n    \"\"\"Owns the CUDA engine and runs the continuous-batching loop in a dedicated thread.\"\"\"\n\n    def __init__(self, lib, model_path, num_slots, num_blocks, ctx_len, kv_q4, kv_v4, kv_t4,\n                 spec, mtp_path, dstate, decode_steps_per_wave, mixed_prefill, prefill_waves_per_step,\n                 t4_at",
+     "tokens": 300,
+     "s": 5.007063865661621
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis repository snapshot contains two distinct Python files related to a custom inference engine (likely for Qwen models) that uses a custom file format (`.tqf`) and a shared library (`libforward_qwen.so`).\n\n### 1. `tests/test_tqf_hash.py`\n\nThis file contains pytest tests to verify the integrity and correctness of the `.tqf` file format and its associated C library functions.\n\n**Key Components:**\n\n*   **Library Loading:** It attempts to load `libforward_qwen.so` from an environment variable `QWENTIN_LIB` or a default build path. If the library is missing, tests are skipped.\n*   **`test_blake2b256_matches_hashlib`:**\n    *   Verifies that the C function `qwn_tqf_blake2b256` produces the same output as Python's `hashlib.blake2b` (with `digest_size=32`).\n    *   It tests various input lengths, specifically focusing on block boundaries (128 bytes) to ensure the C implementation handles block padding and finalization correctly.\n*   **`test_loader_refuses_bad_v2_files`:**\n    *   This is a more complex test that validates the `qwn_probe` function, which parses `.tqf` files without uploading them to a GPU.\n    *   It constructs a valid \"tiny",
+     "tokens": 300,
+     "s": 5.003385543823242
+    },
+    {
+     "text": "Based on the provided snapshot, there is **no source code** (such as C, C++, Python, or CUDA files) included in the text. The snapshot consists solely of `CHANGELOG.md`, which contains release notes, feature descriptions, and documentation references.\n\nTherefore, it is **not possible** to refactor a function because no functions are present in the provided text.\n\nIf you have the actual source code file (e.g., `src/forward_qwen.cu`, `tools/engine_text.py`, or another file mentioned in the changelog), please provide it, and I will be happy to identify the longest function and refactor it for readability.",
+     "tokens": 134,
+     "s": 2.491769790649414
+    },
+    {
+     "text": "I'll analyze the snapshot to identify the most important function and write comprehensive unit tests for it.\n\nThe most important function here is `float_to_e4m3` \u2014 it's the core quantization routine, has the most complex logic (subnormal/normal regions, RNE rounding, carry handling, saturation), and the docstring explicitly notes a previous bug that was fixed (exponent clipping). Let me first check the repo structure to place the test appropriately.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls -la && echo \"---\" && find . -name \"test_*.py\" -o -name \"*_test.py\" | head -20 && echo \"---\" && cat pyproject.toml 2>/dev/null | head -40\n</parameter>\n<parameter=description>\nInspect repo layout and existing tests\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 189,
+     "s": 3.2999074459075928
+    },
+    {
+     "text": "# LRU Cache Implementation in Python\n\n## Design Overview\n\nAn LRU (Least Recently Used) cache requires **O(1)** time complexity for both `get` and `put` operations. The key insight is combining two data structures:\n\n1. **Hash Map (Dictionary)**: Maps keys to nodes for O(1) lookup.\n2. **Doubly Linked List**: Maintains the order of usage, with the most recently used item at the head and the least recently used at the tail.\n\n### Why this combination?\n- The hash map gives us O(1) access to any key.\n- The doubly linked list allows O(1) insertion at the head, removal from the tail, and removal of any node (given a reference to it).\n- Each node in the linked list stores both the key and value, so when we remove a node from the list, we can also remove it from the hash map.\n\n```\nHead <-> [MRU] <-> ... <-> [LRU] <-> Tail\n         \u2191                          \u2191\n    most recently used      least recently used\n```\n\n## Implementation\n\n```python\nclass Node:\n    \"\"\"Doubly linked list node storing key-value pair.\"\"\"\n    __slots__ = ('key', 'value', 'prev', 'next')\n\n    def __init__(self, key=0, value=0):\n        self.key = key\n        self.value = value\n",
+     "tokens": 300,
+     "s": 4.426703453063965
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis code implements a **speculative decoding** mechanism for a Qwen-based LLM inference engine on CUDA. Speculative decoding works by having a smaller \"drafter\" model propose multiple candidate tokens (a \"tree\" of possibilities), and then a larger \"target\" model verifies them in a single forward pass. If the target model accepts the proposed tokens, they are committed to the output; otherwise, the first rejected token is used to continue generation.\n\n### Key Components\n\n1. **CUDA Graph Capture for Speculative Forward Pass**\n   - `qwn_capture_spec_forward`: Captures a CUDA graph of the speculative verification forward pass. This allows the entire verification computation (which involves processing a tree of candidate tokens) to be replayed efficiently with minimal CPU overhead.\n   - The graph is captured in \"global\" mode, meaning all memory accesses are recorded. The tree topology (parent pointers, depths, number of nodes N) is **fixed** at capture time.\n   - Before capture, a warmup run is performed to ensure all kernels are compiled and memory is allocated.\n\n2. **Graph Replay with Dynamic Token/Position Inputs**\n   - `qwn_spec_forward_graph`: Replays the captured graph. Since the tree topology is fixed, only the **token IDs** and **positions** change between replays. These are copied to pre-allocated device buffers (`d_spec_tokens`, `d_spec_positions`) via `set_spec_graph",
+     "tokens": 300,
+     "s": 4.930668115615845
+    },
+    {
+     "text": "Based on the provided snapshot, the file `src/forward_qwen.cu` is a **unity build** (a single translation unit) that includes numerous `.cuh` files. The actual implementation of the functions resides in those included files (e.g., `engine/forward_single.cuh`, `engine/batched_decode.cuh`, etc.), which are **not provided** in the snapshot.\n\nHowever, the snapshot *does* provide the **header comment** and the **include structure** of `src/forward_qwen.cu`. The \"longest function\" in the visible code is effectively the **file header comment block** itself, which is a dense, multi-paragraph description of the engine's architecture, dependencies, and usage.\n\nSince we cannot refactor the actual CUDA kernel code (as it's not in the snapshot), I will refactor the **header comment** for readability, breaking it down into logical sections with clear formatting. This is the only \"function-like\" block of text available to refactor in the provided snapshot.\n\n### Refactored Header Comment for `src/forward_qwen.cu`\n\n```c\n/*\n * forward_qwen.cu\n *\n * The qwentin engine: Qwen3.6/3.8 27B (gated DeltaNet + GQA) on SM120 GPUs.\n *\n * Architecture:\n *   - Single CUDA translation unit (unity build) behind the qwn",
+     "tokens": 300,
+     "s": 4.930550575256348
+    },
+    {
+     "text": "I'll start by exploring the repository to understand what code actually exists, since the snapshot only shows a documentation file.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls -la && echo \"---GIT---\" && git log --oneline -20 2>/dev/null | head -40\n</parameter>\n<parameter=description>\nList repo root and recent git history\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 95,
+     "s": 1.9185523986816406
+    },
+    {
+     "text": "```c\n// TQ_PERSIST_P2P (PROBE, default OFF): replace the part-1 gemv2->\n// part-2 gemv2 pipeline with a persistent kernel that keeps the MLP weights\n// resident in L2 cache across the two stages, reducing DRAM traffic for\n// small-batch inference. When enabled, the MLP GEMV is split into two\n// persistent kernels: one for the first half of the hidden dimension and one\n// for the second half, with a grid-wide barrier between them. The weights\n// are loaded once into L2 and reused, avoiding redundant DRAM reads.\n// This is a probe feature and is disabled by default.\n__constant__ int gc_use_persist_p2p = 0;\n\n// TQ_KV_FP8 (PROBE, default OFF): store KV cache in FP8 (E4M3) instead of\n// FP16/BF16 to reduce memory bandwidth and capacity. When enabled, the KV\n// cache is stored as FP8 with per-head scaling factors. The attention\n// kernels are modified to dequantize on-the-fly. This is a probe feature\n// and is disabled by default.\n__constant__ int gc_use_kv_fp8 = 0;\n\n// TQ_4BIT_KV (PROBE, default OFF): store KV cache in 4-bit quantized format\n// to further reduce memory footprint.",
+     "tokens": 300,
+     "s": 4.934024810791016
+    },
+    {
+     "text": "```c\n#include <stdint.h>\n#include <string.h>\n#include <stdlib.h>\n#include <errno.h>\n\n/**\n * Parses an IPv4 address string (e.g., \"192.168.1.1\") into a uint32_t.\n * The resulting uint32_t is in network byte order (big-endian), where the\n * first octet is the most significant byte.\n *\n * @param str  Pointer to the null-terminated IPv4 address string.\n * @param out  Pointer to a uint32_t where the parsed address will be stored.\n * @return     0 on success, -1 on error.\n */\nint parse_ipv4(const char *str, uint32_t *out) {\n    if (str == NULL || out == NULL) {\n        return -1;\n    }\n\n    uint32_t result = 0;\n    int octet_count = 0;\n    const char *p = str;\n\n    while (1) {\n        // Parse one octet\n        char *endptr;\n        errno = 0;\n        long val = strtol(p, &endptr, 10);\n\n        // Check for errors\n        if (errno != 0) {\n            return -1;\n        }\n        if (endptr == p) {\n            //",
+     "tokens": 300,
+     "s": 4.422992467880249
+    }
+   ]
+  }
+ },
+ "speed-32k": [
+  {
+   "N": 1,
+   "mode": "on",
+   "p50_tps": 114.61196246671048,
+   "min_tps": 114.61196246671048,
+   "max_tps": 114.61196246671048,
+   "agg_tps": 114.61196246671048,
+   "tokens": 300,
+   "wall_s": 2.6929914951324463,
+   "prefill_s": 11.85835337638855,
+   "rounds": 122,
+   "steps": 122,
+   "deltas": {
+    "prefilled_tokens": 50,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 1,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": 2.4508196721311477,
+   "ttft_p50": 0.08404087999952026,
+   "cached": [
+    32668
+   ],
+   "completion_tokens": [
+    300
+   ]
+  },
+  {
+   "N": 8,
+   "mode": "on",
+   "p50_tps": 74.73211245781732,
+   "min_tps": 69.80337669520804,
+   "max_tps": 82.21745401025554,
+   "agg_tps": 596.943232475078,
+   "tokens": 2400,
+   "wall_s": 4.751259803771973,
+   "prefill_s": 94.83268880844116,
+   "rounds": 137,
+   "steps": 137,
+   "deltas": {
+    "prefilled_tokens": 400,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 8,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": 17.45985401459854,
+   "ttft_p50": 0.25575492400093935,
+   "cached": [
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668
+   ],
+   "completion_tokens": [
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300
+   ]
+  },
+  {
+   "N": 1,
+   "mode": "off",
+   "p50_tps": 65.14834798613633,
+   "min_tps": 65.14834798613633,
+   "max_tps": 65.14834798613633,
+   "agg_tps": 65.14834798613633,
+   "tokens": 300,
+   "wall_s": 4.650388240814209,
+   "prefill_s": 11.866971492767334,
+   "rounds": 0,
+   "steps": 299,
+   "deltas": {
+    "prefilled_tokens": 50,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 1,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": null,
+   "ttft_p50": 0.06073383099283092,
+   "cached": [
+    32668
+   ],
+   "completion_tokens": [
+    300
+   ]
+  },
+  {
+   "N": 8,
+   "mode": "off",
+   "p50_tps": 48.037234073427584,
+   "min_tps": 47.02417386081673,
+   "max_tps": 50.049051845329515,
+   "agg_tps": 383.5893729842857,
+   "tokens": 2400,
+   "wall_s": 7.094420909881592,
+   "prefill_s": 95.43200087547302,
+   "rounds": 0,
+   "steps": 339,
+   "deltas": {
+    "prefilled_tokens": 400,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 8,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": null,
+   "ttft_p50": 0.28132033700239845,
+   "cached": [
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668
+   ],
+   "completion_tokens": [
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300
+   ]
+  }
+ ],
+ "summary": {
+  "needle_pass": "3/3",
+  "needle_ttft_s": [
+   11.782,
+   11.757,
+   11.764
+  ],
+  "spec_ab_identical": "10/10",
+  "speed_32k_p50_tps": {
+   "N=1 spec=on": 114.6,
+   "N=8 spec=on": 74.7,
+   "N=1 spec=off": 65.1,
+   "N=8 spec=off": 48.0
+  }
+ }
+}

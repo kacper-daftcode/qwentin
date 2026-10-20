@@ -1,12 +1,40 @@
 # Evidence pack — the logs behind the README's numbers
 
-Every headline number in the top-level `README.md` (pinned at **v0.10**) is a line in one of the files in this
+Every headline number in the top-level `README.md` (pinned at **v0.11**) is a line in one of the files in this
 directory. The files are verbatim copies of the research project's (`kacper-daftcode/qwentin-internal`) `logs/`,
 `notes/` and `runs/` — nothing was edited or trimmed (the paths `/mnt/nvme/...` and `/root/work/venv/bin/python` are
 the measurement box's). `scripts/` holds the exact shell scripts that produced each log, so every flag of every gate is
 on record. The narrative around the numbers is [`docs/NOTES.md`](../NOTES.md); the release notes, [`CHANGELOG.md`](../../CHANGELOG.md).
 
-## Environment of the 2026-10-17 measurements
+## v0.11 (2026-10-20): what was re-measured
+
+v0.11 re-measured every served-line cell of the README on its own library and model file — capacity, needle, TTFT,
+spec A/B and the per-stream speed table with the commands of `scripts/final-speed.sh` (`cand16-all.log` gate 2). The
+rows it did not re-measure carry over from v0.10 for the reasons at the end of this section; the sections after it are
+the v0.10 record.
+
+| item | value |
+|---|---|
+| engine source | `src/forward_qwen.cu` + `src/engine/*.cuh` at commit `dd6d21e` (2026-10-20 07:14 UTC; patches 0084–0108 of the research repo since v0.10's `b2e7a3f`) |
+| served library | `build-qwen/libforward_qwen.so`, md5 `158edd06753376d9e4671fb96d86a803` (the logs print `158edd067533`), built from `dd6d21e`; landed by `cand15-all.log` (all 398 kernels' SASS identical to the previous library, paged-decode logits bitwise) |
+| model file | the v0.10 opt-5.75 `-mtp4.tqf` re-converted to format version 2 — the same payload byte for byte plus the 80-byte extension (`cand16-all.log` gate 0: `inspect_tqf.py --verify`, `cmp` of the payloads); the engine's paged-decode logits are bitwise equal on both files (gate 1) and the served line's A/B texts equal the run on the version-1 file (gate 2) |
+| toolkit, driver, GPU, Python | unchanged from v0.10 (next section): nvcc 13.1 V13.1.115, driver 610.57.04, RTX 5090 at 550 W, Python 3.14.4 with torch 2.14.0+cu130, transformers 5.17.0 |
+
+| README statement | file : line | note |
+|---|---|---|
+| 576 000 pooled tokens at 29 894 MiB, the startup line | `cand16-all.log` gate 2 (`server up ... 29894 MiB`, `batched server: pool blocks=4500 ...`) | unchanged since v0.10 |
+| needle 6/6, **TTFT 11.6 s @32K** (11.651 / 11.62 / 11.632 s) **/ 59.7 s @128K** (59.651 / 59.721 / 59.8 s) | `cand16-all.log` gate 2, the six `[ 32k/128k depth=... ] PASS` lines | within 0.2 s of `cand14-all.log` / `cand15-all.log` |
+| spec A/B 10/10 identical, 128 vs 61 tok/s, 3.39 tokens per round | `cand16-all.log` gate 2, `[ab] ...` lines; `[ab-vs-v1]` = the texts of the version-1 file's run (`cand15`) | |
+| 177 / 153 / 106 / 79 tok/s per stream @32K spec on (N = 1 / 2 / 4 / 8), 66 / 62 / 57 / 48 spec off, 115 / 99 @128K (N = 1 / 2) | `cand16-all.log` gate 2, `[speed] ...` lines | `tools/spec_speed.py` on the vLLM-checkout corpus, one prompt per cell; N = 1 / 8 across the gates since v0.10: 175–177 / 78–82 (`cand9`–`cand12`, `cand14`–`cand16`) |
+| the decode path is v0.10's bit for bit | `rel11-v010-bitwise.log` | `tools/paged_logit_ab.py` (401 decode steps, N = 3 / 8): the v0.11 library = the v0.10 library (`484bdb825c36`), max \|d\| 0, with the default flags and with `TQ_PATTN_GQA=0` (the tool decodes token by token, so the prefill attention is not in it) |
+| why the spec-on cells moved: 3.78 vs 3.56 tokens per round @32K N = 1, 2.85 vs 3.29 @128K | `diag-128k-pattn.log` | the same library and line with `TQ_PATTN_GQA=0` (v0.10's prefill attention, bitwise per `cand9-all.log` gate 1): 166.9 tok/s in 84 rounds @32K and 129.9 in 91 rounds @128K — v0.10's values (`cand7-all.log`: 166.9 and 132.8 tok/s, 91 rounds @128K). Per round: ~21 ms @32K, ~25 ms @128K with either kernel |
+| `bench/reproduce.sh`: 176 / 79 tok/s (N = 1 / 8, spec on; 65 / 48 off) with `CORPUS` = the vLLM checkout, ~115 / 75 on this repository's own code (2.45 tokens per round); needle 3/3, A/B 10/10 in both | `rel11-reproduce.log`, `results-rel11-own.json` (run 1, the script's defaults), `results-rel11-vllm.json` (run 2) | the release worktree (`dd6d21e` + the release docs) on GPU 1, the version-2 file; the library the script built (`build-qwen-repro/`, md5 `45cb462773de`) has all 398 kernels' SASS identical to the served one; run 2 reads the same 79 rounds @32K N = 1 as `cand16` |
+
+Carried over from v0.10 without re-measurement: the quality rows (the decode path is the one they were measured on, and
+the new prefill attention's prefill rows are within the 95 % CI of v0.10's, `cand9-all.log` gate 2), T1 EvalPlus, the
+8-session mix, the 16 GB / 24 GB variants and the vLLM columns (2026-10-17).
+
+## v0.10 (2026-10-17): environment of the measurements
 
 Two engine commits appear in this pack, and the README's table footer names both. **`2cf671c`** (06:59 UTC) is the
 served stack of the morning: the kernels every decode, quality and capacity number was measured with
@@ -45,7 +73,9 @@ Earlier libraries that appear in the logs (all on `main`, each the gated predece
 | `e454a29c3caf` | `2cf671c` | the opt-ins as defaults — the served line of the morning (landed by `cand7-all.log`); gate 1 of that log proves it bitwise equal to `c9d5269c2963` + flags |
 | `484bdb825c36` | `b2e7a3f` | + the gated-DeltaNet prefill kernels, `TQ_GDN_PREFILL` default 1 — **the v0.10 served line** (landed by `cand8-all.log`); gate 1 of that log proves it bitwise equal to `e454a29c3caf` on the paged-decode logits with the flag on and with `TQ_GDN_PREFILL=0` (the off-switch) |
 
-## Which file backs which README number
+## v0.10: which file backs which number of its README
+
+(The README of the `v0.10` tag; v0.11's re-measured cells are in the first section.)
 
 | README statement | file : line | note |
 |---|---|---|
@@ -70,12 +100,18 @@ driver 595), the RTX PRO 6000 rows and the 2026-06 batched-server rows — they 
 unchanged and are labelled as such in their footers. (The 2026-08 scale sweep of the residual-stream steering hook
 moved out of this repository together with the steering maps it was measured for.)
 
-## Since v0.10 (CHANGELOG "Unreleased")
+## From v0.10 to v0.11: the landing gates
 
 | change | file | what the gate proved |
 |---|---|---|
 | `TQ_PATTN_GQA=1` default — the GQA-grouped prefill attention on the trellis pool (main `9c0a046`, library md5 `c40173fefe9a`) | `cand9-all.log` (2026-10-17 17:19–18:06 UTC; `scripts/cand9-all.sh`) | gate 1: `TQ_PATTN_GQA=0` bitwise = the v0.10 library (N = 3 / 8, max \|d\| 0); gate 2: the e2e prefill rows within the 95 % CI at 4K and 32K (dKL −0.00000 … +0.00003, top-1 CIs across 0, also on positions ≥ 16K / 24K); gate 3: spec exactness 4K + 32K ALL PASS; gate 4: the served line, 29 894 MiB, needle 6/6 with **TTFT 11.8 s @32K / 60.4 s @128K**, A/B 10/10, 175 / 79 tok/s at N = 1 / 8 |
 | the trellis-KV codebook compiled into the engine (`src/kv_t4_codebook.inc`; `TQ_KV_T4_CODEBOOK` only overrides it; engine `81b8453`, library md5 `5734b39678c6`) | `cand10-all.log` (2026-10-18 08:56–09:06 UTC; `scripts/cand10-all.sh`) | gate 0: `--kv-t4-codebook` with a missing file is refused; gate 1: the built-in table and the shipped file each bitwise = the `9c0a046` library reading the measurement box's file (N = 3 / 8, max \|d\| 0), and `TQ_KV_T4_CODEBOOK=random12.f32` is still read (= the old library's rows, ≠ the lloyd_kv12a rows); gate 2: spec exactness 4K + 32K ALL PASS; gate 3: the served line with no codebook flag — `codebook built-in lloyd_kv12a`, 576 000 pooled tokens, 29 894 MiB, needle 6/6 (TTFT 11.8 / 60.4 s), A/B 10/10, 176 / 78 tok/s at N = 1 / 8 |
+| `TQ_GEMM_FORK_MAXN=64`, stale comments and dead code, `qwn_ot_*` → `qwn_rmap_*` (main `364aa9c`, library md5 `4a42c129072d`) | `cand11-all.log` (2026-10-18 16:26–16:36 UTC) | gate 1: bitwise = the `d842e36` library at N = 3 / 8, with `TQ_GEMM_FORK_MAXN=1000000` (the previous behaviour) and at 32K × 2 slots; gate 2: spec exactness 4K + 32K; gate 3: the served line, needle 6/6 (TTFT 11.6 / 59.7 s), A/B 10/10, 177 / 81 tok/s; gate 4: the hook through the new names, `residual_map_check.py` PARITY OK |
+| the engine in 26 parts `src/engine/*.cuh`; tool defaults without development-box paths | `scripts/cand12-all.sh` (16:40–17:06 UTC); its log stays in the research repository — its first line records another project's job on the shared GPUs | gate 1: all 398 kernels' SASS identical to the unsplit file (`analysis/sass_diff.py` of the research repo), bitwise as `cand11`; gates 2–3 as `cand11` (177 / 81 tok/s); gate 4 re-run after a wrong maps path in the script (recorded in the log), PARITY OK |
+| `src/qwentin.h` (the C ABI as a generated header) | `cand13-all.log` (17:06–17:09 UTC) | declarations only: SASS identical, bitwise at N = 3, the served line's needle at 32K and A/B 10/10 |
+| `.tqf` format version 2 (main `0d647f9`, library md5 `a3731a9854bd`) | `cand14-all.log` (17:09–17:18 UTC) | gate 0: the engine's BLAKE2b = `hashlib`, each refusal code; gate 1: SASS identical, bitwise on the version-1 file and version 2 = version 1; gate 2: spec exactness 4K; gate 3: the served line on the version-1 file (needle 6/6, A/B 10/10, 177 / 82 tok/s); gate 4: the server on the version-2 file, `qwn_probe` with `TQ_VERIFY_TQF=1` |
+| ten experiment switches of the served path removed, their defaults hard-coded (main `dd6d21e`, library md5 `158edd067533` — **v0.11**) | `cand15-all.log` (2026-10-20 07:15–07:26 UTC) | gate 1: SASS identical, bitwise at N = 3 / 8 and 32K × 2 slots; gate 2: spec exactness 4K + 32K; gate 3: the served line, needle 6/6 (TTFT 11.6–11.7 / 59.7–59.8 s), A/B 10/10, 177 / 80 tok/s |
+| the served line on the version-2 `.tqf`; the v0.11 numbers | `cand16-all.log` (07:37–07:54 UTC) | see the first section |
 
 ## Reading the logs
 

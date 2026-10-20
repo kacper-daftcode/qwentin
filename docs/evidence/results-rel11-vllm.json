@@ -1,0 +1,403 @@
+{
+ "environment": {
+  "date_utc": "2026-10-20T08:18:25Z",
+  "tag": "rel11-vllm",
+  "commit": "dd6d21eb06b9296387fc504bd08dc575bea8ee49",
+  "commit_dirty": false,
+  "lib": "/mnt/nvme/qwen256k/qwentin-rel11/build-qwen-repro/libforward_qwen.so",
+  "lib_md5": "45cb462773de85707f38d2520800abc9",
+  "tqf": "/mnt/nvme/models/qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf",
+  "tqf_bytes": 21260594836,
+  "model_dir": "/mnt/nvme/models/Qwen3.8-27B-FP8",
+  "corpus": "/mnt/nvme/vllm/vllm",
+  "gpu_index": "1",
+  "gpu": "NVIDIA GeForce RTX 5090, 32607 MiB, 550.00 W",
+  "driver": "610.57.04",
+  "nvcc": "/usr/local/cuda-13.1/bin/nvcc",
+  "nvcc_version": [
+   "Cuda compilation tools, release 13.1, V13.1.115",
+   "Build cuda_13.1.r13.1/compiler.37061995_0"
+  ],
+  "python": "3.14.4",
+  "torch": "2.14.0+cu130",
+  "transformers": "5.17.0",
+  "safetensors": "0.8.0",
+  "numpy": "2.5.3",
+  "served_line": {
+   "max_slots": 12,
+   "num_blocks": 4500,
+   "env": {
+    "TQ_CTX": "262144",
+    "TQ_KV_Q4": "1",
+    "TQ_EMBED_FP8": "2",
+    "TQ_PAGED_ATTN_MMA": "1"
+   },
+   "server_defaults": "tools/serve_batched.py at this commit (--kv-v4 --kv-t4 --spec --dstate fp16sr --decode-steps-per-wave 1 ...)"
+  }
+ },
+ "inspect_tqf": null,
+ "server_startup_line": "batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet state fp16sr 80 MiB/slot; speculative decoding ON (MTP drafter, K=auto); decode attention TQ_PAGED_ATTN_ST=3 (a no-op under --kv-t4 today: the trellis pool runs its own GQA kernels); decode steps per mixed wave 1",
+ "process_mib_after_runs": "process 30286 MiB after the runs",
+ "server_error_lines": 0,
+ "needle": {
+  "config": {
+   "base_url": "http://127.0.0.1:8148",
+   "model": "qwen3.8-27b",
+   "lengths": "32768",
+   "depths": "0.95,0.5,0.05",
+   "needles": 1,
+   "decoys": 3,
+   "repeats": 1,
+   "concurrency": 1,
+   "max_tokens": 48,
+   "corpus": "/mnt/nvme/vllm/vllm",
+   "tokenizer": "/mnt/nvme/models/Qwen3.8-27B-FP8",
+   "chat_kwargs": "{\"enable_thinking\": false}",
+   "timeout": 3600.0,
+   "seed": 1,
+   "out": "/mnt/nvme/qwen256k/runs/rel11/work-rel11-vllm/needle.json"
+  },
+  "results": [
+   {
+    "length": 32768,
+    "depths": [
+     0.95
+    ],
+    "rep": 0,
+    "ok": true,
+    "status": 200,
+    "pass": true,
+    "hits": [
+     true
+    ],
+    "expected": [
+     "FF-699212-PR"
+    ],
+    "answer": "FF-699212-PR",
+    "ttft_s": 11.843,
+    "e2e_s": 11.888,
+    "prompt_tokens": 32596,
+    "error": ""
+   },
+   {
+    "length": 32768,
+    "depths": [
+     0.5
+    ],
+    "rep": 0,
+    "ok": true,
+    "status": 200,
+    "pass": true,
+    "hits": [
+     true
+    ],
+    "expected": [
+     "UI-672763-WB"
+    ],
+    "answer": "UI-672763-WB",
+    "ttft_s": 11.812,
+    "e2e_s": 11.855,
+    "prompt_tokens": 32596,
+    "error": ""
+   },
+   {
+    "length": 32768,
+    "depths": [
+     0.05
+    ],
+    "rep": 0,
+    "ok": true,
+    "status": 200,
+    "pass": true,
+    "hits": [
+     true
+    ],
+    "expected": [
+     "ZU-821600-AR"
+    ],
+    "answer": "ZU-821600-AR",
+    "ttft_s": 11.815,
+    "e2e_s": 11.88,
+    "prompt_tokens": 32602,
+    "error": ""
+   }
+  ]
+ },
+ "spec-ab": {
+  "prompts": [
+   "Repository snapshot:\n\n### FILE: ir/ops/layernorm.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\nimport torch\nfrom torch import Tensor\n\nfrom ..op import register_op\n\n\n@register_op\ndef rms_norm(\n    x: Tensor, weight: Tensor | None, epsilon: float, variance_size: int | None = None\n) -> Tensor:\n    \"\"\"Weighted root-mean-square layer normalization\"\"\"\n    orig_dtype = x.dtype\n    x = x.to(torch.float32)\n    x_var = x if variance_size is None else x[..., :variance_size]\n    variance = x_var.pow(2).mean(dim=-1, keepdim=True)\n    x = x * torch.rsqrt(variance + epsilon)\n    if weight is not None:\n        x = x.to(weight.dtype) * weight\n    return x.to(orig_dtype)\n\n\n@rms_norm.register_input_generator\ndef _rms_norm_input_generator(\n    num_tokens: int,\n    hidden_size: int,\n    dtype: torch.dtype,\n    epsilon: float = 1e-5,\n    device: torch.device | str | None = None,\n) -> tuple:\n    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)\n    weight = torch.randn(hidden_size, dtype=dtype, device=device)\n    return x, weight, epsilon\n\n\n# Reductions in rms_norm accumulate rounding error at large shapes\n# (e.g. 32768x16384), causing a few elements out of millions to exceed\n# the default float16 tolerance.\nrms_norm.override_tolerance(torch.float16, atol=1e-2, rtol=2e-3)\n\n\n@register_op(allow_inplace=True)\ndef fused_add_rms_norm(\n    x: Tensor,\n    x_residual: Tensor,\n    weight: Tensor | None,\n    epsilon: float,\n    variance_size: int | None = None,\n) -> tuple[Tensor, Tensor]:\n    \"\"\"Fused add and weighted root-mean-square layer normalization\"\"\"\n    orig_dtype = x.dtype\n    x = x.to(torch.float32)\n    x = x + x_residual.to(torch.float32)\n    x_residual = x.to(orig_dtype)\n\n    x_var = x if variance_size is None else x[..., :variance_size]\n    variance = x_var.pow(2).mean(dim=-1, keepdim=True)\n    x = x * torch.rsqrt(variance + epsilon)\n    if weight is not None:\n        x = x.to(weight.dtype) * weight\n    return x.to(orig_dtype), x_residual\n\n\n# fused_add_rms_norm has similar rounding error accumulation as rms_norm\nfused_add_rms_norm.override_tolerance(torch.float16, atol=1e-2, rtol=2e-3)\n\n\n@fused_add_rms_norm.register_input_generator\ndef _fused_add_rms_norm_input_generator(\n    num_tokens: int,\n    hidden_size: int,\n    dtype: torch.dtype,\n    epsilon: float = 1e-5,\n    device: torch.device | str | None = None,\n) -> tuple:\n    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)\n    x_residual = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)\n    weight = torch.randn(hidden_size, dtype=dtype, device=device)\n    return x, x_residual, weight, epsilon\n\n\n### FILE: benchmarks/throughput.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"Benchmark offline inference throughput.\"\"\"\n\nimport argparse\nimport json\nimport os\nimport random\nimport time\nimport warnings\nfrom typing import Any\n\nimport torch\nimport uvloop\nfrom tqdm import tqdm\nfrom transformers import AutoModelForCausalLM, PreTrainedTokenizerBase\n\nfrom vllm.benchmarks.datasets import (\n    BenchmarkDataset,\n    SampleRequest,\n    add_random_dataset_base_args,\n    add_random_multimodal_dataset_args,\n    get_samples,\n)\nfrom vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json\nfrom vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs\nfrom vllm.inputs import TextPrompt, TokensPrompt\nfrom vllm.lora.request import LoRARequest\nfrom vllm.outputs import RequestOutput\nfrom vllm.platforms import current_platform\nfrom vllm.sampling_params import BeamSearchParams\nfrom vllm.tokenizers import TokenizerLike, get_tokenizer\nfrom vllm.utils.argparse_utils import FlexibleArgumentParser\nfrom vllm.utils.async_utils import merge_async_iterators\n\n\ndef run_vllm(\n    requests: list[SampleRequest],\n    n: int,\n    engine_args: EngineArgs,\n    do_profile: bool,\n    disable_detokenize: bool = False,\n    warmup_requests: list[SampleRequest] | None = None,\n    prequeue_requests: bool = False,\n) -> tuple[float, list[RequestOutput] | None]:\n    from vllm import LLM\n\n    llm = LLM.from_engine_args(engine_args)\n    all_requests = list(warmup_requests or []) + requests\n    assert all(\n        llm.llm_engine.model_config.max_model_len\n        >= (request.prompt_len + request.expected_output_len)\n        for request in all_requests\n    ), (\n        \"Please ensure that max_model_len is greater than the sum of\"\n        \" prompt_len and expected_output_len for all requests.\"\n    )\n\n    if warmup_requests:\n        print(f\"Warming up with {len(warmup_requests)} requests...\")\n        _run_vllm_requests(\n            llm,\n            warmup_requests,\n            n,\n            disable_detokenize,\n            do_profile=False,\n            prequeue_requests=prequeue_requests,\n            enable_lora=engine_args.enable_lora,\n        )\n\n    return _run_vllm_requests(\n        llm,\n        requests,\n        n,\n        disable_detokenize,\n        do_profile=do_profile,\n        prequeue_requests=prequeue_requests,\n        enable_lora=engine_args.enable_lora,\n    )\n\n\ndef _run_vllm_requests(\n    llm: Any,\n    requests: list[SampleRequest],\n    n: int,\n    disable_detokenize: bool,\n    do_profile: bool,\n    prequeue_requests: bool,\n    enable_lora: bool,\n) -> tuple[float, list[RequestOutput] | None]:\n    from vllm import SamplingParams\n\n    prompts: list[TextPrompt | TokensPrompt] = []\n    sampling_params: list[SamplingParams] = []\n   \n\nContinue this file: write the next function that would naturally follow, with a docstring.",
+   "Repository snapshot:\n\n### FILE: triton_utils/force_first_config.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"Skip Triton autotuning under VLLM_TRITON_FORCE_FIRST_CONFIG.\"\"\"\n\nfrom vllm.logger import init_logger\nfrom vllm.triton_utils.importing import HAS_TRITON\n\nlogger = init_logger(__name__)\n\n_installed: bool = False\n\n\ndef is_installed() -> bool:\n    \"\"\"Return whether the first-valid-config patch is currently installed.\"\"\"\n    return _installed\n\n\ndef install() -> None:\n    \"\"\"Install the Autotuner.run replacement.\"\"\"\n    global _installed\n    if _installed:\n        return\n    if not HAS_TRITON:\n        return\n\n    import importlib\n\n    autotuner_mod = importlib.import_module(\"triton.runtime.autotuner\")\n    Autotuner = autotuner_mod.Autotuner\n    from triton.compiler.errors import CompileTimeAssertionFailure\n    from triton.runtime.errors import OutOfResources, PTXASError\n\n    _invalid_config_errors = (OutOfResources, CompileTimeAssertionFailure, PTXASError)\n    _picked_cache: dict[tuple, int] = {}\n    seen_kernels: set[str] = set()\n\n    def _run_first_valid_config(self, *args, **kwargs):\n        if not self.configs:\n            return self.fn(*args, **kwargs)\n\n        key_vals = tuple(kwargs[name] for name in self.keys if name in kwargs)\n        cache_key = (id(self), key_vals)\n        kernel_name = getattr(self.base_fn, \"__name__\", repr(self.fn))\n\n        cached_idx = _picked_cache.get(cache_key)\n        candidate_indices = (\n            [cached_idx] if cached_idx is not None else list(range(len(self.configs)))\n        )\n\n        last_exc: Exception | None = None\n        for idx in candidate_indices:\n            config = self.configs[idx]\n            if config.pre_hook is not None:\n                full_nargs = {\n                    **dict(zip(self.arg_names, args)),\n                    **kwargs,\n                    **config.all_kwargs(),\n                }\n                config.pre_hook(full_nargs)\n            # Prefer self.fn.run(...) \u2014 the kernel-launch entrypoint for both\n            # JITFunction and Heuristics. Calling JITFunction(...) directly\n            # raises \"Cannot call @triton.jit'd outside of the scope of a\n            # kernel\". Fall back to plain call only if .run is missing.\n            launch = getattr(self.fn, \"run\", self.fn)\n            try:\n                result = launch(*args, **kwargs, **config.all_kwargs())\n            except _invalid_config_errors as e:\n                last_exc = e\n                continue\n\n            if cached_idx is None:\n                _picked_cache[cache_key] = idx\n                self.best_config = config\n                if kernel_name not in seen_kernels:\n                    seen_kernels.add(kernel_name)\n                    logger.info(\n                        \"[triton-autotune-disabled] kernel=%s configs=%d \"\n                        \"picked_index=%d picked=%s\",\n                        kernel_name,\n                        len(self.configs),\n                        idx,\n                        config,\n                    )\n            return result\n\n        raise RuntimeError(\n            f\"No valid config for kernel \"\n            f\"{kernel_name} key={key_vals} (tried {len(self.configs)} configs)\"\n        ) from last_exc\n\n    Autotuner.run = _run_first_valid_config\n    _installed = True\n\n\n### FILE: model_executor/model_loader/reload/meta.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\nimport inspect\nfrom collections.abc import Callable\n\nimport torch\nfrom torch.nn.parameter import UninitializedParameter\nfrom torch.utils._python_dispatch import TorchDispatchMode\n\nfrom .sanitize import restore_layer_refs, sanitize_layer_refs\nfrom .types import LayerReloadingInfo, LayerTensors\nfrom .utils import get_layer_params_buffers, get_layer_tensors\n\n__all__ = [\n    \"to_meta_tensor\",\n    \"materialize_meta_tensor\",\n    \"capture_layer_to_meta\",\n    \"restore_layer_on_meta\",\n    \"materialize_layer\",\n    \"get_numel_loaded\",\n]\n\n# Modules whose tensors are never moved to, or materialized from, the meta device.\nSKIP_MODULES: set[str] = {\"HadamardTransform\"}\n\n# Tensors never loaded by a weight loader, so the layerwise trigger ignores them.\nSKIP_LOAD_TENSORS: set[str] = {\n    \"_expert_map\",\n    \"expert_mask\",\n    \"expert_global_to_physical\",\n    \"expert_physical_to_global\",\n    \"expert_local_to_global\",\n    \"e_score_correction_bias\",\n}\n\n# Tensors which are never moved to, or materialized from, the meta device.\n# `bias` is built after create_weights(), so it is never on meta to begin with.\nSKIP_TENSORS: set[str] = SKIP_LOAD_TENSORS | {\"bias\"}\n\n\ndef to_meta_tensor(tensor: torch.Tensor) -> torch.Tensor:\n    \"\"\"Convert a tensor to a meta tensor while preserving class and attributes.\"\"\"\n    meta_tensor = tensor.data.to(\"meta\")\n    meta_tensor.__class__ = tensor.__class__\n    meta_tensor.__dict__ = tensor.__dict__.copy()\n    return meta_tensor\n\n\ndef materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:\n    \"\"\"\n    Materialize a meta tensor into an actual tensor on the current device.\n    Should be called within the torch device context for the given rank.\n    \"\"\"\n    tensor = torch.empty_strided(\n        size=tuple(meta_tensor.size()),\n        stride=tuple(meta_tensor.stride()),\n        dtype=meta_tensor.dtype,\n        requires_grad=False,\n    )\n    tensor.__class__ = meta_tensor.__class__\n    tensor.__dict__ = meta_tensor.__dict__.copy()\n    return tensor\n\n\ndef _is_non_persistent_parameter_alias_buffer(\n    layer: torch.nn.Module,\n    name: str,\n    buffer: torch.Tensor,\n    parameter_storage_ptrs: set[int],\n) -> bool:\n    if name not in layer._non_persistent_buffers_set:\n        return False\n\n    buffer_storage_ptr = _tensor_storage_ptr(buffer)\n    return (\n        buffer_storage_ptr is not None and buffer_storage_ptr in parameter_storage_ptrs\n    )\n\n\ndef _tensor_storage_ptr(tensor: torch.Tensor) -> int | None:\n    if isinstance(tensor, UninitializedParameter):\n        return None\n\n    try:\n        return tensor.untyped_storage().data_ptr()\n    except (RuntimeError, ValueError):\n        return None\n\n\ndef _parameter_storage_ptrs(layer: torch.nn.Module) -> set[int]:\n    return {\n        storage_ptr\n        for param in layer.parameters(recurse=True)\n        if (\n\nExplain what this code does in detail, then point out two possible bugs.",
+   "Repository snapshot:\n\n### FILE: lora/layers/__init__.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\nfrom vllm.lora.layers.base import BaseLayerWithLoRA\nfrom vllm.lora.layers.column_parallel_linear import (\n    ColumnParallelLinearWithLoRA,\n    ColumnParallelLinearWithShardedLoRA,\n    MergedColumnParallelLinearVariableSliceWithLoRA,\n    MergedColumnParallelLinearWithLoRA,\n    MergedColumnParallelLinearWithShardedLoRA,\n    MergedQKVParallelLinearWithLoRA,\n    MergedQKVParallelLinearWithShardedLoRA,\n    QKVParallelLinearWithLoRA,\n    QKVParallelLinearWithShardedLoRA,\n)\nfrom vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA, FusedMoEWithLoRA\nfrom vllm.lora.layers.logits_processor import LogitsProcessorWithLoRA\nfrom vllm.lora.layers.replicated_linear import ReplicatedLinearWithLoRA\nfrom vllm.lora.layers.row_parallel_linear import (\n    RowParallelLinearWithLoRA,\n    RowParallelLinearWithShardedLoRA,\n)\nfrom vllm.lora.layers.utils import LoRAMapping, LoRAMappingType\nfrom vllm.lora.layers.vocab_parallel_embedding import VocabParallelEmbeddingWithLoRA\n\n__all__ = [\n    \"BaseLayerWithLoRA\",\n    \"VocabParallelEmbeddingWithLoRA\",\n    \"LogitsProcessorWithLoRA\",\n    \"ColumnParallelLinearWithLoRA\",\n    \"ColumnParallelLinearWithShardedLoRA\",\n    \"MergedColumnParallelLinearWithLoRA\",\n    \"MergedColumnParallelLinearWithShardedLoRA\",\n    \"MergedColumnParallelLinearVariableSliceWithLoRA\",\n    \"MergedQKVParallelLinearWithLoRA\",\n    \"MergedQKVParallelLinearWithShardedLoRA\",\n    \"QKVParallelLinearWithLoRA\",\n    \"QKVParallelLinearWithShardedLoRA\",\n    \"RowParallelLinearWithLoRA\",\n    \"RowParallelLinearWithShardedLoRA\",\n    \"ReplicatedLinearWithLoRA\",\n    \"LoRAMapping\",\n    \"LoRAMappingType\",\n    \"FusedMoEWithLoRA\",\n    \"FusedMoE3DWithLoRA\",\n]\n\n\n### FILE: v1/attention/backends/flash_attn.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"Attention layer with FlashAttention.\"\"\"\n\nimport copy\nimport functools\nfrom dataclasses import dataclass\nfrom typing import ClassVar\n\nimport numpy as np\nimport torch\n\nfrom vllm.model_executor.layers.attention import Attention\nfrom vllm.platforms import current_platform\nfrom vllm.utils.torch_utils import (\n    PIN_MEMORY,\n    canonicalize_singleton_dim_strides,\n    is_quantized_kv_cache,\n)\nfrom vllm.v1.attention.backend import (\n    AttentionBackend,\n    AttentionImpl,\n    AttentionType,\n    MultipleOf,\n)\nfrom vllm.v1.attention.backends.fa_utils import (\n    FA4_HD256_PAGE_SIZE,\n    flash_attn_supports_kv_cache_dtype,\n    flash_attn_supports_quant_query_input,\n    get_flash_attn_version,\n    is_fa_version_supported,\n    is_flash_attn_varlen_func_available,\n    uses_fa4_hd256_kernel,\n)\nfrom vllm.v1.attention.backends.utils import (\n    fill_mm_prefix_query_ranges,\n    get_dcp_local_seq_lens,\n    get_num_attention_heads_from_layers,\n)\nfrom vllm.v1.attention.ops.dcp import (\n    cp_lse_ag_out_rs,\n    dcp_a2a_lse_reduce,\n)\nfrom vllm.v1.attention.ops.merge_attn_states import merge_attn_states\nfrom vllm.v1.worker.workspace import current_workspace_manager\n\nif is_flash_attn_varlen_func_available():\n    from vllm.v1.attention.backends.fa_utils import (\n        flash_attn_supports_sinks,\n        flash_attn_varlen_func,\n        get_scheduler_metadata,\n        reshape_and_cache_flash,\n    )\nimport vllm.envs as envs\nfrom vllm.config import (\n    VllmConfig,\n    get_current_vllm_config_or_none,\n    get_layers_from_vllm_config,\n)\nfrom vllm.config.cache import CacheDType\nfrom vllm.distributed.parallel_state import get_dcp_group\nfrom vllm.logger import init_logger\nfrom vllm.platforms.interface import DeviceCapability\nfrom vllm.utils.math_utils import cdiv, round_up\nfrom vllm.v1.attention.backend import (\n    AttentionCGSupport,\n    AttentionMetadataBuilder,\n    CommonAttentionMetadata,\n)\nfrom vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec\nfrom vllm.v1.worker.cp_utils import (\n    run_split_fa2_dcp_context_attention,\n    should_skip_dcp_context_attention,\n    should_split_fa2_dcp_context_attention,\n    split_dcp_context_queries,\n)\n\nlogger = init_logger(__name__)\n\n\nclass FlashAttentionBackend(AttentionBackend):\n    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]\n    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [\n        \"auto\",\n        \"float16\",\n        \"bfloat16\",\n        \"fp8\",\n        \"fp8_e4m3\",\n    ]\n    head_size_v: int | None = None\n\n    @classmethod\n    def _get_fa4_hd256_block_size(cls) -> int | None:\n        vllm_config = get_current_vllm_config_or_none()\n        if vllm_config is None or vllm_config.model_config is None:\n            return None\n\n        head_size = vllm_config.model_config.get_head_size()\n        if (\n            uses_fa4_hd256_kernel(head_size, cls.head_size_v)\n            and get_flash_attn_version(\n                head_size=head_size,\n                head_size_v=cls.head_size_v,\n                supports_fa4_hd256=True,\n            )\n            == 4\n        ):\n            return FA4_HD256_PAGE_SIZE\n        return None\n\n    @classmethod\n    def get_supported_kernel_block_sizes(cls) -> list[int | MultipleOf]:\n        if block_size := cls._get_fa4_hd256_block_size():\n            # Sliding-window specs select the smallest advertised size.\n\n\nRefactor the longest function in this snapshot for readability and show the result.",
+   "Repository snapshot:\n\n### FILE: v1/sample/ops/bad_words.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\nimport torch\n\n_SMALLEST_LOGIT = float(\"-inf\")\n\n\ndef _apply_bad_words_single_batch(\n    logits: torch.Tensor,\n    bad_words_token_ids: list[list[int]],\n    past_tokens_ids: list[int],\n) -> None:\n    for bad_word_ids in bad_words_token_ids:\n        if len(bad_word_ids) > len(past_tokens_ids) + 1:\n            continue\n\n        prefix_length = len(bad_word_ids) - 1\n        last_token_id = bad_word_ids[-1]\n        actual_prefix = past_tokens_ids[-prefix_length:] if prefix_length > 0 else []\n        expected_prefix = bad_word_ids[:prefix_length]\n\n        assert len(actual_prefix) == len(expected_prefix)\n\n        if actual_prefix == expected_prefix:\n            # Assign to slice to avoid cpu->gpu sync.\n            logits[last_token_id : last_token_id + 1] = _SMALLEST_LOGIT\n\n\ndef apply_bad_words(\n    logits: torch.Tensor,\n    bad_words_token_ids: dict[int, list[list[int]]],\n    past_tokens_ids: list[list[int]],\n) -> None:\n    for i, bad_words_ids in bad_words_token_ids.items():\n        _apply_bad_words_single_batch(logits[i], bad_words_ids, past_tokens_ids[i])\n\n\ndef apply_bad_words_with_drafts(\n    logits: torch.Tensor,\n    bad_words_token_ids: dict[int, list[list[int]]],\n    past_tokens_ids: list[list[int]],\n    num_draft_tokens: list[int],\n) -> None:\n    start_idx = 0\n    remaining = len(bad_words_token_ids)\n    for i, n in enumerate(num_draft_tokens):\n        if (bad_words_ids := bad_words_token_ids.get(i)) is not None:\n            for draft_idx in range(start_idx, start_idx + n):\n                _apply_bad_words_single_batch(\n                    logits[draft_idx],\n                    bad_words_ids,\n                    past_tokens_ids[draft_idx],\n                )\n            remaining -= 1\n            if not remaining:\n                break\n        start_idx += n\n\n\n### FILE: model_executor/model_loader/reload/torchao_decorator.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\nfrom collections.abc import Iterable\nfrom functools import wraps\nfrom types import FunctionType\nfrom typing import TYPE_CHECKING\n\nimport torch\n\nfrom vllm.config import ModelConfig\n\nfrom .layerwise import (\n    finalize_layerwise_reload,\n    initialize_layerwise_reload,\n)\n\nif TYPE_CHECKING:\n    from vllm.model_executor.models.utils import AutoWeightsLoader\n\n__all__ = [\"set_torchao_reload_attrs\", \"support_quantized_model_reload_from_hp_weights\"]\n\n\ndef set_torchao_reload_attrs(model: torch.nn.Module, model_config: ModelConfig):\n    model._do_torchao_reload = True\n    model._model_config = model_config\n\n\ndef support_quantized_model_reload_from_hp_weights(original_load_weights: FunctionType):\n    \"\"\"\n    Decorator for `load_weights` method for AutoWeightsLoader.load_weights to support\n    reloading high precision (bfloat16/float16/float32) weight for an already quantized\n    model, this involves restoring the weights to a high precision weights and\n    then online quantize the weights.\n\n    Only applies to torchao quantized models. Assumes that all model weights are\n    loaded within a single weights iterator (cannot perform batched updates)\n    \"\"\"\n\n    @wraps(original_load_weights)\n    def patched_model_load_weights(\n        self: \"AutoWeightsLoader\",\n        weights: Iterable[tuple[str, torch.Tensor]],\n        *args,\n        **kwargs,\n    ):\n        model = self.module\n\n        if not getattr(model, \"_do_torchao_reload\", False):\n            return original_load_weights(self, weights, *args, **kwargs)\n\n        initialize_layerwise_reload(model)\n        loaded_weights = original_load_weights(self, weights, *args, **kwargs)\n        finalize_layerwise_reload(model, model._model_config)\n\n        return loaded_weights\n\n    return patched_model_load_weights\n\n\n### FILE: models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"Fused QSA pre-indexer kernel for Qwen4Exp.\"\"\"\n\nimport torch\n\nfrom vllm.triton_utils import tl, triton\n\n\n@triton.jit\ndef _norm_rope(\n    x,\n    pos_t,\n    pos_h,\n    pos_w,\n    cos_sin_ptr,\n    cos_sin_stride,\n    norm_weight_ptr,\n    eps,\n    IS_MROPE: tl.constexpr,\n    MROPE_H: tl.constexpr,\n    MROPE_W: tl.constexpr,\n):\n    \"\"\"Apply Gemma RMSNorm and selected-axis NeoX RoPE to register rows.\"\"\"\n    TILE_T: tl.constexpr = x.shape[0]\n    TILE_H: tl.constexpr = x.shape[1]\n    D: tl.constexpr = x.shape[2]\n    ROWS: tl.constexpr = TILE_T * TILE_H\n    HALF: tl.constexpr = D // 2\n    QUARTER: tl.constexpr = D // 4\n    pairs = tl.arange(0, QUARTER)\n    if IS_MROPE:\n        # Qwen interleaves temporal, height, and width rotary pairs. Each axis\n        # still indexes the same position-major cos/sin table.\n        h_mask = ((pairs % 3) == 1) & (pairs <= 3 * MROPE_H)\n        w_mask = ((pairs % 3) == 2) & (pairs <= 3 * MROPE_W)\n        t_mask = ~(h_mask | w_mask)\n        base = cos_sin_ptr + pairs[None, :]\n        pos_rows = (pos_t, pos_h, pos_w)\n        axis_masks = (t_mask, h_mask, w_mask)\n        cos = tl.zeros((TILE_T, QUARTER), dtype=cos_sin_ptr.dtype.element_ty)\n        sin = tl.zeros((TILE_T, QUARTER), dtype=cos_sin_ptr.dtype.element_ty)\n        for axis in tl.static_range(3):\n            cos += tl.load(\n                base + pos_rows[axis][:, None] * cos_sin_stride,\n                mask=axis_masks[axis][None, :],\n                other=0,\n            )\n            sin += tl.load(\n                base + pos_rows[axis][:, None] * cos_sin_stride + QUARTER,\n\n\nWrite unit tests (pytest) for the most important function in this snapshot.",
+   "Implement an LRU cache class in Python with O(1) get/put and explain the design.",
+   "Repository snapshot:\n\n### FILE: v1/core/sched/output.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\nfrom dataclasses import dataclass\nfrom functools import cached_property\nfrom typing import TYPE_CHECKING\n\nfrom vllm.config.ec_manager_config import EncoderCacheManagerMetadata\nfrom vllm.multimodal.utils import strip_covered_mm_data\n\nif TYPE_CHECKING:\n    import numpy as np\n    import numpy.typing as npt\n    import torch\n\n    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata\n    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata\n    from vllm.lora.request import LoRARequest\n    from vllm.multimodal.inputs import MultiModalFeatureSpec\n    from vllm.pooling_params import PoolingParams\n    from vllm.sampling_params import SamplingParams\n    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy\n    from vllm.v1.request import Request\nelse:\n    ECConnectorMetadata = object\n    KVConnectorMetadata = object\n    KVCacheBlockCopy = object\n    LoRARequest = object\n    MultiModalFeatureSpec = object\n    PoolingParams = object\n    SamplingParams = object\n    Request = object\n\n\n@dataclass\nclass NewRequestData:\n    req_id: str\n    prompt_token_ids: list[int] | None\n    mm_features: list[MultiModalFeatureSpec]\n    sampling_params: SamplingParams | None\n    pooling_params: PoolingParams | None\n    block_ids: tuple[list[int], ...]\n    num_computed_tokens: int\n    lora_request: LoRARequest | None\n    prompt_embeds: \"torch.Tensor | None\" = None\n    prompt_is_token_ids: list[bool] | None = None\n\n    # Only used for v2 model runner.\n    prefill_token_ids: list[int] | None = None\n\n    @classmethod\n    def from_request(\n        cls,\n        request: Request,\n        block_ids: tuple[list[int], ...],\n        prefill_token_ids: list[int] | None = None,\n        uses_mrope: bool = False,\n        uses_xdrope: bool = False,\n    ) -> \"NewRequestData\":\n        return cls(\n            req_id=request.request_id,\n            prompt_token_ids=request.prompt_token_ids,\n            mm_features=strip_covered_mm_data(\n                request.mm_features,\n                request.num_computed_tokens,\n                uses_mrope=uses_mrope,\n                uses_xdrope=uses_xdrope,\n            ),\n            sampling_params=request.sampling_params,\n            pooling_params=request.pooling_params,\n            block_ids=block_ids,\n            num_computed_tokens=request.num_computed_tokens,\n            lora_request=request.lora_request,\n            prompt_embeds=request.prompt_embeds,\n            prompt_is_token_ids=request.prompt_is_token_ids,\n            prefill_token_ids=prefill_token_ids,\n        )\n\n    @property\n    def prompt_len(self) -> int:\n        if self.prompt_token_ids is not None:\n            return len(self.prompt_token_ids)\n        if self.prompt_embeds is not None:\n            return self.prompt_embeds.shape[0]\n        return 0\n\n    def __repr__(self) -> str:\n        prompt_embeds_shape = (\n            self.prompt_embeds.shape if self.prompt_embeds is not None else None\n        )\n        return (\n            f\"NewRequestData(\"\n            f\"req_id={self.req_id},\"\n            f\"prompt_token_ids={self.prompt_token_ids},\"\n            f\"prefill_token_ids={self.prefill_token_ids},\"\n            f\"mm_features={self.mm_features},\"\n            f\"sampling_params={self.sampling_params},\"\n            f\"block_ids={self.block_ids},\"\n            f\"num_computed_tokens={self.num_computed_tokens},\"\n            f\"lora_request={self.lora_request},\"\n            f\"prompt_embeds_shape={prompt_embeds_shape}\"\n            \")\"\n        )\n\n    # Version of __repr__ with the prompt data obfuscated\n    def anon_repr(self) -> str:\n        prompt_token_ids_len = (\n            len(self.prompt_token_ids) if self.prompt_token_ids is not None else None\n        )\n        prompt_embeds_shape = (\n            self.prompt_embeds.shape if self.prompt_embeds is not None else None\n        )\n        prefill_token_ids_len = (\n            len(self.prefill_token_ids) if self.prefill_token_ids is not None else None\n        )\n        return (\n            f\"NewRequestData(\"\n            f\"req_id={self.req_id},\"\n            f\"prompt_token_ids_len={prompt_token_ids_len},\"\n            f\"prefill_token_ids_len={prefill_token_ids_len},\"\n            f\"mm_features={self.mm_features},\"\n            f\"sampling_params={self.sampling_params},\"\n            f\"block_ids={self.block_ids},\"\n            f\"num_computed_tokens={self.num_computed_tokens},\"\n            f\"lora_request={self.lora_request},\"\n            f\"prompt_embeds_shape={prompt_embeds_shape}\"\n            \")\"\n        )\n\n\n@dataclass\nclass CachedRequestData:\n    req_ids: list[str]\n    # For request ids not in resumed_req_ids, new_block_ids will be appended to\n    # the request's block IDs. For those in the set, new_block_ids will be used as the\n    # request's block IDs instead of appending to the existing block IDs.\n    resumed_req_ids: set[str]\n    # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.\n    # When PP is not used, new_token_ids will be empty.\n    new_token_ids: list[list[int]]\n    # MRV1-only: For requests not scheduled in the last step, propagate the token ids\n    # to the connector. Won't contain requests scheduled in the prior step.\n    all_token_ids: dict[str, list[int]]\n    new_block_ids: list[tuple[list[int], ...] | None]\n    num_computed_tokens: list[int]\n    num_output_tokens: list[int]\n\n    # Version of dataclass repr with token IDs obfuscated.\n    def anon_repr(self) -> str:\n        new_token_ids_lens = [len(toks) for toks in self.new_token_ids]\n        all_token_ids_lens = {\n            req_id: len(toks) for req_id, toks in self.all_token_ids.items()\n        }\n        return (\n            f\"CachedRequestData(\"\n            f\"req_ids={self.req_ids},\"\n            f\"resumed_req_ids={self.resumed_req_ids},\"\n            f\"new_token_ids_lens={new_token_ids_lens},\"\n            f\"all_token\n\nExplain what this code does in detail, then point out two possible bugs.",
+   "Repository snapshot:\n\n### FILE: model_executor/models/terratorch.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\n# Copyright 2025 The vLLM team.\n# Copyright 2025 IBM.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Wrapper around `Terratorch` models\"\"\"\n\nfrom collections import OrderedDict\nfrom collections.abc import Iterable, Mapping, Sequence\nfrom functools import cached_property\nfrom typing import Any\n\nimport torch\nimport torch.nn as nn\nfrom terratorch.vllm import (\n    DummyDataGenerator,\n    InferenceRunner,\n    InputDefinition,\n    InputTypeEnum,\n)\nfrom transformers import BatchFeature\n\nfrom vllm.config import VllmConfig\nfrom vllm.config.multimodal import BaseDummyOptions\nfrom vllm.inputs import ModalityData, MultiModalDataDict, MultiModalInput, mm_input\nfrom vllm.logger import init_logger\nfrom vllm.model_executor.layers.pooler import IdentityPooler\nfrom vllm.model_executor.model_loader.weight_utils import default_weight_loader\nfrom vllm.model_executor.models.utils import AutoWeightsLoader\nfrom vllm.multimodal import MULTIMODAL_REGISTRY\nfrom vllm.multimodal.inputs import (\n    ImageItem,\n    MultiModalFieldConfig,\n    MultiModalKwargsItems,\n    PlaceholderRange,\n)\nfrom vllm.multimodal.parse import (\n    DictEmbeddingItems,\n    ModalityDataItems,\n    MultiModalDataItems,\n    MultiModalDataParser,\n)\nfrom vllm.multimodal.processing import (\n    BaseDummyInputsBuilder,\n    BaseMultiModalProcessor,\n    BaseProcessingInfo,\n    ProcessorInputs,\n    PromptUpdate,\n    TimingContext,\n)\nfrom vllm.sequence import IntermediateTensors\nfrom vllm.utils.gpu_sync_debug import gpu_sync_allowed\n\nfrom .interfaces import IsAttentionFree, MultiModalEmbeddings, SupportsMultiModal\nfrom .interfaces_base import attn_type\n\nlogger = init_logger(__name__)\n\n\ndef _terratorch_field_names(input_definition: InputDefinition):\n    return set(input_definition.data.keys())\n\n\ndef _terratorch_field_factory(\n    input_definition: InputDefinition,\n    *,\n    is_shared: bool = True,  # True for unprocessed data, False for processed data\n):\n    def _terratorch_field_config(\n        hf_inputs: Mapping[str, torch.Tensor],\n    ) -> Mapping[str, MultiModalFieldConfig]:\n        fields = dict[str, MultiModalFieldConfig]()\n        for name, input in input_definition.data.items():\n            modality = \"image\"\n            if input.type == InputTypeEnum.tensor:\n                fields[name] = (\n                    MultiModalFieldConfig.shared(modality, batch_size=1)\n                    if is_shared\n                    else MultiModalFieldConfig.batched(modality)\n                )\n\n        return fields\n\n    return _terratorch_field_config\n\n\nclass TerratorchMultiModalDataParser(MultiModalDataParser):\n    def __init__(self, input_definition: InputDefinition, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n\n        self.input_definition = input_definition\n\n    def _parse_image_data(\n        self,\n        data: dict[str, torch.Tensor] | ModalityData[ImageItem],\n    ) -> ModalityDataItems[Any, Any] | None:\n        if isinstance(data, dict):\n            return DictEmbeddingItems(\n                data,\n                modality=\"image\",\n                required_fields=_terratorch_field_names(self.input_definition),\n                fields_factory=_terratorch_field_factory(self.input_definition),\n            )\n\n        return super()._parse_image_data(data)\n\n    def parse_mm_data(self, mm_data: MultiModalDataDict) -> MultiModalDataItems:\n        if \"image\" not in mm_data:\n            mm_data = {\"image\": mm_data}\n\n        return super().parse_mm_data(mm_data)\n\n\nclass TerratorchProcessingInfo(BaseProcessingInfo):\n    @cached_property\n    def input_definition(self) -> InputDefinition:\n        pretrained_cfg = self.get_hf_config().to_dict()[\"pretrained_cfg\"]\n        return InputDefinition(**pretrained_cfg[\"input\"])\n\n    def get_data_parser(self):\n        return TerratorchMultiModalDataParser(\n            self.input_definition,\n            expected_hidden_size=self._get_expected_hidden_size(),\n        )\n\n    def get_supported_mm_limits(self) -> Mapping[str, int | None]:\n        return {\"image\": None}\n\n\nclass TerratorchInputBuilder(BaseDummyInputsBuilder[TerratorchProcessingInfo]):\n    def __init__(self, info: TerratorchProcessingInfo):\n        super().__init__(info)\n        self.dummy_data_generator = DummyDataGenerator(\n            self.info.get_hf_config().to_dict()[\"pretrained_cfg\"]\n        )\n\n    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:\n        return \"\"\n\n    def get_dummy_mm_data(\n        self,\n        seq_len: int,\n        mm_counts: Mapping[str, int],\n        mm_options: Mapping[str, BaseDummyOptions],\n    ) -> MultiModalDataDict:\n        # Dummy data is generated based on the 'input' section\n        # defined in the HF configuration file\n\n        if mm_options:\n            logger.warning(\n                \"Configurable multimodal profiling \"\n                \"options are not supported for Terratorch. \"\n                \"They are ignored for now.\"\n            )\n\n        return self.dummy_data_generator.get_dummy_mm_data()\n\n\nclass TerratorchMultiModalProcessor(BaseMultiModalProcessor[TerratorchProcessingInfo]):\n    # Terratorch models, including Prithvi, consume tokenizer-free inputs.\n    requires_tokenizer = False\n\n    def _get_mm_fields_config(\n        self,\n        hf_inputs: BatchFeature,\n        hf_processor_mm_kwargs: Mapping[str, object],\n        *,\n        is_shared: bool = True,\n    ) -> Mapping[str, MultiModalFieldConfig]:\n        factory = _terratorch_field_factory(\n            self.info.input_definition,\n            is_shared=is_shared,\n        )\n        return factory(hf_inputs)\n\n    def _get_prompt_updates(\n        self,\n        mm_items: MultiModalDataItems,\n       \n\nRefactor the longest function in this snapshot for readability and show the result.",
+   "Repository snapshot:\n\n### FILE: entrypoints/launchers/cli_args.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"\nThis file contains the command line arguments for the vLLM's online server.\nIt is kept in a separate file for documentation purposes.\n\"\"\"\n\nimport argparse\nimport json\nimport ssl\nfrom collections.abc import Sequence\nfrom dataclasses import field\nfrom typing import Any, Literal\n\nimport vllm.envs as envs\nfrom vllm.config import config\nfrom vllm.engine.arg_utils import AsyncEngineArgs, optional_type\nfrom vllm.entrypoints.chat_utils import (\n    ChatTemplateContentFormatOption,\n    validate_chat_template,\n)\nfrom vllm.entrypoints.openai.models.protocol import LoRAModulePath\nfrom vllm.tool_parsers import ToolParserManager\nfrom vllm.utils.argparse_utils import FlexibleArgumentParser\n\nfrom .utils.constants import (\n    H11_MAX_HEADER_COUNT_DEFAULT,\n    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,\n)\n\n\nclass LoRAParserAction(argparse.Action):\n    def __call__(\n        self,\n        parser: argparse.ArgumentParser,\n        namespace: argparse.Namespace,\n        values: str | Sequence[str] | None,\n        option_string: str | None = None,\n    ):\n        if values is None:\n            values = []\n        if isinstance(values, str):\n            raise TypeError(\"Expected values to be a list\")\n\n        lora_list: list[LoRAModulePath] = []\n        for item in values:\n            if item in [None, \"\"]:  # Skip if item is None or empty string\n                continue\n            if \"=\" in item and \",\" not in item:  # Old format: name=path\n                name, path = item.split(\"=\")\n                lora_list.append(LoRAModulePath(name, path))\n            else:  # Assume JSON format\n                try:\n                    lora_dict = json.loads(item)\n                    lora = LoRAModulePath(**lora_dict)\n                    lora_list.append(lora)\n                except json.JSONDecodeError:\n                    parser.error(f\"Invalid JSON format for --lora-modules: {item}\")\n                except TypeError as e:\n                    parser.error(\n                        f\"Invalid fields for --lora-modules: {item} - {str(e)}\"\n                    )\n        setattr(namespace, self.dest, lora_list)\n\n\n@config\nclass BaseFrontendArgs:\n    \"\"\"Base arguments for the OpenAI-compatible frontend server.\n\n    This base class does not include host, port, and server-specific arguments\n    like SSL, CORS, and HTTP server settings. Those arguments are added by\n    the subclasses.\n    \"\"\"\n\n    lora_modules: list[LoRAModulePath] | None = None\n    \"\"\"LoRA modules configurations in either 'name=path' format or JSON format\n    or JSON list format. Example (old format): `'name=path'` Example (new\n    format): `{\\\"name\\\": \\\"name\\\", \\\"path\\\": \\\"lora_path\\\",\n    \\\"base_model_name\\\": \\\"id\\\"}`\"\"\"\n    chat_template: str | None = None\n    \"\"\"The file path to the chat template, or the template in single-line form\n    for the specified model.\"\"\"\n    chat_template_content_format: ChatTemplateContentFormatOption = \"auto\"\n    \"\"\"The format to render message content within a chat template.\n\n    * \"string\" will render the content as a string. Example: `\"Hello World\"`\n    * \"openai\" will render the content as a list of dictionaries, similar to\n      OpenAI schema. Example: `[{\"type\": \"text\", \"text\": \"Hello world!\"}]`\"\"\"\n    trust_request_chat_template: bool = False\n    \"\"\"Whether to trust the chat template provided in the request. If False,\n    the server will always use the chat template specified by `--chat-template`\n    or the ones from tokenizer.\"\"\"\n    default_chat_template_kwargs: dict[str, Any] | None = None\n    \"\"\"Default keyword arguments to pass to the chat template renderer.\n    These will be merged with request-level chat_template_kwargs,\n    with request values taking precedence. Useful for setting default\n    behavior for reasoning models. Example: '{\"enable_thinking\": false}'\n    to disable thinking mode by default for Qwen3/DeepSeek models.\"\"\"\n    response_role: str = \"assistant\"\n    \"\"\"The role name to return if `request.add_generation_prompt=true`.\"\"\"\n    return_tokens_as_token_ids: bool = False\n    \"\"\"When `--max-logprobs` is specified, represents single tokens as\n    strings of the form 'token_id:{token_id}' so that tokens that are not\n    JSON-encodable can be identified.\"\"\"\n    enable_auto_tool_choice: bool = False\n    \"\"\"Enable auto tool choice for supported models. Use `--tool-call-parser`\n    to specify which parser to use.\"\"\"\n    exclude_tools_when_tool_choice_none: bool = False\n    \"\"\"If specified, exclude tool definitions in prompts when\n    tool_choice='none'.\"\"\"\n    tool_call_parser: str | None = None\n    \"\"\"Select the tool call parser depending on the model that you're using.\n    This is used to parse the model-generated tool call into OpenAI API format.\n    Required for `--enable-auto-tool-choice`. You can choose any option from\n    the built-in parsers or register a plugin via `--tool-parser-plugin`.\"\"\"\n    tool_parser_plugin: str = \"\"\n    \"\"\"Special the tool parser plugin write to parse the model-generated tool\n    into OpenAI API format, the name register in this plugin can be used in\n    `--tool-call-parser`.\"\"\"\n    tool_server: str | None = None\n    \"\"\"Comma-separated list of host:port pairs (IPv4, IPv6, or hostname).\n    Examples: 127.0.0.1:8000, [::1]:8000, localhost:1234. Or `demo` for\n    built-in demo tools (browser and Python code interpreter). WARNING:\n    The `demo` Python tool executes model-generated code in Docker without\n    network isolation by default. See the security guide for more\n    information.\"\"\"\n    log_config_file: str | None = envs.VLLM_LOGGING_CONFIG_PATH\n    \"\"\"Path to logging config JSON file for both vllm and uvicorn\"\"\"\n    max_log_len: int | None = None\n    \"\"\"Max number of prompt characters or prompt ID numbers being printed in\n    log. The default of None means unlimited.\"\"\"\n    enable_prompt_tokens_details: bool = False\n    \"\"\"If set to True, enable prompt_tokens_details in usage.\"\"\"\n    enable_per_request_metrics: bool = False\n    \"\"\"If set to True, include per-request timing metrics in API responses.\"\"\"\n    enable_server_load_tracking: bool = False\n    \"\"\"If set to True\n\nWrite unit tests (pytest) for the most important function in this snapshot.",
+   "Repository snapshot:\n\n### FILE: transformers_utils/configs/colqwen3.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"\nColQwen3 configuration that extends Qwen3VLConfig with embedding projection\nfields. This allows ColQwen3 models to be loaded without trust_remote_code\nby mapping their custom model_type (colqwen3, ops_colqwen3, etc.) to a\nstandard config class that vLLM understands.\n\nSupported model_types:\n- colqwen3 (TomoroAI/tomoro-colqwen3-embed-8b)\n- ops_colqwen3 (OpenSearch-AI/Ops-Colqwen3-4B)\n- qwen3_vl_nemotron_embed (nvidia/nemotron-colembed-vl-8b-v2)\n\"\"\"\n\nfrom transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig\n\n\nclass ColQwen3Config(Qwen3VLConfig):\n    \"\"\"Configuration class for ColQwen3 models.\n\n    Extends Qwen3VLConfig with additional fields used by ColQwen3 variants\n    for the embedding projection layer.\n    \"\"\"\n\n    # Accept any ColQwen3 variant model_type\n    model_type = \"colqwen3\"\n\n    def __init__(\n        self,\n        embed_dim: int | None = None,\n        dims: int | None = None,\n        dim: int | None = None,\n        projection_dim: int | None = None,\n        colbert_dim: int | None = None,\n        pooling: str | None = None,\n        **kwargs,\n    ):\n        # Store embedding projection config fields\n        self.embed_dim = embed_dim\n        self.dims = dims\n        self.dim = dim\n        self.projection_dim = projection_dim\n        self.colbert_dim = colbert_dim\n        self.pooling = pooling\n\n        super().__init__(**kwargs)\n\n\nclass OpsColQwen3Config(ColQwen3Config):\n    \"\"\"Configuration for OpenSearch-AI ColQwen3 variants.\"\"\"\n\n    model_type = \"ops_colqwen3\"\n\n\nclass Qwen3VLNemotronEmbedConfig(ColQwen3Config):\n    \"\"\"Configuration for NVIDIA Nemotron ColEmbed variants.\"\"\"\n\n    model_type = \"qwen3_vl_nemotron_embed\"\n\n\n### FILE: v1/worker/dp_utils.py\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\nfrom contextlib import nullcontext\n\nimport torch\nimport torch.distributed as dist\n\nfrom vllm.config import ParallelConfig\nfrom vllm.distributed.parallel_state import get_dp_group\nfrom vllm.logger import init_logger\nfrom vllm.utils.gpu_sync_debug import gpu_sync_allowed\nfrom vllm.v1.worker.ubatch_utils import (\n    check_ubatch_thresholds,\n    is_last_ubatch_empty,\n)\n\nlogger = init_logger(__name__)\n\n\ndef _get_device_and_group(parallel_config: ParallelConfig):\n    # Use the actual device assigned to the DP group, not just the device type\n    device = get_dp_group().device\n    group = get_dp_group().device_group\n\n    # Transferring this tensor from GPU to CPU will introduce a GPU sync\n    # point that could adversely affect performance of vllm with asynch\n    # scheduling. This environment variable exists to quickly disable\n    # this optimization if we run into this case.\n    if parallel_config.disable_nccl_for_dp_synchronization:\n        logger.info_once(\n            \"Using CPU all reduce to synchronize DP padding between ranks.\",\n        )\n        device = \"cpu\"\n        group = get_dp_group().cpu_group\n    return device, group\n\n\ndef _run_ar(\n    should_ubatch: bool,\n    orig_num_tokens_per_ubatch: int,\n    padded_num_tokens_per_ubatch: int,\n    cudagraph_mode: int,\n    parallel_config: ParallelConfig,\n) -> torch.Tensor:\n    dp_size = parallel_config.data_parallel_size\n    dp_rank = parallel_config.data_parallel_rank\n    device, group = _get_device_and_group(parallel_config)\n    # Populate this rank's contribution on CPU to reduce GPU syncs.\n    tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)\n    tensor_cpu[0][dp_rank] = orig_num_tokens_per_ubatch\n    tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch\n    tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0\n    tensor_cpu[3][dp_rank] = cudagraph_mode\n    tensor = tensor_cpu.to(device, non_blocking=True)\n    dist.all_reduce(tensor, group=group)\n    return tensor\n\n\ndef _post_process_ubatch(tensor: torch.Tensor, num_ubatches: int) -> bool:\n    orig_num_tokens_tensor = tensor[0, :]\n    padded_num_tokens_tensor = tensor[1, :]\n\n    # First determine if we are going to be ubatching.\n    should_ubatch: bool = bool(torch.all(tensor[2] == 1).item())\n    if not should_ubatch:\n        return False\n    # If the DP ranks are planning to ubatch, make sure that\n    # there are no \"empty\" second ubatches\n    orig_min_num_tokens = int(orig_num_tokens_tensor.min().item())\n    padded_max_num_tokens = int(padded_num_tokens_tensor.max().item())\n    if is_last_ubatch_empty(orig_min_num_tokens, padded_max_num_tokens, num_ubatches):\n        logger.debug(\n            \"Aborting ubatching %s %s\", orig_min_num_tokens, padded_max_num_tokens\n        )\n        should_ubatch = False\n    return should_ubatch\n\n\ndef _post_process_dp_padding(tensor: torch.Tensor, should_dp_pad: bool) -> torch.Tensor:\n    num_tokens_across_dp = tensor[1, :]\n    if should_dp_pad:\n        # If DP padding is enabled, ensure that each rank is processing the same number\n        # of tokens\n        max_num_tokens = int(num_tokens_across_dp.max().item())\n        return torch.tensor(\n            [max_num_tokens] * len(num_tokens_across_dp),\n            device=\"cpu\",\n            dtype=torch.int32,\n        )\n    else:\n        return num_tokens_across_dp.cpu()\n\n\ndef _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:\n    \"\"\"\n    Synchronize cudagraph_mode across DP ranks by taking the minimum.\n    If any rank has NONE (0), all ranks use NONE.\n    This ensures all ranks send consistent values (all padded or all unpadded).\n    \"\"\"\n    return int(tensor[3, :].min().item())\n\n\ndef _synchronize_dp_ranks(\n    num_tokens_un\n\nContinue this file: write the next function that would naturally follow, with a docstring.",
+   "Write a C function that parses an IPv4 address string into a uint32_t, with error handling."
+  ],
+  "res": {
+   "on": [
+    {
+     "text": "```python\n    for request in requests:\n        if request.prompt_token_ids is not None:\n            prompts.append(TokensPrompt(prompt_token_ids=request.prompt_token_ids))\n        else:\n            prompts.append(TextPrompt(prompt=request.prompt))\n        \n        sampling_params.append(\n            SamplingParams(\n                n=n,\n                temperature=request.temperature,\n                top_p=request.top_p,\n                max_tokens=request.expected_output_len,\n                ignore_eos=request.ignore_eos,\n                detokenize=not disable_detokenize,\n            )\n        )\n\n    start_time = time.perf_counter()\n    outputs = llm.generate(prompts, sampling_params)\n    end_time = time.perf_counter()\n\n    if do_profile:\n        llm.llm_engine.profile()\n\n    return end_time - start_time, outputs\n```",
+     "tokens": 178,
+     "s": 1.6413602828979492
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis codebase contains two distinct modules related to vLLM's execution and memory management:\n\n### 1. `triton_utils/force_first_config.py`\nThis module provides a mechanism to **disable Triton's autotuning** by forcing the use of the first valid configuration for each kernel. This is controlled by the environment variable `VLLM_TRITON_FORCE_FIRST_CONFIG`.\n\n**Key Components:**\n- **`install()` function**: Monkey-patches `triton.runtime.autotuner.Autotuner.run` with a custom implementation `_run_first_valid_config`.\n- **`_run_first_valid_config`**:\n  - Caches the index of the first valid configuration for each unique kernel/key combination in `_picked_cache`.\n  - On first call for a given key, it iterates through all configurations, attempting to launch the kernel with each config.\n  - It catches specific errors (`OutOfResources`, `CompileTimeAssertionFailure`, `PTXASError`) that indicate an invalid configuration.\n  - The first configuration that successfully launches (without raising those errors) is cached and used for all subsequent calls with the same key.\n  - It logs which configuration was picked for each kernel.\n  - If no configuration works, it raises a `RuntimeError`.\n\n**Purpose**: Autotuning can be expensive (running multiple kernel variants to find the fastest). This patch skips that process, using the first working config",
+     "tokens": 300,
+     "s": 2.553433418273926
+    },
+    {
+     "text": "Looking at the provided snapshot, I need to identify the longest function.\n\n1.  **`lora/layers/__init__.py`**: This file contains only imports and the `__all__` list. There are no function definitions here.\n2.  **`v1/attention/backends/flash_attn.py`**: This file contains the class `FlashAttentionBackend`.\n    *   `_get_fa4_hd256_block_size`: This is a classmethod. It checks `vllm_config`, gets `head_size`, and returns a block size or `None`. It's relatively short (about 10-15 lines).\n    *   `get_supported_kernel_block_sizes`: This is a classmethod. It calls `_get_fa4_hd256_block_size` and returns a list. It's very short (about 3-5 lines).\n\nWait, the prompt asks to refactor the **longest function** in the snapshot. Let me re-read the files carefully.\n\nIn `lora/layers/__init__.py`, there are no functions.\nIn `v1/attention/backends/flash_attn.py`, the visible code ends at `get_supported_kernel_block_sizes`. The file is truncated (\"Sliding-window specs select the smallest advertised size.\").\n\nHowever, looking at the imports and structure, `flash_attn.py` is a large file in vLLM. But I can only see a",
+     "tokens": 300,
+     "s": 2.3286020755767822
+    },
+    {
+     "text": "I'll analyze the snapshot to identify the most important function and write comprehensive unit tests for it.\n\nThe most important function is `apply_bad_words` in `v1/sample/ops/bad_words.py` \u2014 it's a core sampling operation that prevents the model from generating forbidden token sequences. Let me first explore the repository structure to understand conventions.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls && echo \"---TESTS---\" && ls tests/ 2>/dev/null | head -50\n</parameter>\n<parameter=description>\nList repo root and tests directory\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=Bash>\n<parameter=command>\nfind . -path ./node_modules -prune -o -name \"*.py\" -print 2>/dev/null | grep -i \"bad_word\" \n</parameter>\n<parameter=description>\nFind existing bad_words related files\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 209,
+     "s": 1.772655963897705
+    },
+    {
+     "text": "# LRU Cache Implementation in Python\n\n## Design Overview\n\nAn LRU (Least Recently Used) cache requires **O(1)** time complexity for both `get` and `put` operations. The key insight is combining two data structures:\n\n1. **Hash Map (Dictionary)**: Maps keys to nodes for O(1) lookup.\n2. **Doubly Linked List**: Maintains the order of usage, with the most recently used item at the head and the least recently used at the tail.\n\n### Why this combination?\n- The hash map gives us O(1) access to any key.\n- The doubly linked list allows O(1) insertion at the head, removal from the tail, and removal of any node (given a reference to it).\n- Each node in the linked list stores both the key and value, so when we remove a node from the list, we can also remove it from the hash map.\n\n```\nHead <-> [MRU] <-> ... <-> [LRU] <-> Tail\n         \u2191                          \u2191\n    most recently used      least recently used\n```\n\n## Implementation\n\n```python\nclass Node:\n    \"\"\"Doubly linked list node storing key-value pair.\"\"\"\n    __slots__ = ('key', 'value', 'prev', 'next')\n\n    def __init__(self, key=0, value=0):\n        self.key = key\n        self.value = value\n",
+     "tokens": 300,
+     "s": 1.8835422992706299
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis file defines two dataclasses used in the vLLM v1 scheduler to communicate scheduling decisions from the scheduler to the model runner:\n\n### `NewRequestData`\nRepresents a **newly scheduled request** that needs to be processed for the first time (or resumed after being preempted). It contains:\n- **`req_id`**: Unique identifier for the request.\n- **`prompt_token_ids`**: The token IDs of the prompt (may be `None` if using embeddings).\n- **`mm_features`**: Multi-modal feature specifications (images, audio, etc.), filtered by `strip_covered_mm_data` to exclude features already covered by computed tokens.\n- **`sampling_params` / `pooling_params`**: Parameters controlling how the model generates or pools outputs.\n- **`block_ids`**: Tuple of lists of KV cache block IDs allocated for this request.\n- **`num_computed_tokens`**: Number of tokens already computed (relevant for resumed requests).\n- **`lora_request`**: Optional LoRA adapter request.\n- **`prompt_embeds`**: Optional pre-computed prompt embeddings (alternative to token IDs).\n- **`prompt_is_token_ids`**: Boolean list indicating which positions are token IDs vs. embeddings.\n- **`prefill_token_ids`**: Only used for v2 model runner; token IDs for the prefill phase.\n\nThe `from_request`",
+     "tokens": 300,
+     "s": 2.470292568206787
+    },
+    {
+     "text": "Looking at the code, the longest function is `TerratorchMultiModalProcessor._get_prompt_updates` (which is cut off in the snapshot, but based on the pattern and typical vLLM implementations, it's likely the most complex). However, since it's cut off, let me look at what's fully visible.\n\nActually, looking more carefully at the complete functions in the snapshot, `TerratorchMultiModalDataParser._parse_image_data` and `TerratorchInputBuilder.get_dummy_mm_data` are relatively short. The `_terratorch_field_factory` function is also moderate.\n\nWait - the snapshot is cut off at `_get_prompt_updates`. Let me re-examine. The functions that are fully visible are:\n- `_terratorch_field_names` (1 line)\n- `_terratorch_field_factory` (12 lines)\n- `TerratorchMultiModalDataParser.__init__` (3 lines)\n- `TerratorchMultiModalDataParser._parse_image_data` (10 lines)\n- `TerratorchMultiModalDataParser.parse_mm_data` (4 lines)\n- `TerratorchProcessingInfo.input_definition` (3 lines)\n- `TerratorchProcessingInfo.get_data_parser` (4 lines)\n- `TerratorchProcessingInfo.get_supported_mm_limits` (1 line)\n- `TerratorchInputBuilder.__init__` (4 lines)\n- `",
+     "tokens": 300,
+     "s": 2.186903715133667
+    },
+    {
+     "text": "I'll analyze the snapshot to identify the most important function to test.\n\nLooking at the code, the most important and complex function is `LoRAParserAction.__call__`. It handles parsing LoRA module configurations in multiple formats (old `name=path` format and new JSON format), with error handling for invalid inputs. This is a critical piece of CLI argument parsing logic with several branches worth testing.\n\nLet me first explore the repository structure to understand the dependencies.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nfind /testbed -type f -name \"*.py\" | head -50 && echo \"---\" && ls /testbed\n</parameter>\n<parameter=description>\nExplore repository structure\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 160,
+     "s": 1.5066993236541748
+    },
+    {
+     "text": "```python\n    padded: int,\n    num_ubatches: int,\n    cudagraph_mode: int,\n    parallel_config: ParallelConfig,\n) -> tuple[int, bool, int]:\n    \"\"\"\n    Synchronize DP ranks to determine the final number of tokens to process,\n    whether to use ubatching, and the effective cudagraph mode.\n\n    This function performs an all-reduce across DP ranks to ensure all ranks\n    agree on:\n    1. The number of tokens to process (padded if DP padding is enabled).\n    2. Whether to use ubatching (only if all ranks agree and it's beneficial).\n    3. The cudagraph mode (minimum across ranks to ensure consistency).\n\n    Args:\n        num_tokens_unpadded: The number of tokens on this rank before padding.\n        num_ubatches: The number of ubatches to use.\n        cudagraph_mode: The cudagraph mode for this rank.\n        parallel_config: The parallel configuration.\n\n    Returns:\n        A tuple containing:\n        - The final number of tokens to process on this rank.\n        - Whether to use ubatching.\n        - The effective cudagraph mode.\n    \"\"\"\n    should_ubatch, orig_num_tokens_per_ubatch, padded_num_tokens_per_ubatch = (\n        check_ubatch_thresholds(\n            num_tokens_unpadded,\n            num_ub",
+     "tokens": 300,
+     "s": 2.2691152095794678
+    },
+    {
+     "text": "```c\n#include <stdint.h>\n#include <string.h>\n#include <stdlib.h>\n#include <errno.h>\n\n/**\n * Parses an IPv4 address string (e.g., \"192.168.1.1\") into a uint32_t.\n * The resulting uint32_t is in network byte order (big-endian), where the\n * first octet is the most significant byte.\n *\n * @param str  Pointer to the null-terminated IPv4 address string.\n * @param out  Pointer to a uint32_t where the parsed address will be stored.\n * @return     0 on success, -1 on error.\n */\nint parse_ipv4(const char *str, uint32_t *out) {\n    if (str == NULL || out == NULL) {\n        return -1;\n    }\n\n    uint32_t result = 0;\n    int octet_count = 0;\n    const char *p = str;\n\n    while (1) {\n        // Parse one octet\n        char *endptr;\n        errno = 0;\n        long val = strtol(p, &endptr, 10);\n\n        // Check for errors\n        if (errno != 0) {\n            return -1;\n        }\n        if (endptr == p) {\n            //",
+     "tokens": 300,
+     "s": 1.724198341369629
+    }
+   ],
+   "off": [
+    {
+     "text": "```python\n    for request in requests:\n        if request.prompt_token_ids is not None:\n            prompts.append(TokensPrompt(prompt_token_ids=request.prompt_token_ids))\n        else:\n            prompts.append(TextPrompt(prompt=request.prompt))\n        \n        sampling_params.append(\n            SamplingParams(\n                n=n,\n                temperature=request.temperature,\n                top_p=request.top_p,\n                max_tokens=request.expected_output_len,\n                ignore_eos=request.ignore_eos,\n                detokenize=not disable_detokenize,\n            )\n        )\n\n    start_time = time.perf_counter()\n    outputs = llm.generate(prompts, sampling_params)\n    end_time = time.perf_counter()\n\n    if do_profile:\n        llm.llm_engine.profile()\n\n    return end_time - start_time, outputs\n```",
+     "tokens": 178,
+     "s": 3.237076997756958
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis codebase contains two distinct modules related to vLLM's execution and memory management:\n\n### 1. `triton_utils/force_first_config.py`\nThis module provides a mechanism to **disable Triton's autotuning** by forcing the use of the first valid configuration for each kernel. This is controlled by the environment variable `VLLM_TRITON_FORCE_FIRST_CONFIG`.\n\n**Key Components:**\n- **`install()` function**: Monkey-patches `triton.runtime.autotuner.Autotuner.run` with a custom implementation `_run_first_valid_config`.\n- **`_run_first_valid_config`**:\n  - Caches the index of the first valid configuration for each unique kernel/key combination in `_picked_cache`.\n  - On first call for a given key, it iterates through all configurations, attempting to launch the kernel with each config.\n  - It catches specific errors (`OutOfResources`, `CompileTimeAssertionFailure`, `PTXASError`) that indicate an invalid configuration.\n  - The first configuration that successfully launches (without raising those errors) is cached and used for all subsequent calls with the same key.\n  - It logs which configuration was picked for each kernel.\n  - If no configuration works, it raises a `RuntimeError`.\n\n**Purpose**: Autotuning can be expensive (running multiple kernel variants to find the fastest). This patch skips that process, using the first working config",
+     "tokens": 300,
+     "s": 5.007601499557495
+    },
+    {
+     "text": "Looking at the provided snapshot, I need to identify the longest function.\n\n1.  **`lora/layers/__init__.py`**: This file contains only imports and the `__all__` list. There are no function definitions here.\n2.  **`v1/attention/backends/flash_attn.py`**: This file contains the class `FlashAttentionBackend`.\n    *   `_get_fa4_hd256_block_size`: This is a classmethod. It checks `vllm_config`, gets `head_size`, and returns a block size or `None`. It's relatively short (about 10-15 lines).\n    *   `get_supported_kernel_block_sizes`: This is a classmethod. It calls `_get_fa4_hd256_block_size` and returns a list. It's very short (about 3-5 lines).\n\nWait, the prompt asks to refactor the **longest function** in the snapshot. Let me re-read the files carefully.\n\nIn `lora/layers/__init__.py`, there are no functions.\nIn `v1/attention/backends/flash_attn.py`, the visible code ends at `get_supported_kernel_block_sizes`. The file is truncated (\"Sliding-window specs select the smallest advertised size.\").\n\nHowever, looking at the imports and structure, `flash_attn.py` is a large file in vLLM. But I can only see a",
+     "tokens": 300,
+     "s": 4.938793182373047
+    },
+    {
+     "text": "I'll analyze the snapshot to identify the most important function and write comprehensive unit tests for it.\n\nThe most important function is `apply_bad_words` in `v1/sample/ops/bad_words.py` \u2014 it's a core sampling operation that prevents the model from generating forbidden token sequences. Let me first explore the repository structure to understand conventions.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls && echo \"---TESTS---\" && ls tests/ 2>/dev/null | head -50\n</parameter>\n<parameter=description>\nList repo root and tests directory\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=Bash>\n<parameter=command>\nfind . -path ./node_modules -prune -o -name \"*.py\" -print 2>/dev/null | grep -i \"bad_word\" \n</parameter>\n<parameter=description>\nFind existing bad_words related files\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 209,
+     "s": 3.5971407890319824
+    },
+    {
+     "text": "# LRU Cache Implementation in Python\n\n## Design Overview\n\nAn LRU (Least Recently Used) cache requires **O(1)** time complexity for both `get` and `put` operations. The key insight is combining two data structures:\n\n1. **Hash Map (Dictionary)**: Maps keys to nodes for O(1) lookup.\n2. **Doubly Linked List**: Maintains the order of usage, with the most recently used item at the head and the least recently used at the tail.\n\n### Why this combination?\n- The hash map gives us O(1) access to any key.\n- The doubly linked list allows O(1) insertion at the head, removal from the tail, and removal of any node (given a reference to it).\n- Each node in the linked list stores both the key and value, so when we remove a node from the list, we can also remove it from the hash map.\n\n```\nHead <-> [MRU] <-> ... <-> [LRU] <-> Tail\n         \u2191                          \u2191\n    most recently used      least recently used\n```\n\n## Implementation\n\n```python\nclass Node:\n    \"\"\"Doubly linked list node storing key-value pair.\"\"\"\n    __slots__ = ('key', 'value', 'prev', 'next')\n\n    def __init__(self, key=0, value=0):\n        self.key = key\n        self.value = value\n",
+     "tokens": 300,
+     "s": 4.437303781509399
+    },
+    {
+     "text": "## Detailed Explanation\n\nThis file defines two dataclasses used in the vLLM v1 scheduler to communicate scheduling decisions from the scheduler to the model runner:\n\n### `NewRequestData`\nRepresents a **newly scheduled request** that needs to be processed for the first time (or resumed after being preempted). It contains:\n- **`req_id`**: Unique identifier for the request.\n- **`prompt_token_ids`**: The token IDs of the prompt (may be `None` if using embeddings).\n- **`mm_features`**: Multi-modal feature specifications (images, audio, etc.), filtered by `strip_covered_mm_data` to exclude features already covered by computed tokens.\n- **`sampling_params` / `pooling_params`**: Parameters controlling how the model generates or pools outputs.\n- **`block_ids`**: Tuple of lists of KV cache block IDs allocated for this request.\n- **`num_computed_tokens`**: Number of tokens already computed (relevant for resumed requests).\n- **`lora_request`**: Optional LoRA adapter request.\n- **`prompt_embeds`**: Optional pre-computed prompt embeddings (alternative to token IDs).\n- **`prompt_is_token_ids`**: Boolean list indicating which positions are token IDs vs. embeddings.\n- **`prefill_token_ids`**: Only used for v2 model runner; token IDs for the prefill phase.\n\nThe `from_request`",
+     "tokens": 300,
+     "s": 4.937008857727051
+    },
+    {
+     "text": "Looking at the code, the longest function is `TerratorchMultiModalProcessor._get_prompt_updates` (which is cut off in the snapshot, but based on the pattern and typical vLLM implementations, it's likely the most complex). However, since it's cut off, let me look at what's fully visible.\n\nActually, looking more carefully at the complete functions in the snapshot, `TerratorchMultiModalDataParser._parse_image_data` and `TerratorchInputBuilder.get_dummy_mm_data` are relatively short. The `_terratorch_field_factory` function is also moderate.\n\nWait - the snapshot is cut off at `_get_prompt_updates`. Let me re-examine. The functions that are fully visible are:\n- `_terratorch_field_names` (1 line)\n- `_terratorch_field_factory` (12 lines)\n- `TerratorchMultiModalDataParser.__init__` (3 lines)\n- `TerratorchMultiModalDataParser._parse_image_data` (10 lines)\n- `TerratorchMultiModalDataParser.parse_mm_data` (4 lines)\n- `TerratorchProcessingInfo.input_definition` (3 lines)\n- `TerratorchProcessingInfo.get_data_parser` (4 lines)\n- `TerratorchProcessingInfo.get_supported_mm_limits` (1 line)\n- `TerratorchInputBuilder.__init__` (4 lines)\n- `",
+     "tokens": 300,
+     "s": 4.934464454650879
+    },
+    {
+     "text": "I'll analyze the snapshot to identify the most important function to test.\n\nLooking at the code, the most important and complex function is `LoRAParserAction.__call__`. It handles parsing LoRA module configurations in multiple formats (old `name=path` format and new JSON format), with error handling for invalid inputs. This is a critical piece of CLI argument parsing logic with several branches worth testing.\n\nLet me first explore the repository structure to understand the dependencies.\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nfind /testbed -type f -name \"*.py\" | head -50 && echo \"---\" && ls /testbed\n</parameter>\n<parameter=description>\nExplore repository structure\n</parameter>\n</function>\n</tool_call>",
+     "tokens": 160,
+     "s": 2.8771448135375977
+    },
+    {
+     "text": "```python\n    padded: int,\n    num_ubatches: int,\n    cudagraph_mode: int,\n    parallel_config: ParallelConfig,\n) -> tuple[int, bool, int]:\n    \"\"\"\n    Synchronize DP ranks to determine the final number of tokens to process,\n    whether to use ubatching, and the effective cudagraph mode.\n\n    This function performs an all-reduce across DP ranks to ensure all ranks\n    agree on:\n    1. The number of tokens to process (padded if DP padding is enabled).\n    2. Whether to use ubatching (only if all ranks agree and it's beneficial).\n    3. The cudagraph mode (minimum across ranks to ensure consistency).\n\n    Args:\n        num_tokens_unpadded: The number of tokens on this rank before padding.\n        num_ubatches: The number of ubatches to use.\n        cudagraph_mode: The cudagraph mode for this rank.\n        parallel_config: The parallel configuration.\n\n    Returns:\n        A tuple containing:\n        - The final number of tokens to process on this rank.\n        - Whether to use ubatching.\n        - The effective cudagraph mode.\n    \"\"\"\n    should_ubatch, orig_num_tokens_per_ubatch, padded_num_tokens_per_ubatch = (\n        check_ubatch_thresholds(\n            num_tokens_unpadded,\n            num_ub",
+     "tokens": 300,
+     "s": 4.939361095428467
+    },
+    {
+     "text": "```c\n#include <stdint.h>\n#include <string.h>\n#include <stdlib.h>\n#include <errno.h>\n\n/**\n * Parses an IPv4 address string (e.g., \"192.168.1.1\") into a uint32_t.\n * The resulting uint32_t is in network byte order (big-endian), where the\n * first octet is the most significant byte.\n *\n * @param str  Pointer to the null-terminated IPv4 address string.\n * @param out  Pointer to a uint32_t where the parsed address will be stored.\n * @return     0 on success, -1 on error.\n */\nint parse_ipv4(const char *str, uint32_t *out) {\n    if (str == NULL || out == NULL) {\n        return -1;\n    }\n\n    uint32_t result = 0;\n    int octet_count = 0;\n    const char *p = str;\n\n    while (1) {\n        // Parse one octet\n        char *endptr;\n        errno = 0;\n        long val = strtol(p, &endptr, 10);\n\n        // Check for errors\n        if (errno != 0) {\n            return -1;\n        }\n        if (endptr == p) {\n            //",
+     "tokens": 300,
+     "s": 4.426852464675903
+    }
+   ]
+  }
+ },
+ "speed-32k": [
+  {
+   "N": 1,
+   "mode": "on",
+   "p50_tps": 175.78781518409764,
+   "min_tps": 175.78781518409764,
+   "max_tps": 175.78781518409764,
+   "agg_tps": 175.78781518409764,
+   "tokens": 300,
+   "wall_s": 1.7806227207183838,
+   "prefill_s": 11.881309509277344,
+   "rounds": 79,
+   "steps": 79,
+   "deltas": {
+    "prefilled_tokens": 50,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 1,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": 3.7848101265822787,
+   "ttft_p50": 0.07954185199923813,
+   "cached": [
+    32668
+   ],
+   "completion_tokens": [
+    300
+   ]
+  },
+  {
+   "N": 8,
+   "mode": "on",
+   "p50_tps": 79.38247311116943,
+   "min_tps": 73.54399173810137,
+   "max_tps": 83.8352210384549,
+   "agg_tps": 628.9546146402721,
+   "tokens": 2400,
+   "wall_s": 4.668369293212891,
+   "prefill_s": 95.04234290122986,
+   "rounds": 136,
+   "steps": 136,
+   "deltas": {
+    "prefilled_tokens": 400,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 8,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": 17.58823529411765,
+   "ttft_p50": 0.29923988100199495,
+   "cached": [
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668
+   ],
+   "completion_tokens": [
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300
+   ]
+  },
+  {
+   "N": 1,
+   "mode": "off",
+   "p50_tps": 65.14156919833086,
+   "min_tps": 65.14156919833086,
+   "max_tps": 65.14156919833086,
+   "agg_tps": 65.14156919833086,
+   "tokens": 300,
+   "wall_s": 4.659121751785278,
+   "prefill_s": 11.884045124053955,
+   "rounds": 0,
+   "steps": 299,
+   "deltas": {
+    "prefilled_tokens": 50,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 1,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": null,
+   "ttft_p50": 0.06895201899169479,
+   "cached": [
+    32668
+   ],
+   "completion_tokens": [
+    300
+   ]
+  },
+  {
+   "N": 8,
+   "mode": "off",
+   "p50_tps": 47.759628950226215,
+   "min_tps": 46.79977746751926,
+   "max_tps": 50.00353120252502,
+   "agg_tps": 383.39979628481194,
+   "tokens": 2400,
+   "wall_s": 7.128366947174072,
+   "prefill_s": 95.52533459663391,
+   "rounds": 0,
+   "steps": 341,
+   "deltas": {
+    "prefilled_tokens": 400,
+    "host_saves": 0,
+    "host_hits": 0,
+    "prefix_cache_hits": 8,
+    "spec_fallbacks": 0
+   },
+   "tokens_per_round": null,
+   "ttft_p50": 0.2514670450036647,
+   "cached": [
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668,
+    32668
+   ],
+   "completion_tokens": [
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300,
+    300
+   ]
+  }
+ ],
+ "summary": {
+  "needle_pass": "3/3",
+  "needle_ttft_s": [
+   11.843,
+   11.812,
+   11.815
+  ],
+  "spec_ab_identical": "10/10",
+  "speed_32k_p50_tps": {
+   "N=1 spec=on": 175.8,
+   "N=8 spec=on": 79.4,
+   "N=1 spec=off": 65.1,
+   "N=8 spec=off": 47.8
+  }
+ }
+}
