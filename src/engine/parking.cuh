@@ -370,7 +370,7 @@ extern "C" int qwn_paged_slot_restore(int slot, int upto_pos, const void *host, 
 static inline int paged_lm_head_wide(void) {
     return !g_qwen.tie_word_embeddings &&
            (g_qwen.lm_head.exl3 ||
-            (g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
+            (g_qwen.lm_head.e2m3 &&
              !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major));
 }
 

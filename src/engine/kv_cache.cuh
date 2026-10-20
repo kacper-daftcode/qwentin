@@ -1,7 +1,7 @@
-// the single-stream KV cache formats (FP8, int4 K with (scale, zp) groups) and the MMA tree-attention layout.
+// the int4-K / E4M3-V cache layout helpers ((scale, zp) groups, Hadamard rotation) of the single-stream decoder and the paged pool.
 // Part of the forward_qwen.cu unity build: included in order, not a standalone header.
 
-// ===== FP8 (E4M3) prefix KV cache helpers (TQ_KV_FP8=1) =====
+// ===== E4M3 KV rows (the V rows of TQ_KV_Q4) =====
 // Codes are stored as u8 E4M3 with one pow2 scale per (pos, kv_head) row section
 // (absmax over the hd values): scale = exp2(ceil(log2(absmax/448))), so val/scale
 // is an exact exponent shift and only the E4M3 mantissa rounding is lossy.
@@ -224,7 +224,7 @@ static __device__ __noinline__ float tq_attn_tail_pp_q4(
     return acc / denom;
 }
 
-// FP8 variant of the attention tail (TQ_KV_FP8): rows <= base decode E4M3 codes
+// FP8 variant of the attention tail: rows <= base decode E4M3 codes
 // from the prefix cache; the pow2 row scale is pulled out of the dot product
 // (score = dot * ksc[t] * rsqrt(hd)) and the V scale is folded into p[t] before
 // the hd-wide FMA stream. Scale pointers arrive pre-offset by kv_head and stride
@@ -320,7 +320,7 @@ static __device__ __noinline__ float tq_attn_tail_pp_fp8(
 // Rows <= base come from the (cache, cstride) pair; rows > base resolve through
 // anc_n into the (arch, astride) pair. Dense callers pass base == pos.
 // `red` may alias qn (qn is dead once the score slices are done).
-// kc8 != NULL routes to the FP8 tail above (TQ_KV_FP8); kc4 != NULL routes to
+// kc8 != NULL routes to the FP8 tail above; kc4 != NULL routes to
 // the int4-K tail (TQ_KV_Q4, qn must arrive rotated); the fp32 body below is
 // untouched.
 static __device__ __forceinline__ float tq_attn_tail_pp(
@@ -386,27 +386,10 @@ static __device__ __forceinline__ float tq_attn_tail_pp(
     return acc / denom;
 }
 
-// ===== TQ_ATTN_MMA: tensor-core tree attention with online softmax =====
-// One 256-thread block handles ONE q-head x ALL N (<=16) tree nodes (they share
-// the kv-head's K/V): the M dim of m16n8 tiles is the node axis. Positions are
-// tiled 16 wide; the committed prefix [0..base] is uniform across rows, the tree
-// part is ONE extra 16-wide tile over the archive slots masked per (row, slot)
-// by the node's ancestor bitmask (rows have different lengths -- the per-row
-// mask is what makes the tree part correct). Online softmax (m/l/rescale, fp32)
-// runs across tiles; scores are NEVER materialized (no gmem slabs on this path).
-// MODE 1: Q/K/V cast to bf16, HMMA m16n8k16, fp32 accum.
-// MODE 2 (TQ_KV_FP8): prefix K as raw E4M3 codes x per-row pow2-quantized Q via
-// QMMA m16n8k32 e4m3 (per-(pos,kv_head) K scale and per-node Q scale pulled out
-// of the MMA and applied to the C fragment per column/row); prefix V codes are
-// decoded to bf16 at B-fragment build (the V scale is folded into P, denominator
-// on unscaled p, like the fp8 tail). The fp32 archive seam stays bf16 HMMA.
-// NOT bit-exact vs the fp32 tail (bf16/e4m3 scores + tiled summation order) --
-// same deliberate numerics-baseline-change precedent as tq_attn_tail_pp, gated
-// by accept/tf-top1. Default OFF (TQ_ATTN_MMA unset).
-
+// ===== Shared-memory layout of the MMA attention kernels (wide prefill, paged decode / verify) =====
+// Positions are tiled 16 wide; online softmax (running m / l, fp32 rescale) across tiles.
 // dynamic smem layout (32-bit words)
 #define TQ_AMM_QA      0                    // [16 chunks][32 lanes][4] bf16 Q A-frags
-#define TQ_AMM_QA8     2048                 // [8 chunks][32][4] e4m3 Q A-frags (mode 2)
 #define TQ_AMM_PST     3072                 // [8 tiles][32][4] P A-frag staging
 #define TQ_AMM_WMAX    4096                 // [8 warps][16 rows] tile row-max
 #define TQ_AMM_WSUM    4224                 // [8 warps][16 rows] tile row-sum
@@ -415,10 +398,8 @@ static __device__ __forceinline__ float tq_attn_tail_pp(
 #define TQ_AMM_ALPH    4384                 // [16] per-row rescale exp(m_old-m_new)
 #define TQ_AMM_QTMP    4400                 // [256] one node's normed+roped q
 #define TQ_AMM_QSC     4656                 // [16] per-node Q pow2 scale (mode 2)
-#define TQ_AMM_AMASK   4672                 // [16] ancestor slot bitmask per node
 #define TQ_AMM_RED     4688                 // [9] block-reduce scratch
 #define TQ_AMM_WORDS   4704
-#define TQ_ATTN_MMA_SMEM ((size_t)TQ_AMM_WORDS * 4)
 #define TQ_ATTN_SCORE_SLOTS 512             // [512 x max_seq] gmem score/partial slab
 #define TQ_AMM_NINF    (-3.402823466e38f)   // finite -inf stand-in (exp underflows to 0)
 
@@ -438,18 +419,3 @@ static __device__ __forceinline__ void tq_mma_bf16_m16n8k16(float *c, const uint
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
-static __device__ __forceinline__ void tq_mma_e4m3_m16n8k32(float *c, const uint32_t *a,
-                                                            uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
-          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-}
-
-static __device__ __forceinline__ uint32_t tq_pack_e4m3x4(float x0, float x1, float x2,
-                                                          float x3) {
-    return (uint32_t)tq_float_to_e4m3(x0) | ((uint32_t)tq_float_to_e4m3(x1) << 8) |
-           ((uint32_t)tq_float_to_e4m3(x2) << 16) | ((uint32_t)tq_float_to_e4m3(x3) << 24);
-}

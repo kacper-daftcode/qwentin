@@ -1,5 +1,45 @@
-// the paged KV pool: KV write kernels and the trellis page encoder.
+// the paged KV pool: per-slot argmax and state sizes, KV write kernels and the trellis page encoder.
 // Part of the forward_qwen.cu unity build: included in order, not a standalone header.
+
+// Per-client greedy argmax over [N x V] logits (one block/client, lowest-index tie-break).
+__global__ void k_tq_batched_argmax(int *out_ids, const float *logits, int V, int N) {
+    tq_pdl_enter();
+    int c = blockIdx.x;
+    if (c >= N) return;
+    const float *row = logits + (size_t)c * V;
+    int tid = threadIdx.x, bs = blockDim.x;
+    float best = -3.402823466e38f; int besti = 0;
+    for (int i = tid; i < V; i += bs) {
+        float v = row[i];
+        if (v > best) { best = v; besti = i; }
+    }
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    sv[tid] = best; si[tid] = besti;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_ids[c] = si[0];
+}
+
+// (scale,zp) element size for the Q4 K scale store (fp16).
+static size_t batched_q4s_elem_bytes(void) { return sizeof(__half); }
+
+static int batched_recur_floats(void) {
+    return g_qwen.linear_num_value_heads * g_qwen.linear_key_head_dim * g_qwen.linear_value_head_dim;
+}
+static int batched_conv_floats(void) {
+    int key_dim = g_qwen.linear_num_key_heads * g_qwen.linear_key_head_dim;
+    int value_dim = g_qwen.linear_num_value_heads * g_qwen.linear_value_head_dim;
+    int conv_dim = 2 * key_dim + value_dim;
+    return conv_dim * g_qwen.linear_conv_kernel_dim;
+}
 
 // ============== Roadmap E milestone 3: PAGED KV + continuous batching ==============
 // Replaces the contiguous bat_ctx-per-client KV slab with a shared POOL of fixed-size
@@ -778,12 +818,9 @@ static int paged_linear_core(tq_layer_t *l, float *core_base, void *recur_base,
                              int recur_f, int conv_dim, int value_dim, const int *positions) {
     int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
     int dim = g_qwen.linear_value_head_dim;
-    int lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
-    bool lc_par_ok = lc_g > 0 && dim == 128 && dim * lc_g <= 1024;      // the paged cores unroll over dim == 128
-    bool lc_hs_ok = lc_par_ok && lc_hs >= 2 && (dim % lc_hs) == 0 && lc_g >= lc_hs &&
-                    ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) ||
-                     (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
-    if (!lc_hs_ok) return -1;
+    // 8 threads per state element, each head split over 4 blocks (fills 170 SMs); the cores unroll over dim == 128
+    const int lc_g = 8, lc_hs = 4;
+    if (dim != 128) return -1;
     size_t shA = (size_t)3 * dim * sizeof(float), shB = (size_t)dim * sizeof(float);
     int blkA = (dim / lc_hs) * lc_g;
     dim3 gridA(heads * lc_hs, N);
@@ -798,11 +835,7 @@ static int paged_linear_core(tq_layer_t *l, float *core_base, void *recur_base,
         else if (g_pg_dstate == 3) PAGED_CORE_HS1(GG, HH, 3);                          \
         else if (g_pg_dstate == 4) PAGED_CORE_HS1(GG, HH, 4);                          \
         else PAGED_CORE_HS1(GG, HH, 0); } while (0)
-    if (lc_g == 8 && lc_hs == 8) PAGED_CORE_HS(8, 8);
-    else if (lc_g == 8 && lc_hs == 4) PAGED_CORE_HS(8, 4);
-    else if (lc_g == 8 && lc_hs == 2) PAGED_CORE_HS(8, 2);
-    else if (lc_g == 4 && lc_hs == 4) PAGED_CORE_HS(4, 4);
-    else PAGED_CORE_HS(4, 2);
+    PAGED_CORE_HS(8, 4);
     #undef PAGED_CORE_HS
     #undef PAGED_CORE_HS1
     // gated norm: IO is column-major -> identity ids (the merged _b kernel reads node=ids[col]).

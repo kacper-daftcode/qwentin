@@ -1,71 +1,18 @@
-// prefill attention: wide flash-causal, MMA wide prefill, the GQA-grouped trellis-pool kernel (TQ_PATTN_GQA).
+// prefill attention: wide flash-causal, MMA wide prefill, the GQA-grouped trellis-pool kernel (TQ_PATTN_GQA); cp.async helpers.
 // Part of the forward_qwen.cu unity build: included in order, not a standalone header.
 
-// ===================== D.1 (2): wide flash-causal prefill attention =====================
-// A dedicated N-wide full attention for a prefill chunk, with NO 16-slot archive (the
-// k_tq_spec_attn_tree_mma archive overflows for chunks > ~16 and corrupts long context).
-// It mirrors k_tq_full_attn_decode_arr EXACTLY -- q/k RMSNorm over hd, partial RoPE
-// (rotary_dim 64, rotate-half +-32 pairing), GQA head->kv_head map, the
-// tq_attn_tail_pp online softmax, and the sigmoid(gate) fold -- but processes N query
-// tokens in one launch by reading straight from the fp32 KV cache rows [0..pos]
-// (pos = positions[token]) instead of a per-chunk archive tile.
-//
-// Two phases, launched in order on the same stream (so phase 1 finishes first):
-//   (1) k_tq_wide_attn_kv_write : write every chunk token's normed+roped K and raw V
-//       into the live cache at its absolute slot, so token i can attend causally to
-//       the earlier chunk tokens 0..i-1 (and itself) -- identical bytes to the K/V
-//       store inside k_tq_full_attn_decode_arr.
-//   (2) k_tq_wide_attn          : each (head, token) block runs the dense online
-//       softmax over cache rows [0..pos]. Scores live in DYNAMIC SHARED (pos+1 floats),
-//       so there is no nh*N*max_seq gmem scores slab; tq_attn_tail_pp does not care
-//       whether `scores` is gmem or smem (same write-then-read, same reduction order).
-// Running this pair is bit-identical to invoking k_tq_full_attn_decode_arr once per
-// chunk token in ascending order against the same prefix cache.
-// SCOPE: fp32 KV cache only. TQ_KV_FP8 / TQ_KV_Q4 are a deliberate TODO (the callers
-// reject those modes); the fp8/q4 K/V store + tail variants are not wired here yet.
-
-__global__ void k_tq_wide_attn_kv_write(
-    float *k_cache, float *v_cache,
-    const float *k_proj_base, const float *v_proj_base,
-    const uint16_t *k_norm_w, const int *positions,
-    int nkv, int hd, int kv_m, float eps, float rope_theta) {
-    __shared__ float partial[8];
-    __shared__ float k_sum_shared;
-    int kv_head = blockIdx.x;
-    int i = blockIdx.y;          // chunk token index
-    int tid = threadIdx.x;
-    if (kv_head >= nkv || tid >= hd) return;
-    int pos = positions[i];
-    const float *k_proj = k_proj_base + (size_t)i * kv_m;
-    const float *v_proj = v_proj_base + (size_t)i * kv_m;
-    int rotary_dim = 64;
-    float kv = k_proj[kv_head * hd + tid];
-    float ksum = kv * kv;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        ksum += __shfl_down_sync(0xffffffff, ksum, offset);
-    if ((tid & 31) == 0) partial[tid >> 5] = ksum;
-    __syncthreads();
-    if (tid < 8) {
-        float vtmp = partial[tid];
-        for (int offset = 4; offset > 0; offset >>= 1) vtmp += __shfl_down_sync(0xff, vtmp, offset);
-        if (tid == 0) k_sum_shared = vtmp;
-    }
-    __syncthreads();
-    kv = kv * rsqrtf(k_sum_shared / (float)hd + eps) * (1.0f + tq_bf16_to_float(k_norm_w[tid]));
-    if (tid < rotary_dim) {
-        int idx = tid & 31;
-        float freq = powf(rope_theta, -((float)(2 * idx) / (float)rotary_dim));
-        float angle = (float)pos * freq;
-        float c = cosf(angle);
-        float s = sinf(angle);
-        float k_pair = k_proj[kv_head * hd + ((tid < 32) ? tid + 32 : tid - 32)];
-        k_pair = k_pair * rsqrtf(k_sum_shared / (float)hd + eps) * (1.0f + tq_bf16_to_float(k_norm_w[(tid < 32) ? tid + 32 : tid - 32]));
-        float k_rot = (tid < 32) ? -k_pair : k_pair;
-        kv = kv * c + k_rot * s;
-    }
-    k_cache[((size_t)pos * nkv + kv_head) * hd + tid] = kv;
-    v_cache[((size_t)pos * nkv + kv_head) * hd + tid] = v_proj[kv_head * hd + tid];
+static __device__ __forceinline__ void tq_cp_async16(uint32_t dst_smem, const void *src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_smem), "l"(src));
 }
+static __device__ __forceinline__ void tq_cp_async8(uint32_t dst_smem, const void *src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(dst_smem), "l"(src));
+}
+static __device__ __forceinline__ void tq_cp_async4(uint32_t dst_smem, const void *src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst_smem), "l"(src));
+}
+
+static int ensure_attn_scores(void);   // defined with the other host helpers below
+static int paged_sm_count(void);       // cached multiProcessorCount (defined below)
 
 // Flash key-chunk size: the cache rows [0..pos] are processed in fixed-width chunks
 // with a running online softmax, so the per-block shared-memory footprint is O(chunk)
@@ -77,137 +24,12 @@ __global__ void k_tq_wide_attn_kv_write(
 #define TQ_WIDE_ATTN_CHUNK 2048
 #endif
 
-// Flash-style key-chunked rewrite of the wide-prefill full attention (D.1(2) ctx fix).
-// Per (head, query-token) block it walks the fp32 KV cache rows [0..pos] in
-// TQ_WIDE_ATTN_CHUNK-sized chunks, keeping the softmax running max/denom in shared
-// memory and the per-thread output column (dim = tid) in a register, rescaling on each
-// chunk exactly like tq_attn_mma_block's flash-decoding split. The q/k RMSNorm + partial
-// RoPE prologue and the dot*rsqrt(hd) score scaling are byte-for-byte the same as the
-// per-token reference k_tq_full_attn_decode_arr / tq_attn_tail_pp; only the softmax
-// reduction is tiled (chunked m/l rescale) instead of one flat pass over a pos-sized
-// score buffer, so the result is mathematically identical and matches the reference to
-// fp reassociation (~1e-6), far inside the 1e-3 gate. fp32 KV only (fp8/q4 TODO).
-__global__ void k_tq_wide_attn(
-    float *out, const float *q_proj_base, const uint16_t *q_norm_w,
-    const float *k_cache, const float *v_cache,
-    const int *positions, int nh, int nkv, int hd, int q_m, int attn_m,
-    float eps, float rope_theta) {
-    __shared__ float partial[8];
-    __shared__ float q_sum_shared;
-    __shared__ float qn[256];                       // normed+roped q, persists across chunks
-    __shared__ float s_chunk[TQ_WIDE_ATTN_CHUNK];   // one chunk of scores/probs (O(chunk))
-    __shared__ float red[256];                      // block-reduce scratch (chunk max/sum)
-    __shared__ float m_run, l_run;                  // running online-softmax max / denom
-    int head = blockIdx.x;
-    int i = blockIdx.y;          // chunk token index
-    int tid = threadIdx.x;
-    if (head >= nh || tid >= hd) return;
-    int pos = positions[i];
-    int group = nh / nkv;
-    int kv_head = head / group;
-    int rotary_dim = 64;
-    const float *q_proj = q_proj_base + (size_t)i * q_m;
-    float qv = q_proj[head * (2 * hd) + tid];
-    float qsum = qv * qv;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        qsum += __shfl_down_sync(0xffffffff, qsum, offset);
-    if ((tid & 31) == 0) partial[tid >> 5] = qsum;
-    __syncthreads();
-    if (tid < 8) {
-        float vtmp = partial[tid];
-        for (int offset = 4; offset > 0; offset >>= 1) vtmp += __shfl_down_sync(0xff, vtmp, offset);
-        if (tid == 0) q_sum_shared = vtmp;
-    }
-    __syncthreads();
-    qv = qv * rsqrtf(q_sum_shared / (float)hd + eps) * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
-    if (tid < rotary_dim) {
-        int idx = tid & 31;
-        float freq = powf(rope_theta, -((float)(2 * idx) / (float)rotary_dim));
-        float angle = (float)pos * freq;
-        float c = cosf(angle);
-        float s = sinf(angle);
-        float q_pair = q_proj[head * (2 * hd) + ((tid < 32) ? tid + 32 : tid - 32)];
-        q_pair = q_pair * rsqrtf(q_sum_shared / (float)hd + eps) * (1.0f + tq_bf16_to_float(q_norm_w[(tid < 32) ? tid + 32 : tid - 32]));
-        float q_rot = (tid < 32) ? -q_pair : q_pair;
-        qv = qv * c + q_rot * s;
-    }
-    qn[tid] = qv;
-    if (tid == 0) { m_run = -3.402823466e38f; l_run = 0.0f; }
-    __syncthreads();
-
-    // Flash online softmax over the causal prefix rows [0..pos] of the fp32 cache. Each
-    // cache row is [t][kv_head][hd]; stride between rows is nkv*hd. Thread `tid` owns
-    // output dim `tid` and keeps its running (rescaled) numerator in the register `acc`.
-    const float *kc = k_cache + (size_t)kv_head * hd;
-    const float *vc = v_cache + (size_t)kv_head * hd;
-    size_t cstride = (size_t)nkv * hd;
-    int warp = tid >> 5, lane = tid & 31;
-    float scale = rsqrtf((float)hd);
-    float acc = 0.0f;
-    int total = pos + 1;
-    for (int c0 = 0; c0 < total; c0 += TQ_WIDE_ATTN_CHUNK) {
-        int clen = total - c0;
-        if (clen > TQ_WIDE_ATTN_CHUNK) clen = TQ_WIDE_ATTN_CHUNK;
-        // (1) scores for this chunk: one warp per row, 8 dims/lane, warp-reduced dot.
-        for (int j = warp; j < clen; j += 8) {
-            const float *krow = kc + (size_t)(c0 + j) * cstride;
-            float dot = 0.0f;
-            #pragma unroll
-            for (int e = 0; e < 8; e++) { int d = lane + 32 * e; dot += qn[d] * krow[d]; }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
-            if (lane == 0) s_chunk[j] = dot * scale;
-        }
-        __syncthreads();
-        // (2) chunk max (block reduce over s_chunk[0..clen)).
-        float m = -3.402823466e38f;
-        for (int j = tid; j < clen; j += 256) if (s_chunk[j] > m) m = s_chunk[j];
-        red[tid] = m;
-        __syncthreads();
-        for (int s = 128; s > 0; s >>= 1) {
-            if (tid < s && red[tid + s] > red[tid]) red[tid] = red[tid + s];
-            __syncthreads();
-        }
-        float m_chunk = red[0];
-        __syncthreads();
-        // (3) running-max update + rescale factor (m_run = -inf on chunk 0 -> alpha = 0).
-        float m_old = m_run;
-        float m_new = fmaxf(m_old, m_chunk);
-        float alpha = expf(m_old - m_new);
-        // (4) probabilities exp(score - m_new) (overwrite s_chunk) + chunk denom.
-        float lsum = 0.0f;
-        for (int j = tid; j < clen; j += 256) {
-            float p = expf(s_chunk[j] - m_new);
-            s_chunk[j] = p;
-            lsum += p;
-        }
-        red[tid] = lsum;
-        __syncthreads();
-        for (int s = 128; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            __syncthreads();
-        }
-        float l_chunk = red[0];
-        // (5) rescale the running numerator and fold in this chunk's weighted V column.
-        acc *= alpha;
-        for (int j = 0; j < clen; j++)
-            acc += s_chunk[j] * vc[(size_t)(c0 + j) * cstride + tid];
-        if (tid == 0) { l_run = l_run * alpha + l_chunk; m_run = m_new; }
-        __syncthreads();
-    }
-    float ratio = acc / l_run;
-    float gate = q_proj[head * (2 * hd) + hd + tid];
-    out[(size_t)i * attn_m + head * hd + tid] = ratio * (1.0f / (1.0f + expf(-gate)));
-}
-
 // ===== milestone 3.6: MMA (tensor-core) wide-prefill attention (fp32 KV) =====
 // PREFILL attention is COMPUTE-bound (~170 FLOP/byte: 16 query rows reuse the same K), so
 // tensor cores win here (unlike the memory-bound decode, kept scalar). Clean causal flash
 // attention -- 16-query m16 tiles (grid.y = ceil(N/16)) attend the fp32 KV cache causally
 // (per-row STAIRCASE mask: token attends keys [0..its pos]), MMA Q.K^T -> online softmax ->
-// MMA P.V. Reuses tq_attn_mma_block's mode-1 fragment layout / helpers; NO spec-tree /
-// ancestor / archive machinery (that path stays intact). Replaces the scalar k_tq_wide_attn
-// where it beats the baseline tensor-core path (>~16k), lifting the wide-prefill ctx cap.
+// MMA P.V (smem layout: the TQ_AMM_* table in kv_cache.cuh).
 // Key-split (gridDim.z = S > 1): the causal key range [0..maxpos] is cut into S
 // even super-tile chunks -- one (head, qtile, kchunk) block each -- so a long
 // prefix no longer serializes in nh x ceil(N/16) blocks (192 blocks left half
@@ -976,24 +798,6 @@ static __device__ __forceinline__ uint32_t tq_pa_pack_f16(float lo, float hi) {
     asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
     return d;
 }
-// Decode 32 trellis values (dims 32 g .. 32 g + 31 of one row) from the row's 16 code bytes at byte 16 g (cw) and the
-// code byte before them (prevb; the prefix byte at g = 0) into raw fp16 table values, 8 per 16-byte store.
-static __device__ __forceinline__ void tq_pa_dequant32(const uint4 cw, uint32_t prevb, const uint16_t *tab, uint4 *dst) {
-    const uint32_t w[4] = {cw.x, cw.y, cw.z, cw.w};
-    #pragma unroll
-    for (int k = 0; k < 4; k++) {
-        const uint32_t lowb = (k == 0) ? prevb : (w[k - 1] >> 24);
-        const uint32_t x = (w[k] << 8) | lowb, y = w[k] >> 24;
-        uint32_t v[4];
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const uint32_t pr = __funnelshift_r(x, y, 8 * j);
-            v[j] = (uint32_t)tab[pr & 0xFFFu] | ((uint32_t)tab[(pr >> 4) & 0xFFFu] << 16);
-        }
-        dst[k] = make_uint4(v[0], v[1], v[2], v[3]);
-    }
-}
-
 // G = q heads per kv head; QH = 1: the Q A-fragments of chunks 8..15 live in smem (32 KB, one LDS.128 per chunk and
 // tile) instead of registers (frees 32 registers); AQ = 1: Q.K^T accumulates in fp16 over TQ_PA_FOLD chunks and folds
 // into the fp32 scores; AP = 1: P.V accumulates the tile's 32 keys in fp16 per 8-n-tile group and folds into the
@@ -1496,64 +1300,3 @@ static int wide_attn_mma_enabled(void) {
     return c;
 }
 
-// Launch the wide-attn pair for a chunk of N tokens (fp32 KV only). `positions` is a
-// device array of the N absolute slots; max_pos is their maximum (the dynamic scores
-// smem size). k_proj_base/v_proj_base/q_proj_base hold the RAW (un-normed) projections
-// laid out [token][proj]. Returns 0 on success, negative on launch error.
-static int launch_wide_attn(float *out, const float *q_proj, const uint16_t *q_norm_w,
-                            const float *k_proj, const float *v_proj, const uint16_t *k_norm_w,
-                            float *k_cache, float *v_cache, const int *positions,
-                            int N, int max_pos, cudaStream_t st) {
-    int nh = g_qwen.nh, nkv = g_qwen.nkv, hd = g_qwen.hd;
-    int q_m = nh * hd * 2, kv_m = nkv * hd, attn_m = nh * hd;
-    k_tq_wide_attn_kv_write<<<dim3(nkv, N), hd, 0, st>>>(
-        k_cache, v_cache, k_proj, v_proj, k_norm_w, positions, nkv, hd, kv_m,
-        g_qwen.eps, g_qwen.rope_theta);
-    // Flash key-chunking: k_tq_wide_attn now uses a fixed O(TQ_WIDE_ATTN_CHUNK) static
-    // shared-memory footprint (a few KB), so there is NO dynamic smem and no opt-in cap
-    // to raise as context grows -- this is exactly what removes the old O(pos)-smem launch
-    // failure (-11) at ctx ~32k. `max_pos` is retained only for ABI compatibility.
-    (void)max_pos;
-    if (wide_attn_mma_enabled()) {       // tensor-core prefill attention (compute-bound regime)
-        int nqt = (N + 15) / 16;
-        int S = wide_attn_split_S(max_pos);
-        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
-            S = 1;
-        k_tq_wide_attn_mma<1, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
-            out, q_proj, q_norm_w, k_cache, v_cache, NULL, NULL, NULL, NULL, positions,
-            0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m,
-            g_qwen.eps, g_qwen.rope_theta, g_wide_attn_part);
-        if (S > 1)
-            k_tq_wide_attn_mma_merge<1><<<dim3(nh, nqt), 256, 0, st>>>(
-                out, q_proj, N, nh, hd, q_m, attn_m, S, g_wide_attn_part);
-    } else {
-        k_tq_wide_attn<<<dim3(nh, N), hd, 0, st>>>(
-            out, q_proj, q_norm_w, k_cache, v_cache, positions, nh, nkv, hd, q_m, attn_m,
-            g_qwen.eps, g_qwen.rope_theta);
-    }
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
-}
-
-__global__ void k_tq_spec_archive_kv(float *dst, const float *cache, const int *pos_arr,
-                                      int node_idx, int kv_m,
-                                      const uint8_t *cache8, const float *cscale,
-                                      int nkv, int hd,
-                                      const uint8_t *cache4, const float *cq4s) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= kv_m) return;
-    int pos = pos_arr[node_idx];
-    if (cache4) {   // int4 K cache -> fp32 archive (stays in the ROTATED space)
-        uint8_t byte = cache4[((size_t)pos * kv_m + tid) >> 1];
-        float code = (float)((tid & 1) ? (byte >> 4) : (byte & 15));
-        int kv_head = tid / hd, g = (tid % hd) >> 5;
-        const float *sz = q4s_adv(cq4s, ((size_t)pos * nkv + kv_head) * 16 + 2 * g);
-        dst[tid] = (code - q4s_at(sz, 1)) * q4s_at(sz, 0);
-        return;
-    }
-    if (cache8) {   // FP8 cache -> fp32 archive (dequant; arch stays fp32)
-        dst[tid] = tq_e4m3_dec_fast(cache8[(size_t)pos * kv_m + tid]) *
-                   cscale[(size_t)pos * nkv + tid / hd];
-        return;
-    }
-    dst[tid] = cache[(size_t)pos * kv_m + tid];
-}

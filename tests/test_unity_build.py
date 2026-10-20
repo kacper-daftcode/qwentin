@@ -27,4 +27,4 @@ def test_unity_file_holds_only_includes():
 
 
 def test_engine_text_is_the_whole_source():
-    assert len(engine_text.engine_source_text(ROOT)) > 1_000_000
+    assert len(engine_text.engine_source_text(ROOT)) > 500_000

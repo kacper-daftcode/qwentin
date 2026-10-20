@@ -1,4 +1,4 @@
-// EXL3 trellis weights (dequant GEMM / GEMV, launchers) and the single-stream wide prefill entry points.
+// EXL3 trellis weights (dequant GEMM / GEMV, launchers).
 // Part of the forward_qwen.cu unity build: included in order, not a standalone header.
 
 // ===== EXL3 trellis weights on the wide path (TQ_FLAG_EXL3_WEIGHTS) =====
@@ -969,15 +969,15 @@ static int wide_quant_input(const float *d_x, int K, int N) {
 }
 
 // run one wide projection from the prepared B-frag (call wide_quant_input first).
-// wide path accepts E2M3 (6-bit) OR E2M1 (4-bit, throughput tier via TQ_W_E2M1 repack), both SF.
+// the wide path takes E2M3 (6-bit) block-scaled weights (or EXL3).
 static inline int tq_wide_fmt_ok(const tq_qmma_weight_t *w) {
     if (w->exl3) return 1;
-    return can_use_qmma_sf_weight(w) && !w->row_major && (w->e2m3 || w->e2m1);
+    return can_use_qmma_sf_weight(w) && !w->row_major && w->e2m3;
 }
 
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (w->exl3) return exl3_wide_proj(w, out, N);
-    if (!can_use_qmma_sf_weight(w) || w->row_major || !(w->e2m3 || w->e2m1)) return -90;
+    if (!can_use_qmma_sf_weight(w) || w->row_major || !w->e2m3) return -90;
     int k_splits = qmma_sf_k_split_auto(w->Mt, w->Kt);
     if (k_splits > 1) {
         size_t need = (size_t)k_splits * N * w->M * sizeof(float);
@@ -988,8 +988,6 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
             g_wproj_part_bytes = need;
         }
     }
-    if (w->e2m1)
-        return launch_fp4_wide_gemm(out, w, g_wproj_b, g_wproj_bscale, N, g_wproj_part, k_splits, g_qwen.stream);
     return launch_fp6_wide_gemm(out, w, g_wproj_b, g_wproj_bscale, N, g_wproj_part, k_splits, g_qwen.stream);
 }
 
@@ -1107,254 +1105,3 @@ extern "C" int qwn_wide_linear_bench(int layer, int which, int N, int iters, flo
     return ret;
 }
 
-static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
-    int H = g_qwen.H;
-    int q_m = g_qwen.nh * g_qwen.hd * 2, kv_m = g_qwen.nkv * g_qwen.hd, attn_m = g_qwen.nh * g_qwen.hd;
-    int ret = ensure_wide_prefill_buffers(n);
-    if (ret != 0) return -50;
-    if (ensure_debug_vectors(0) != 0) return -51;
-    if (ensure_float_buffer(&g_qwen.d_debug_core, &g_qwen.debug_core_count, attn_m, "d_debug_core") != 0) return -51;
-    if (ensure_float_buffer(&g_qwen.d_debug_resid, &g_qwen.debug_resid_count, H, "d_debug_resid") != 0) return -51;
-    if (ensure_attn_scores() != 0) return -52;
-    if (!g_wide_capture_mode) {   // host malloc + sync -> not capturable; skip during replay capture
-        int *hp = (int *)malloc((size_t)n * sizeof(int));
-        if (!hp) return -53;
-        for (int i = 0; i < n; i++) hp[i] = base_pos + 1 + i;   // token i -> absolute slot
-        cudaMemcpyAsync(g_wide_pos, hp, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-        cudaStreamSynchronize(g_qwen.stream);
-        free(hp);
-    }
-    int max_pos = base_pos + n;                                 // = positions[n-1]
-    for (int i = 0; i < n; i++)
-        k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
-            g_wide_h + (size_t)i * H, g_qwen.d_embed, tokens[i], H);
-    for (int L = 0; L < g_qwen.L; L++) {
-        tq_layer_t *l = &g_qwen.layers[L];
-        rmap_hook_after_layer(L - 1, g_wide_h, n);
-        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
-            // (a) batched rmsnorm + RAW q/k/v projections -> batched [token][proj].
-            // WIDE path (k_tq_fp6_wide_gemm, one weight read for all n tokens) when the
-            // projections are e2m3-SF; otherwise per-token fallback. q/k norm is applied
-            // later inside launch_wide_attn, so these are the raw projections.
-            if (l->q_proj.e2m3 && l->k_proj.e2m3 && l->v_proj.e2m3 &&
-                can_use_qmma_sf_weight(&l->q_proj) && !l->q_proj.row_major) {
-                k_tq_qwen_rmsnorm_b<<<dim3(8, n), 1024, 0, g_qwen.stream>>>(
-                    g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
-                if ((ret = wide_quant_input(g_wide_norm, H, n)) != 0) return -54;
-                if ((ret = wide_proj(&l->q_proj, g_wide_q, n)) != 0) return -54;
-                if ((ret = wide_proj(&l->k_proj, g_wide_k, n)) != 0) return -55;
-                if ((ret = wide_proj(&l->v_proj, g_wide_v, n)) != 0) return -56;
-            } else {
-                for (int i = 0; i < n; i++) {
-                    cudaMemcpyAsync(g_qwen.d_debug_x, g_wide_h + (size_t)i * H,
-                                    (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    k_tq_qwen_rmsnorm<<<8, 1024, 0, g_qwen.stream>>>(g_qwen.d_debug_norm, g_qwen.d_debug_x,
-                                                   l->d_input_ln, H, g_qwen.eps);
-                    if ((ret = run_qmma_projection_from_input_to_buffer(&l->q_proj, g_qwen.d_debug_norm,
-                                                  g_wide_q + (size_t)i * q_m, q_m)) != 0) return -54;
-                    if ((ret = run_qmma_projection_from_input_to_buffer(&l->k_proj, g_qwen.d_debug_norm,
-                                                  g_wide_k + (size_t)i * kv_m, kv_m)) != 0) return -55;
-                    if ((ret = run_qmma_projection_from_input_to_buffer(&l->v_proj, g_qwen.d_debug_norm,
-                                                  g_wide_v + (size_t)i * kv_m, kv_m)) != 0) return -56;
-                }
-            }
-            // (b) batched wide attention straight to the live KV cache (no archive). Q4(K)+E4M3(V)
-            // when TQ_KV_Q4 (shared cache -> {strides}=0, every chunk token attends [0..pos] of the
-            // one sequence's Q4 cache), else fp32.
-            if (g_qwen.kv_q4) {
-                if (launch_batched_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
-                                           l->d_k_cache4, l->d_k_q4s, l->d_v_cache8, l->d_v_scale,
-                                           g_wide_pos, n, max_pos, 0, 0, 0, 0, g_qwen.stream) != 0)
-                    return -57;
-            } else if (launch_wide_attn(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
-                                 l->d_k_cache, l->d_v_cache, g_wide_pos, n, max_pos, g_qwen.stream) != 0) {
-                return -57;
-            }
-            // (c) o_proj WIDE (+residual) then WIDE MLP -> updated hidden. o_proj input is
-            // g_wide_core [n x attn_m]; resid = h + o_proj(core); then wide gate/up/down.
-            int wide_ok = l->o_proj.e2m3 && can_use_qmma_sf_weight(&l->o_proj) && !l->o_proj.row_major &&
-                          l->mlp_gate.e2m3 && l->mlp_down.e2m3;
-            if (wide_ok) {
-                if ((ret = wide_quant_input(g_wide_core, attn_m, n)) != 0) return -58;
-                if ((ret = wide_proj(&l->o_proj, g_wide_o, n)) != 0) return -58;
-                k_tq_add_vec<<<((size_t)n * H + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    g_wide_resid, g_wide_h, g_wide_o, (size_t)n * H);
-                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, n)) != 0) return -59;
-            } else {
-                for (int i = 0; i < n; i++) {
-                    cudaMemcpyAsync(g_qwen.d_debug_x, g_wide_h + (size_t)i * H,
-                                    (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    cudaMemcpyAsync(g_qwen.d_debug_core, g_wide_core + (size_t)i * attn_m,
-                                    (size_t)attn_m * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    if ((ret = run_qmma_projection_from_input_add_to_buffer(&l->o_proj, g_qwen.d_debug_core,
-                                                  g_qwen.d_debug_x, g_qwen.d_debug_resid, H)) != 0) return -58;
-                    if ((ret = run_mlp_from_resid_to_layer_out(L)) != 0) return -59;
-                    cudaMemcpyAsync(g_wide_h + (size_t)i * H, g_qwen.d_debug_layer_out,
-                                    (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                }
-            }
-        } else {   // linear-attention (DeltaNet): WIDE projections + SEQUENTIAL recurrence.
-            // in_proj_qkv/z/b/a + out_proj + MLP go WIDE (one weight read for n tokens);
-            // the conv + gated-delta recurrence stays per-token (token i advances the live
-            // conv/recurrent state from i-1). Falls back to per-token decode otherwise.
-            int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
-            int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
-            int lin_wide = l->linear_in_qkv.e2m3 && l->linear_in_z.e2m3 && l->linear_in_b.e2m3 &&
-                           l->linear_in_a.e2m3 && l->linear_out.e2m3 && l->mlp_gate.e2m3 && l->mlp_down.e2m3 &&
-                           can_use_qmma_sf_weight(&l->linear_in_qkv) && !l->linear_in_qkv.row_major;
-            if (lin_wide) {
-                k_tq_qwen_rmsnorm_b<<<dim3(8, n), 1024, 0, g_qwen.stream>>>(
-                    g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
-                if ((ret = wide_quant_input(g_wide_norm, H, n)) != 0) return -60;
-                if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, n)) != 0) return -60;
-                if ((ret = wide_proj(&l->linear_in_z, g_wide_z, n)) != 0) return -60;
-                if ((ret = wide_proj(&l->linear_in_b, g_wide_b, n)) != 0) return -60;
-                if ((ret = wide_proj(&l->linear_in_a, g_wide_a, n)) != 0) return -60;
-                // Chunk-parallel conv (one launch; position taps read the raw chunk buffer,
-                // block y==n refreshes the state) -- bit-exact vs the old n serial per-token
-                // launches, which were 9.5% of a 64k prefill (3.1M launches x 1.3 us) purely
-                // from launch/serialization overhead. kernel_size > 8 falls back to serial.
-                static int wide_conv_on = -1;
-                if (wide_conv_on < 0) {
-                    const char *e = getenv("TQ_WIDE_CONV");
-                    wide_conv_on = (e && *e) ? (atoi(e) != 0) : 1;
-                }
-                if (wide_conv_on && g_qwen.linear_conv_kernel_dim <= 8) {
-                    k_tq_linear_conv_update_wide<<<dim3((conv_dim + 255) / 256, n + 1), 256, 0,
-                                                   g_qwen.stream>>>(
-                        g_wide_conv, l->d_linear_conv_state, g_wide_qkv, l->d_linear_conv1d,
-                        conv_dim, g_qwen.linear_conv_kernel_dim, n);
-                } else {
-                    for (int i = 0; i < n; i++)
-                        k_tq_linear_conv_update<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
-                            g_wide_conv + (size_t)i * conv_dim, l->d_linear_conv_state,
-                            g_wide_qkv + (size_t)i * conv_dim, l->d_linear_conv1d, conv_dim,
-                            g_qwen.linear_conv_kernel_dim);
-                }
-                // ONE chunkwise-parallel gated-delta core over all n tokens, replacing the 128
-                // serial per-token k_tq_linear_decode_core_gated launches (was 73.9% of prefill;
-                // 15.3x faster, max diff 9.9e-6 vs per-token). config ck=8/nstripe=2/g=8.
-                if ((ret = launch_deltanet_chunk_hs(8, 2, 8, g_wide_lcore, l->d_linear_recurrent_state,
-                        g_wide_conv, g_wide_z, g_wide_b, g_wide_a,
-                        l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_norm,
-                        n, lvh, lkh, ld, g_qwen.eps, g_qwen.stream)) != 0) return -60;
-                if ((ret = wide_quant_input(g_wide_lcore, value_dim, n)) != 0) return -60;
-                if ((ret = wide_proj(&l->linear_out, g_wide_o, n)) != 0) return -60;
-                k_tq_add_vec<<<((size_t)n * H + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    g_wide_resid, g_wide_h, g_wide_o, (size_t)n * H);
-                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, n)) != 0) return -60;
-            } else {
-                for (int i = 0; i < n; i++) {
-                    cudaMemcpyAsync(g_qwen.d_debug_x, g_wide_h + (size_t)i * H,
-                                    (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                    if ((ret = run_linear_layer_decode_from_current(L)) != 0) return -60;
-                    cudaMemcpyAsync(g_wide_h + (size_t)i * H, g_qwen.d_debug_layer_out,
-                                    (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-                }
-            }
-        }
-    }
-    rmap_hook_after_layer(g_qwen.L - 1, g_wide_h, n);
-    return cudaGetLastError() == cudaSuccess ? 0 : -61;
-}
-
-// Wide prefill chunk ABI (mirrors qwn_prefill_chunk's signature): tokens[i] lands at
-// absolute position base_pos+1+i. NO TQ_SPEC_MAX_N cap -- the chunk can be 128+ wide.
-// out_argmax (optional) = greedy argmax at the last chunk position (continuation seed).
-extern "C" int qwn_prefill_wide(const int *tokens, int base_pos, int n, int *out_argmax) {
-    if (!g_qwen.initialized) return -1;
-    if (n < 1) return -2;
-    if (g_qwen.kv_fp8 && !g_qwen.kv_q4) return -3;             // fp32 or Q4(K)+E4M3(V); pure-FP8 not ported
-    if (base_pos + n + 1 > g_qwen.max_seq) return -4;
-    int ret = run_wide_chunk_forward(tokens, base_pos, n);
-    if (ret != 0) return ret;
-    if (out_argmax) {
-        cudaMemcpyAsync(g_qwen.d_debug_x, g_wide_h + (size_t)(n - 1) * g_qwen.H,
-                        (size_t)g_qwen.H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
-        if (run_final_norm_device() != 0) return -5;
-        if (run_lm_head_argmax_device() != 0) return -6;
-        if (cudaMemcpyAsync(out_argmax, g_qwen.d_debug_arg_ids + TQ_ARGMAX_BLOCKS, sizeof(int),
-                            cudaMemcpyDeviceToHost, g_qwen.stream) != cudaSuccess) return -7;
-    }
-    return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -8;
-}
-
-// D.1 trunk bridge: build the MTP draft trunk over a wide-prefill chunk that was just
-// forwarded by qwn_prefill_wide (g_wide_h[0..m-1] = per-token pre-final-norm hidden at
-// positions pos0..pos0+m-1). toks[j] is the NEXT token (position pos0+j+1) that trunk
-// node j predicts -- identical contract to the baseline qwn_prefill_chunk +
-// qwn_mtp_advance_wave loop, but the hiddens are gathered from g_wide_h, so spec-decode
-// (qwn_spec_round / snapshot_root) can run after a wide prefill. The MTP head buffers are
-// 16-wide, so a chunk is processed in <=16-token sub-waves (matching the baseline grid).
-// REQUIRES g_wide_h to hold the chunk just forwarded (call right after qwn_prefill_wide,
-// before the next wide chunk overwrites it).
-extern "C" int qwn_wide_advance_trunk(const int *toks, int pos0, int m) {
-    if (!g_qwen.has_mtp_section) return -1;
-    if (m < 1) return -2;
-    if (!g_wide_h) return -3;                 // no wide chunk forwarded yet
-    if (!(g_qwen.mtp_quant_ready && mtp_quant_enabled())) {
-        int ret = ensure_mtp_quant();
-        if (ret != 0) return ret;
-    }
-    // mtp_advance_wave stages knorm/k/v through the spec scratch (d_spec_norm/kbuf/z); the
-    // wide forward never touches those (it uses g_wide_*), so allocate them here.
-    if (ensure_spec_buffers() != 0) return -4;
-    int off = 0;
-    while (off < m) {
-        int mm = (m - off < 16) ? (m - off) : 16;
-        int nodes[16];
-        for (int j = 0; j < mm; j++) nodes[j] = off + j;   // chunk-local row in g_wide_h
-        int ret = mtp_advance_wave(g_wide_h, nodes, toks + off, pos0 + off, mm);
-        if (ret != 0) return ret;
-        off += mm;
-    }
-    return 0;
-}
-
-// D.1 launch-overhead probe: time the wide chunk forward EAGER vs CUDA-GRAPH replay
-// (capture once with pos-setup skipped, replay iters x). Validates whether killing launch
-// overhead makes the wide prefill beat the ~700 tok/s persistent baseline, BEFORE the
-// device-param refactor needed for real cross-chunk graph reuse. Dummy tokens, fixed
-// base_pos -- TIMING ONLY (output unused).
-extern "C" int qwn_wide_prefill_graph_bench(int n, int iters, double *eager_ms, double *graph_ms) {
-    if (!g_qwen.initialized) return -1;
-    if (g_qwen.kv_fp8 || g_qwen.kv_q4) return -2;
-    if (n < 1) n = 1; if (iters < 1) iters = 1;
-    int base_pos = 4096;
-    if (base_pos + n + 1 > g_qwen.max_seq) base_pos = 0;
-    int *tok = (int *)malloc((size_t)n * sizeof(int));
-    if (!tok) return -3;
-    for (int i = 0; i < n; i++) tok[i] = (i * 131 + 7) % (g_qwen.V - 1);
-    g_wide_capture_mode = 0;
-    int ret = run_wide_chunk_forward(tok, base_pos, n);          // warmup: allocs, pos, smem cap
-    if (ret != 0 || cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) { free(tok); return ret ? ret : -4; }
-    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-    cudaEventRecord(e0, g_qwen.stream);
-    for (int it = 0; it < iters; it++) run_wide_chunk_forward(tok, base_pos, n);
-    cudaEventRecord(e1, g_qwen.stream); cudaEventSynchronize(e1);
-    float me = 0; cudaEventElapsedTime(&me, e0, e1);
-    if (eager_ms) *eager_ms = (double)me / iters;
-    g_wide_capture_mode = 1;
-    cudaGraph_t graph = NULL; cudaGraphExec_t exec = NULL;
-    cudaError_t ec = cudaStreamBeginCapture(g_qwen.stream, cudaStreamCaptureModeGlobal);
-    if (ec == cudaSuccess) run_wide_chunk_forward(tok, base_pos, n);
-    cudaError_t ee = cudaStreamEndCapture(g_qwen.stream, &graph);
-    g_wide_capture_mode = 0;
-    if (ec != cudaSuccess || ee != cudaSuccess || !graph) {
-        free(tok); cudaEventDestroy(e0); cudaEventDestroy(e1);
-        fprintf(stderr, "wide graph capture failed: begin=%s end=%s\n", cudaGetErrorString(ec), cudaGetErrorString(ee));
-        return -5;
-    }
-    if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
-        cudaGraphDestroy(graph); free(tok); cudaEventDestroy(e0); cudaEventDestroy(e1); return -6;
-    }
-    cudaGraphLaunch(exec, g_qwen.stream); cudaStreamSynchronize(g_qwen.stream);   // warm replay
-    cudaEventRecord(e0, g_qwen.stream);
-    for (int it = 0; it < iters; it++) cudaGraphLaunch(exec, g_qwen.stream);
-    cudaEventRecord(e1, g_qwen.stream); cudaEventSynchronize(e1);
-    float mg = 0; cudaEventElapsedTime(&mg, e0, e1);
-    if (graph_ms) *graph_ms = (double)mg / iters;
-    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
-    cudaEventDestroy(e0); cudaEventDestroy(e1); free(tok);
-    return 0;
-}

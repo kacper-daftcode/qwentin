@@ -280,12 +280,8 @@ static int vf_linear_core_seq(tq_layer_t *l, float *core_out, void *recur_base, 
                               const int *col_pos) {
     int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
     int dim = g_qwen.linear_value_head_dim;
-    int lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
-    bool lc_par_ok = lc_g > 0 && dim == 128 && dim * lc_g <= 1024;      // the paged cores unroll over dim == 128
-    bool lc_hs_ok = lc_par_ok && lc_hs >= 2 && (dim % lc_hs) == 0 && lc_g >= lc_hs &&
-                    ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) ||
-                     (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
-    if (!lc_hs_ok) return -1;
+    const int lc_g = 8, lc_hs = 4;                                      // paged_linear_core's split
+    if (dim != 128) return -1;
     size_t shA = (size_t)3 * dim * sizeof(float);
     int blkA = (dim / lc_hs) * lc_g;
     dim3 gridA(heads * lc_hs, nseg);
@@ -299,11 +295,7 @@ static int vf_linear_core_seq(tq_layer_t *l, float *core_out, void *recur_base, 
         else if (g_pg_dstate == 3) VF_CORE_HS1(GG, HH, 3);                                        \
         else if (g_pg_dstate == 4) VF_CORE_HS1(GG, HH, 4);                                        \
         else VF_CORE_HS1(GG, HH, 0); } while (0)
-    if (lc_g == 8 && lc_hs == 8) VF_CORE_HS(8, 8);
-    else if (lc_g == 8 && lc_hs == 4) VF_CORE_HS(8, 4);
-    else if (lc_g == 8 && lc_hs == 2) VF_CORE_HS(8, 2);
-    else if (lc_g == 4 && lc_hs == 4) VF_CORE_HS(4, 4);
-    else VF_CORE_HS(4, 2);
+    VF_CORE_HS(8, 4);
     #undef VF_CORE_HS
     #undef VF_CORE_HS1
     return 0;
@@ -622,10 +614,9 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
     if (g_vf_lp) {
         // all 48 linear layers in two launches (grid.z = layer): 48 x 8 x 192 blocks fill the GPU instead of 48 x 1.13
         // waves of a 1536-block launch; the per-thread math (and so the state) is the per-layer kernels' bit for bit
-        int heads = lvh, dim = ld, lc_g = linear_core_par_g(), lc_hs = linear_core_hs();
-        bool ok = lc_g > 0 && dim == 128 && lc_hs >= 2 && lc_g >= lc_hs &&
-                  ((lc_g == 8 && (lc_hs == 2 || lc_hs == 4 || lc_hs == 8)) || (lc_g == 4 && (lc_hs == 2 || lc_hs == 4)));
-        if (!ok) { g_pdl_small = 0; return -7; }
+        int heads = lvh, dim = ld;
+        const int lc_g = 8, lc_hs = 4;                                  // paged_linear_core's split
+        if (dim != 128) { g_pdl_small = 0; return -7; }
         tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged_all, dim3((conv_dim + 255) / 256, m, g_vf_nlin), dim3(256), 0,
                   g_qwen.stream, (const tq_vf_lp *)g_vf_lp, conv_dim, g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f);
         size_t shA = (size_t)3 * dim * sizeof(float);
@@ -639,11 +630,7 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
             else if (g_pg_dstate == 3) VF_CORE_ALL1(GG, HH, 3);                                   \
             else if (g_pg_dstate == 4) VF_CORE_ALL1(GG, HH, 4);                                   \
             else VF_CORE_ALL1(GG, HH, 0); } while (0)
-        if (lc_g == 8 && lc_hs == 8) VF_CORE_ALL(8, 8);
-        else if (lc_g == 8 && lc_hs == 4) VF_CORE_ALL(8, 4);
-        else if (lc_g == 8 && lc_hs == 2) VF_CORE_ALL(8, 2);
-        else if (lc_g == 4 && lc_hs == 4) VF_CORE_ALL(4, 4);
-        else VF_CORE_ALL(4, 2);
+        VF_CORE_ALL(8, 4);
         #undef VF_CORE_ALL
         #undef VF_CORE_ALL1
     } else {

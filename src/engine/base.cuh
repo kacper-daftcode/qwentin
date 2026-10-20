@@ -18,12 +18,11 @@
 #define TQ_DTYPE_FP16 1
 #define TQ_DTYPE_BF16 2
 #define TQ_ARGMAX_BLOCKS 1024
-#define TQ_OPTIMISTIC_TOPK_MAX 16
 // Hard CAP for sequence length (static host scratch, clamp for TQ_CTX).
 // Runtime limit lives in g_qwen.max_seq (default 8192): attention scores moved
 // from smem to a global scratch (bit-exact: same loops/order, other storage),
 // so the old 48KB-smem ceiling is gone. KV fp32: 16k=+2.1GB, 32k=+4.3GB; long
-// contexts need TQ_KV_FP8 (32KB/pos) or 4-bit KV. The cap below is the model's
+// contexts need 4-bit KV (TQ_KV_Q4). The cap below is the model's
 // native max_position_embeddings (Qwen3.6: 262144); the real working limit is
 // still TQ_CTX (g_qwen.max_seq), which gates every cache/scratch allocation.
 #define TQ_MAX_SEQ 262144
@@ -38,20 +37,12 @@
 #define TQ_FLAG_EXL3_WEIGHTS (1u << 11)
 // The MTP section's 8 projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3) instead of bf16.
 #define TQ_FLAG_MTP_EXL3 (1u << 12)
-#define TQ_MTP_TOPK_MAX 64
-#define TQ_MTP_MAX_DEPTH 15  // max MTP covering-tree depth (16-slot KV archive: root + 15)
 
 // Commit-by-pointer-swap: rounds with N <= 8 alternate archive halves (slots
 // 0-7 / 8-15), so the accepted leaf's state slab can BECOME the live state
 // (zero-copy commit); the next round writes the other half and cannot clobber it.
 static int g_spec_slot_base = 0;        // archive half (0 or 8) used by the current round
-static int g_spec_commit_swap = 0;      // this round's commit may pointer-swap
 static int g_spec_live_in_archive = 0;  // live DeltaNet pointers parked in the archive
-static int g_spec_state_skip_round = 0; // chain items skip non-fork slab writes; commit replays
-static int g_spec_pub_h[16];            // host copy of the round's fork-publication mask
-static int g_spec_npub_nodes = 0;       // round had a valid pub mask (seg fuse active)
-static void hist_reset(void);           // n-gram drafter history (defined with the drafter)
-#define TQ_DELTA_SNAP_SLOTS 6  // DeltaNet state snapshot slots for tree-verify forking (Step 3)
 #ifndef TQ_SPEC_MAX_N
 #define TQ_SPEC_MAX_N 16       // max batched verify nodes/round (16 = 2 m16n8 column groups).
                                // MEASURED dead-end (roadmap D stopgap):
@@ -65,27 +56,14 @@ static void hist_reset(void);           // n-gram drafter history (defined with 
                                // GPU6 @256k has ~0.45 GiB margin). Wide prefill needs a DEDICATED
                                // N-wide kernel (D.1), not this bump. Keep the default at 16.
 #endif
-#define TQ_SPEC_MAX_GROUPS ((TQ_SPEC_MAX_N + 7) / 8)   // n-tile groups of 8 columns each
 
 // Set once at load time: 1 if QMMA weights are dense 6-bit E2M3 (mixed-format
 // E2M3 weights x E4M3 activations), 0 for the default E4M3 weight path.
 __constant__ int gc_weight_e2m3 = 0;
 
-// TQ_LDSM (PROBE, default OFF): feed the persistent MLP GEMV operand-A through
-// the SM120 hardware FP6 unpack (ldmatrix.m8n16.x4.b6x16_p32 / LDSM.U6) instead
-// of the software LOP3 unpack. When enabled, the MLP dense-E2M3 weights are
-// repacked at load into LDSM-natural ("matrix row") order (same 384 B/tile, same
-// codes), and the part-1 kernel stages each k-tile to SMEM and ldmatrix's it into
-// the exact same operand-A fragment the dense path produces (bit-identical MMA).
-// The default path is untouched (separate kernel instantiation, no extra SMEM).
+// Unread. Deleting them moves the bank-3 offsets of the constants below and with them the SASS of every kernel that
+// reads those; remove them together with the q4s_* fp32 branch (gc_kv_q4_fp32s) under a bitwise gate.
 __constant__ int gc_use_ldsm = 0;
-
-// TQ_PERSIST_P2P (PROBE, default OFF): replace the part-1 gemv2->reduce_final grid
-// barrier (bar6) with per-m-tile point-to-point readiness. Each gemv2 (m-tile,
-// k-split) item bumps a per-m-tile counter; a reduce_final chunk waits only for
-// the m-tiles its 512-element slice reads (a strict subset) instead of the whole
-// grid. Deadlock-free: reduce only runs after the gemv2 queue is fully claimed, so
-// every awaited counter is owned by a running (never-blocked) producer CTA.
 __constant__ int gc_use_p2p = 0;
 
 // TQ_EMBED_FP8: token-embedding table stored quantized at load (lookup-only --
@@ -98,9 +76,9 @@ __constant__ int gc_embed_mode = 0;
 __constant__ const uint8_t *gc_embed8 = nullptr;
 __constant__ const float *gc_embed_scale = nullptr;
 
-// TQ_KV_Q4 K-cache (scale, zp) group params: fp16 storage by default (half the
-// scale bytes, -0.5 GiB @256k), or fp32 under TQ_KV_Q4_FP32S=1 (A/B escape hatch).
-// The d_k_q4s buffer is reinterpreted at access time via the q4s_* helpers below.
+// TQ_KV_Q4 K-cache (scale, zp) group params: fp16 storage. Nothing sets this to 1 any more (the TQ_KV_Q4_FP32S
+// switch is gone); the q4s_* helpers keep their fp32 branch until a bitwise-gated change removes it from every kernel
+// that inlines them.
 __constant__ int gc_kv_q4_fp32s = 0;
 
 typedef struct {
@@ -112,10 +90,6 @@ typedef struct {
     int row_major;
     int word_major;
     int e2m3;
-    int e2m1;          // 4-bit E2M1 payload (64 words/tile); draft-head only
-    int e2m3_byte;     // E2M3 codes in HW-direct byte containers (128 words/tile,
-                       // code in low 6 bits of each byte): zero-unpack GEMV loop,
-                       // +33% payload bytes. Same codes+scales as dense -> bit-exact.
     int scale_rows;
     int scale_cols;
     // Optimistic sparse-FP4 draft (TQ_FLAG_SPARSE_24_E2M3): tile-level WANDA 2:4
@@ -138,37 +112,6 @@ typedef struct {
     uint16_t *d_exl3_svh;     // fp16 [M]
     uint16_t *d_exl3_bf16;    // kbits == 0 only
 } tq_qmma_weight_t;
-
-static float g_spec_temp_v = -1.0f;       // <0 = uninitialized (read env once)
-static uint64_t g_spec_seed_v = 0x5EEDULL;
-static int g_spec_seed_init = 0;
-static uint32_t g_spec_round_ctr = 0;
-
-static float spec_temp(void) {
-    if (g_spec_temp_v < 0.0f) {
-        const char *e = getenv("TQ_TEMP");
-        float v = e ? (float)atof(e) : 0.0f;
-        g_spec_temp_v = (v < 0.0f) ? 0.0f : v;
-    }
-    return g_spec_temp_v;
-}
-
-static uint64_t spec_seed(void) {
-    if (!g_spec_seed_init) {
-        const char *e = getenv("TQ_SEED");
-        if (e) g_spec_seed_v = strtoull(e, NULL, 0);
-        g_spec_seed_init = 1;
-    }
-    return g_spec_seed_v;
-}
-
-// Payload words per m16k32 tile for a QMMA weight (e2m1 draft: 64, dense 6-bit
-// E2M3: 96, byte containers -- legacy E4M3 or e2m3_byte: 128).
-static inline size_t tq_w_tile_words(const tq_qmma_weight_t *w) {
-    if (w->e2m1) return 64;
-    if (w->e2m3 && !w->e2m3_byte) return 96;
-    return 128;
-}
 
 // Full-precision (BF16) weight, row-major [M, K]. Used for the MTP head projections,
 // which are kept unquantized (the head is tiny; quantizing it costs accept length).
@@ -208,9 +151,8 @@ typedef struct {
     float *d_linear_recurrent_state_owned; // un-swap destination)
     float *d_k_cache;
     float *d_v_cache;
-    // FP8 prefix-cache (TQ_KV_FP8=1): E4M3 codes + pow2 scale per (pos, kv_head).
-    // When active the fp32 cache above is NOT allocated; the tree/wave archives
-    // stay fp32 (small, transient). NULL when the flag is off.
+    // E4M3 rows + pow2 scale per (pos, kv_head) (TQ_KV_Q4: the V rows; K goes to d_k_cache4 below). When active the
+    // fp32 cache above is NOT allocated. NULL when TQ_KV_Q4 is off.
     uint8_t *d_k_cache8;
     uint8_t *d_v_cache8;
     float *d_k_scale;
@@ -259,8 +201,6 @@ typedef struct {
     int embed_fp8;           // 0=off (bf16), 1=E4M3, 2=E2M3-6bit (lookup dequant mode)
     uint16_t *d_norm;
     tq_qmma_weight_t lm_head;
-    tq_qmma_weight_t lm_head_fp4;   // E2M1 repack of lm_head (draft tree waves only)
-    int lm_head_fp4_ready;
     tq_layer_t layers[TQ_MAX_LAYERS];
 
     // Native MTP (multi-token-prediction) head. The 8 projection weights are kept
@@ -279,8 +219,6 @@ typedef struct {
     // E2M3-quantized copies of the MTP head projections (packed on first batched
     // tree build; the BF16 originals stay for the sequential fallback). Order:
     // fc, q, k, v, o, gate, up, down.
-    tq_qmma_weight_t mtp_qw[8];
-    int mtp_quant_ready;
     // TQ_FLAG_MTP_EXL3 (tqf from convert_qwen_tqf.py --mtp-exl3): the 8 projections are EXL3 records
     // loaded into mtp_layer.{q,k,v,o}_proj / mlp_{gate,up,down} and mtp_fc_x, read by the paged drafter
     // (qwn_paged_mtp_*) through the wide path; the bf16 buffers above stay NULL and the single-stream
@@ -290,93 +228,17 @@ typedef struct {
     uint16_t *d_mtp_pre_fc_norm_emb;
     uint16_t *d_mtp_pre_fc_norm_hidden;
     uint16_t *d_mtp_norm;
-    float *d_mtp_e;        // raw embedding of the fed token (H)
-    float *d_mtp_fc_in;    // concat[norm(emb), norm(hidden)] (2H)
-    float *d_mtp_x;        // fc output / decoder-layer input + residual (H)
-    float *d_mtp_normout;  // post mtp.norm hidden -> lm_head input (H)
-    float *d_mtp_hidden_in; // host-injected hidden for qwn_mtp_step_hidden (H)
-    float *d_mtp_logits;   // snapshot of the MTP logits before top-k masking (V)
-    float *d_mtp_topk_vals;
-    int *d_mtp_topk_ids;
-    int mtp_topk_count;
-    int mtp_e_count;
-    int mtp_fc_in_count;
-    int mtp_x_count;
-    int mtp_normout_count;
-    int mtp_hidden_in_count;
-    int mtp_logits_count;
-    // MTP covering-tree (Step 2) scratch. d_mtp_root_hidden snapshots the tree-root
-    // pre-final-norm hidden so the tree can be built AFTER dense decode advances
-    // (which overwrites d_debug_x). d_mtp_post[d] holds the post-mtp.norm hidden
-    // produced at tree depth d, fed as the hidden_in of its depth-(d+1) children.
-    float *d_mtp_root_hidden;
-    float *d_mtp_post[TQ_MTP_MAX_DEPTH];
-
-    // DeltaNet (linear-attention) state snapshots for the Step-3 dense tree verify.
-    // Each slot is a contiguous buffer holding every linear layer's recurrent state
-    // ([value_heads,key_dim,value_dim]) + conv state ([conv_dim,kernel]) so a tree
-    // branch can fork from a committed state and be replayed independently.
-    float *d_delta_snap[TQ_DELTA_SNAP_SLOTS];
-    size_t delta_snap_floats;   // floats per slot (0 until computed)
-
-    // Step-5 batched spec-decode (TQ_SPEC_DECODE) scratch. All column-major [N x dim]
-    // (node n's vector at offset n*dim) so the k-split nk GEMV reads each weight ONCE
-    // for all N verify nodes. Per-node attn/recurrence reuse the per-token kernels.
-    float *d_spec_h, *d_spec_norm, *d_spec_resid, *d_spec_post, *d_spec_lo;
-    float *d_spec_qkv, *d_spec_kbuf, *d_spec_z, *d_spec_bp, *d_spec_ap, *d_spec_core;
-    float *d_spec_gate, *d_spec_up, *d_spec_mlp, *d_spec_logits;
-    uint8_t *d_spec_b;
-    float *d_spec_bscale, *d_spec_part;
-    float *d_spec_nk_factors;              // per-column prescale factors for nk prescaling [TQ_SPEC_MAX_N]
-    float *d_spec_recur, *d_spec_conv;     // per-(layer,node) DeltaNet archive [n_lin x N x size] (1-read commit)
-    float *d_spec_k_arch, *d_spec_v_arch;  // per-(full-layer,node) attn KV archive [n_full x N x kv_m] (1-read commit)
-    float *d_spec_argv; int *d_spec_argi;  // per-node argmax scratch
-    int *d_spec_sample_io;                 // sampler descent io (+ staged dtok/dpar)
     float *d_attn_scores;                  // [512 x max_seq] gmem attention score slabs
     int max_seq;                           // runtime context limit (TQ_CTX, <= TQ_MAX_SEQ)
-    int kv_fp8;                            // TQ_KV_FP8=1: prefix KV caches as E4M3+pow2 scale
+    int kv_fp8;                            // = kv_q4: the V rows + scales ride the E4M3 machinery
     int kv_q4;                             // TQ_KV_Q4=1: K int4+Hadamard, V E4M3 (sets kv_fp8)
-    int kv_q4_fp32s;                        // TQ_KV_Q4_FP32S=1: K (scale,zp) groups stay fp32 (default fp16)
-    int attn_mma;                          // TQ_ATTN_MMA: 0 off, 1 bf16 HMMA, 2 e4m3 QMMA (kv_fp8), 3 int4-K dequant HMMA (kv_q4)
-    int *d_spec_group_ids;                 // depth-major node ids for batched recurrence
-    int *d_spec_parent;                    // parent node indices on device for fused fork kernels
-    int *d_spec_depth_offsets;             // [TQ_SPEC_MAX_N+1] depth group prefix sums for fused tree
-    int *d_spec_depth_done;                // [2] atomic counters for fused-tree depth sync (conv, core)
-    int *d_spec_anc;                       // [N x TQ_SPEC_MAX_N] ancestor-at-depth table for tree attention
-    int *d_spec_segs;                      // chain segments: nodes[N] | off[N+1] | win[N*ks] (DeltaNet fusion)
-    float *d_spec_dnprep;                  // per-layer: qn/kn + v + beta/decay (DeltaNet prep archive)
-    float **d_live_recur_ptrs;             // [n_lin] OWNED live-state buffers (commit replay targets)
-    int *d_spec_replay;                    // replay chain nodes + header for the commit kernel
-    int live_recur_ptrs_ready;
-    int spec_alloc_n;                      // allocated node count (0 = unallocated)
 
-    int *d_spec_tokens;                    // device-side token IDs [TQ_SPEC_MAX_N] for graph replay
-    int *d_spec_positions;                 // device-side positions [TQ_SPEC_MAX_N] for graph replay
-    cudaGraph_t spec_graph;
-    cudaGraphExec_t spec_graph_exec;
-    int spec_graph_ready;
-    int spec_graph_N;                      // N captured (must match replay N)
 
     size_t device_bytes;
     int non_quant_count;
     int qmma_count;
     int f32_count;
-    int last_argmax_id;
     float last_argmax_logit;
-    cudaGraph_t forward_graph;
-    cudaGraphExec_t forward_graph_exec;
-    int forward_graph_ready;
-    int forward_graph_token_id;
-    cudaGraph_t decode_graph;
-    cudaGraphExec_t decode_graph_exec;
-    int decode_graph_ready;
-    int decode_graph_max_tokens;
-    int *d_decode_token;
-    int *d_decode_pos;
-    int *d_decode_step;
-    int *d_decode_generated;
-    int decode_generated_count;
-    int *d_qmma_work_counter;
     cudaStream_t stream;
 
     float *d_debug_x;
@@ -384,11 +246,9 @@ typedef struct {
     float *d_debug_proj;
     float *d_debug_qmma_out;
     float *d_debug_qmma_raw;
-    float *d_debug_conv;
     float *d_debug_qkv;
     float *d_debug_z;
     float *d_debug_a_proj;
-    float *d_debug_b_proj;
     float *d_debug_core;
     float *d_debug_resid;
     float *d_debug_post_norm;
@@ -402,23 +262,11 @@ typedef struct {
     float *d_debug_scale;
     float *d_debug_act_scale_inv;
     uint8_t *d_debug_b;
-    // Sparse-FP4 draft scratch (TQ_SPARSE_DRAFT): residual 2xe4m3 activation
-    // (hi/lo k64 B-fragments), per-block act scale, and the lo-pass output.
-    float *d_sparse_b_hi;
-    float *d_sparse_b_lo;
-    float *d_sparse_ascale;
-    float *d_sparse_out_lo;
-    int sparse_bhi_count;
-    int sparse_blo_count;
-    int sparse_ascale_count;
-    int sparse_outlo_count;
     int debug_proj_count;
     int debug_qmma_out_count;
-    int debug_conv_count;
     int debug_qkv_count;
     int debug_z_count;
     int debug_a_count;
-    int debug_bproj_count;
     int debug_core_count;
     int debug_resid_count;
     int debug_post_norm_count;
@@ -432,72 +280,9 @@ typedef struct {
     int debug_act_scale_count;
     int debug_b_bytes;
     int debug_raw_count;
-    float *d_optimistic_topk_vals;
-    int *d_optimistic_topk_ids;
-    float *d_optimistic_margin;
-    int optimistic_topk_k;
 } tq_model_t;
 
 static tq_model_t g_qwen;
-
-// Persistent layer-kernel scratch (barriers/queues/cursors); allocated lazily.
-static int *g_spec_persist_scratch = NULL;
-// TQ_ATTN_MMA round gating: below TQ_ATTN_MMA_MIN_BASE committed positions the
-// per-(head,node) scalar items win (24 fat MMA items underfill the persistent
-// grid and the Q-prep overhead is not amortized) AND the short-ctx numerics stay
-// bit-identical to the legacy path. The effective mode for the current verify
-// round (0 = legacy) is derived from the round's base on the host.
-static int g_spec_attn_mma_round = 0;
-static int g_spec_attn_base_host = -1;   // round base for nchunks sizing
-static int attn_mma_min_base(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("TQ_ATTN_MMA_MIN_BASE");
-        cached = e ? atoi(e) : 1024;
-        if (cached < 0) cached = 0;
-    }
-    return cached;
-}
-static int attn_mma_active(int base) {
-    return (g_qwen.attn_mma && base >= attn_mma_min_base()) ? g_qwen.attn_mma : 0;
-}
-
-// FP8 commit staging: [node, pos] pairs of the accepted path (device, lazy).
-static int *g_spec_commit_rows = NULL;
-static float *g_spec_persist_amax = NULL;   // [N x 8] stripe absmax from the norm kernels
-static long long *g_spec_persist_clk = NULL; // [16] per-phase clock64 marks (prof mode)
-static int g_spec_persist_ncta = 0;         // part-0 grid (deltanet instantiation)
-static int g_spec_persist_ncta1 = 0;        // part-1 grid (lean mlp instantiation)
-static int g_spec_persist_ncta2 = 0;        // part-2 grid (full-attention instantiation)
-static float *g_spec_persist_out_partials = NULL;  // part-0 out-proj partials (for the host reduce)
-static int g_spec_persist_out_ks = 1;
-
-static void destroy_forward_graph(void) {
-    if (g_qwen.forward_graph_exec) cudaGraphExecDestroy(g_qwen.forward_graph_exec);
-    if (g_qwen.forward_graph) cudaGraphDestroy(g_qwen.forward_graph);
-    g_qwen.forward_graph_exec = NULL;
-    g_qwen.forward_graph = NULL;
-    g_qwen.forward_graph_ready = 0;
-    g_qwen.forward_graph_token_id = -1;
-}
-
-static void destroy_decode_graph(void) {
-    if (g_qwen.decode_graph_exec) cudaGraphExecDestroy(g_qwen.decode_graph_exec);
-    if (g_qwen.decode_graph) cudaGraphDestroy(g_qwen.decode_graph);
-    g_qwen.decode_graph_exec = NULL;
-    g_qwen.decode_graph = NULL;
-    g_qwen.decode_graph_ready = 0;
-    g_qwen.decode_graph_max_tokens = 0;
-}
-
-static void destroy_spec_graph(void) {
-    if (g_qwen.spec_graph_exec) cudaGraphExecDestroy(g_qwen.spec_graph_exec);
-    if (g_qwen.spec_graph) cudaGraphDestroy(g_qwen.spec_graph);
-    g_qwen.spec_graph_exec = NULL;
-    g_qwen.spec_graph = NULL;
-    g_qwen.spec_graph_ready = 0;
-    g_qwen.spec_graph_N = 0;
-}
 
 static __device__ __forceinline__ uint16_t tq_float_to_bf16(float x) {
     uint32_t u = __float_as_uint(x);
@@ -694,11 +479,6 @@ static __device__ __forceinline__ uint8_t tq_qmma_a_byte(const uint8_t *a, int K
     return a[((mt * Kt + kt) * 512) + lane * 16 + byte_idx];
 }
 
-__global__ void k_tq_bf16_to_f32(float *out, const uint16_t *in, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = tq_bf16_to_float(in[i]);
-}
-
 // One embedding element for token `row`, channel `i` (TQ_EMBED_FP8). mode 0 is the
 // bit-exact bf16 default; mode 1 dequants per-row-scaled E4M3; mode 2 dequants
 // per-row-scaled E2M3 packed 6-bit (4 codes / 3 bytes, requires H % 4 == 0).
@@ -729,15 +509,3 @@ __global__ void k_tq_embed_lookup(float *out, const uint16_t *embed, int token_i
     out[i] = tq_embed_lookup_one(embed, (size_t)token_id, i, H);
 }
 
-__global__ void k_tq_embed_lookup_ptr(float *out, const uint16_t *embed, const int *token_id, int H) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= H) return;
-    out[i] = tq_embed_lookup_one(embed, (size_t)token_id[0], i, H);
-}
-
-__global__ void k_tq_embed_lookup_arr(float *out, const uint16_t *embed,
-                                       const int *tokens, int node_idx, int H) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= H) return;
-    out[i] = tq_embed_lookup_one(embed, (size_t)tokens[node_idx], i, H);
-}
