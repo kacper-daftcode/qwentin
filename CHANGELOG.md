@@ -60,6 +60,9 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
   into `os.environ`: the arguments fill every switch the environment leaves unset or empty (an explicit environment
   value still wins; an empty one now counts as unset), and the startup line and `/health` report the engine's
   effective settings. 55 → 59 entry points.
+- Gate (`docs/evidence/cand20-all.log`, `cand20-matrix.log`): host code only — all 211 kernels keep their SASS bit
+  for bit; the library without `TQ_PDL` / `TQ_KV_V4` / `TQ_KV_T4` reproduces the previous one with them bitwise, and
+  the served line runs with no `TQ_*` environment at all (needle, A/B texts and speed as before).
 
 ## [v0.11] — 2026-10-20
 

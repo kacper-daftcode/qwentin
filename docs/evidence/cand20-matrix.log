@@ -1,0 +1,33 @@
+[matrix] start 17:50:09; cand 43e75cc8d91d, served 87abd799229f
+[matrix] t4-attn-f16-0 (plab; TQ_T4_ATTN_F16=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_T4_ATTN_F16=0): 1
+[matrix] graph-0 (plab; TQ_GRAPH=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_GRAPH=0): 1
+[matrix] gemm-fork-0 (plab; TQ_GEMM_FORK=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_GEMM_FORK=0): 1
+[matrix] dstate-0 (plab; TQ_DSTATE_BF16=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_DSTATE_BF16=0): 1
+[matrix] pdl-0 (plab; TQ_PDL=0 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PDL=0): 1
+[matrix] pdl-2 (plab; TQ_PDL=2 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PDL=2): 1
+[matrix] pins (plab; TQ_QMMA_SF_K_SPLIT=4 TQ_PAGED_GQA_SPLIT=8 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_QMMA_SF_K_SPLIT=4 TQ_PAGED_GQA_SPLIT=8): 1
+[matrix] embed-fp8-2 (plab; TQ_EMBED_FP8=2 TQ_EMBED_HOST=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_EMBED_FP8=2): 1
+[matrix] embed-fp8-1 (plab; TQ_EMBED_FP8=1 TQ_EMBED_HOST=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_EMBED_FP8=1): 1
+[matrix] verify-tqf (plab; TQ_VERIFY_TQF=1 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_VERIFY_TQF=1): 1
+[matrix] codebook-file (plab; TQ_KV_T4_CODEBOOK=/mnt/nvme/qwen256k/qwentin-cfg2/tools/codebooks/lloyd_kv12a.f32 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_KV_T4_CODEBOOK=/mnt/nvme/qwen256k/qwentin-cfg2/tools/codebooks/lloyd_kv12a.f32): 1
+[matrix] fp4-st3 (plab; TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_KV_T4=0): 1
+[matrix] fp4-st1 (plab; TQ_PAGED_ATTN_ST=1 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=1): 1
+[matrix] fp4-st0 (plab; TQ_PAGED_ATTN_ST=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=0): 1
+[matrix] fp4-st2 (plab; TQ_PAGED_ATTN_ST=2 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_ST=2): 1
+[matrix] fp4-mma-0 (plab; TQ_PAGED_ATTN_MMA=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PAGED_ATTN_MMA=0): 1
+[matrix] fp4-topk (plab; TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0): 1
+[matrix] fp6-mtp-head (plab; TQ_NO_MTP=0 TQ_PDL=1 TQ_KV_V4=0 TQ_KV_T4=0): bitwise (25 tensors); [config] line as expected (TQ_KV_V4=0 TQ_KV_T4=0): 1
+[matrix] gdn-prefill-0 (ctx; TQ_GDN_PREFILL=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_GDN_PREFILL=0): 1
+[matrix] pattn-gqa-0-qrows-16 (ctx; TQ_PATTN_GQA=0 TQ_WIDE_ATTN_QROWS=16 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_PATTN_GQA=0 TQ_WIDE_ATTN_QROWS=16): 1
+[matrix] t4-async-0 (ctx; TQ_KV_T4_ASYNC=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_KV_T4_ASYNC=0): 1
+[matrix] exl3-ng16-0 (ctx; TQ_EXL3_WIDE_NG16=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_EXL3_WIDE_NG16=0): 1
+[matrix] exl3-bf16-r4-0 (ctx; TQ_EXL3_BF16_R4=0 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_EXL3_BF16_R4=0): 1
+[matrix] gemm-fork-maxn (ctx; TQ_GEMM_FORK_MAXN=1000000 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=1 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_GEMM_FORK_MAXN=1000000): 1
+[matrix] fp4-ctx-qrows-16 (ctx; TQ_WIDE_ATTN_QROWS=16 TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_WIDE_ATTN_QROWS=16): 1
+[matrix] fp4-ctx (ctx; TQ_PDL=1 TQ_KV_V4=1 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_KV_T4=0): 1
+[matrix] e4m3v (plab; TQ_PDL=1 TQ_KV_V4=0 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (25 tensors); [config] line as expected (TQ_KV_V4=0 TQ_KV_T4=0): 1
+[matrix] e4m3v-ctx (ctx; TQ_PDL=1 TQ_KV_V4=0 TQ_KV_T4=0 TQ_NO_MTP=1): bitwise (16 tensors); [config] line as expected (TQ_KV_V4=0 TQ_KV_T4=0): 1
+[matrix] example: [config] TQ_KV_T4=0 TQ_EMBED_FP8=2 TQ_NO_MTP=1 TQ_PAGED_TOPK_PAGES=2 TQ_PAGED_TOPK_MIN_CTX=0 (the other 29 TQ_* switches at their defaults)
+[matrix] bf16 MTP head (FP6 file, TQ_NO_MTP=0), both read past: served 'MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)', candidate 'MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)'
+[matrix] 28 cells, 0 failed   18:02:32
+[matrix] PASS
