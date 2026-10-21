@@ -176,12 +176,16 @@ FP8 row).
 
 pass@1, greedy, through the OpenAI endpoint (`tools/evalplus.sh <base-url> <model-name> <out-dir> humaneval|mbpp`;
 `pip install evalplus`). 164 HumanEval and 378 MBPP tasks, thinking off. Logs of the two rows the README quotes:
-`docs/evidence/evalplus/`.
+`docs/evidence/evalplus/`. **Run it with speculative decoding ON** (the served line): its short prompts and long
+answers are what found the 2026-10-16..21 NaN at position 384 (CHANGELOG), which every other gate missed; the
+landing gate runs it that way since `cand23`.
 
 | stack | HumanEval / HumanEval+ | MBPP / MBPP+ | where |
 |---|---|---|---|
 | **FP8 reference** — the FP8 checkpoint through vLLM, TP2 on two 5090s, bf16 KV | **93.9 / 90.9** | **90.2 / 77.0** | `docs/evidence/evalplus/fp8-vllm-ref-*.log` |
 | **served stack** — EXL3 opt-5.75 + trellis-4 K+V through `serve_batched.py`, 12 slots, 4500 blocks, spec off (spec is bitwise plain decode) | **93.9 / 91.5** | **89.7 / 77.5** | `docs/evidence/evalplus/b2eng-t4-*.log` (2026-10-15) |
+| **served stack, speculative decoding ON** (the served line as is, 2026-10-21, after the segment-attention fix of `cand23`; with the bug it read 53.7 / 53.0 and 75 of 164 answers were `!!!!`) | **93.9 / 91.5** | **90.7 / 77.8** | `docs/evidence/cand23-all.log` gate 3; the before / after of the bug: `cand23-t1-probe-served-{spec,nospec}.log` |
+| candidate weights: the KL-weighted v4 allocation at 5.6 bpw (not served; spec on, fixed library) | 92.7 / 90.2 | 91.3 / 77.5 | research repo `logs/t1-probe-v456-fixed.log` |
 | EXL3 opt-5.75 + int4 K / E4M3 V (batched server, 2026-10-02) | 92.1 / 89.6 | 89.9 / 77.5 | research repo `runs/evalplus-exl3o575-batched/` |
 | EXL3 opt-6.25 + FP4 K+V (the 2026-10-13 served line) | 93.3 / 89.6 | 90.7 / 77.2 | `runs/evalplus-exl3o6-v4-batched/` |
 | legacy FP6 + int4/E4M3 KV, single-stream spec server (from bf16) | 93.3 / 89.6 | 91.3 / 78.0 | `runs/evalplus-fp6q4-bf16src-spec/` |

@@ -1,0 +1,54 @@
+[cand23-all] start 09:26:46; cand 5f9cee32da7c = 40892ff engine: a verify wave that mixes key-split counts no; served 0f4f517442ca
+== gate 0: ruff + pytest, the exported ABI   09:26:46
+[1;32mAll checks passed![0m
+77 passed, 7 skipped in 0.90s
+84 passed in 0.86s
+[gate0] PASS (59 exports)
+== gate 1: per-kernel SASS + bitwise decode vs the served library   09:26:48
+kernels: old 211, new 211, common 211; identical 199, different 12
+   differing kernels that are instances of the three segment kernels: 12 / 12
+[plab] N=3 cand-1212 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1212 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (v2 file), cand-1212 vs served: bitwise True (25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1212 vs served: bitwise True (16 tensors)
+[gate1] PASS
+== gate 2: spec exactness -- the README cells and the unaligned short contexts across position 384   09:29:25
+   new-4k [NOENV=1]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   new-32k [NOENV=1]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   new-300 [NOENV=1]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   new-100 [NOENV=1]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   old-300 [NOENV=1]: 1 FAILURES   (expected FAIL)   4 with different logits (max |d| 0.000e+00), 4 argmax flips
+   new-300-f16off [TQ_T4_ATTN_F16=0]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   old-300-f16off [TQ_T4_ATTN_F16=0]: 1 FAILURES   (expected FAIL)   4 with different logits (max |d| 0.000e+00), 4 argmax flips
+   new-300-v4fp16 [TQ_KV_T4=0 TQ_KV_V4=1]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   old-300-v4fp16 [TQ_KV_T4=0 TQ_KV_V4=1]: ALL PASS   (expected FAIL)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   NB: the served library passed old-300-v4fp16 (the NaN race did not bite in this cell; informational)
+   new-300-e4m3 [TQ_KV_T4=0 TQ_KV_V4=0]: ALL PASS   (expected PASS)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   old-300-e4m3 [TQ_KV_T4=0 TQ_KV_V4=0]: ALL PASS   (expected FAIL)   0 with different logits (max |d| 0.000e+00), 0 argmax flips
+   NB: the served library passed old-300-e4m3 (the NaN race did not bite in this cell; informational)
+[gate2] PASS
+== gate 3: THE SERVED LINE, pure defaults, with T1 with spec on   09:33:37
+   server up after 10 s, pid 848481, 29898 MiB; 576000 pooled tokens; [config] every TQ_* switch at its default
+   [repro] garbage 0 / 6
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.819s e2e=11.863s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.81s e2e=11.853s ans='UI-672763-WB' exp=['UI-6727
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.819s e2e=11.883s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=60.673s e2e=60.724s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.762s e2e=60.813s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.857s e2e=60.908s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[ab-vs-cand21] prompts identical True; texts identical to cand21 (the served library, same file): on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 178.6 (min 178.6, max 178.6), aggregate 178.6; 300 tokens in 1.7s; rounds 78 steps 78 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 80.3 (min 73.0, max 92.3), aggregate 645.7; 2400 tokens in 4.5s; rounds 130 steps 130 tokens/round
+   cand21 N=1: 3.85 tokens per round (300 tokens / 78 rounds)
+   cand21 N=8: 18.32 tokens per round (2400 tokens / 131 rounds)
+   cand23 N=1: 3.85 tokens per round (300 tokens / 78 rounds)
+   cand23 N=8: 18.46 tokens per round (2400 tokens / 130 rounds)
+== T1 (HumanEval+ / MBPP+) WITH SPEC ON   09:40:33
+   humaneval exit 0 09:44:38: pass@1: 0.939 pass@1: 0.915 
+   mbpp exit 0 09:50:56: pass@1: 0.907 pass@1: 0.778 
+   [t1] humaneval spec on: [0.939, 0.915] vs spec off [0.939, 0.915]; garbage generations 0 / 164 -> ok
+   [t1] mbpp spec on: [0.907, 0.778] vs spec off [0.897, 0.775]; garbage generations 0 / 378 -> ok
+   server log error lines: 0; repro clean: 1; needle PASS 6 FAIL 0; A/B 10/10: 1, texts = cand21: 1; speed rc 0; T1 rc 0
+[gate3] PASS
+== ALL PASS   09:51:00  (landing: build-qwen/ := the candidate, main := cand-1212 (ff), patches 0127-0128)

@@ -146,7 +146,11 @@ README (FP8 95.94 > FP6 91.30 > E2M1 86.46 ≈ NVFP4 85.78) is a different proto
 token set and has not been re-run on the new stack. Speculative decoding is lossless by
 construction here: the verify wave is the decode step's own kernels, and the committed tokens
 are bitwise plain decode's at the same client count (`tools/spec_paged_check.py`,
-`tools/spec_server_ab.py` 10/10 identical).
+`tools/spec_server_ab.py` 10/10 identical) — with one historical exception: from 2026-10-16 to
+2026-10-21 a wave that straddled position 384 (the first key-split change) could NaN its first
+column, after which the stream emitted token 0; the gates' page-aligned 4096 / 32768-token contexts
+and 1.5K-token A/B prompts never crossed it, T1 with spec on did (see CHANGELOG, `cand23-all.log`).
+T1 is now also run through the served line with speculative decoding on.
 
 ## Performance of the served stack (2026-10-17, main `2cf671c`, CUDA 13.1, driver 610, RTX 5090 at 550 W)
 

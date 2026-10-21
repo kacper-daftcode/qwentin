@@ -1,0 +1,5 @@
+[t1-probe served-spec] start 08:55:34 GPU 1 lib 0f4f517442ca tqf qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf args: 
+   server up, pid 777905, 576000 pooled tokens, speculative decoding ON (MTP drafter
+   [served-spec] pass@1 ['0.537', '0.530']; garbage generations 75 / 164: ['10', '19', '25', '32', '33', '37', '38', '39', '40', '41', '45', '46', '53', '68', '69', '71', '72', '73', '75', '76', '77', '78', '81', '83', '84', '85', '86', '87', '89', '91']
+   server log error lines: 0
+[t1-probe served-spec] done 09:00:50 rc 0

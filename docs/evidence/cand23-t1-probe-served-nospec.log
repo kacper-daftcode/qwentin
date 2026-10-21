@@ -1,0 +1,5 @@
+[t1-probe served-nospec] start 08:52:46 GPU 3 lib 0f4f517442ca tqf qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf args: --no-spec
+   server up, pid 769298, 576000 pooled tokens, speculative decoding OFF (--no-spec)
+   [served-nospec] pass@1 ['0.939', '0.915']; garbage generations 0 / 164: []
+   server log error lines: 0
+[t1-probe served-nospec] done 09:04:31 rc 0

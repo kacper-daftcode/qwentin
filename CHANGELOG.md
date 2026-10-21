@@ -8,6 +8,23 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+- **FIXED — speculative decoding could turn a short-prompt answer into `!!!!` from position 384 on (present since
+  speculative decoding became the default, 2026-10-16).** A verify wave gives every column its own key-split count
+  S_t; the first change (1 → 2) is at position 384, so a wave straddling 383 | 384 mixes S_t = 1 and S_t = 2 columns.
+  The three segment-attention kernels (`k_tq_paged_attn_q4_gqa_seg`, `_f16`, `_seg_t4`) launch S_max blocks per
+  segment, and a block with split ≥ 1 also ran the final-row path for an S_t = 1 column — with an empty tile range,
+  so it wrote 0 × ∞ = NaN over split 0's correct output; the DeltaNet recurrence carried the NaN into the slot's
+  state and every later token was token 0. Affected: any spec-on request whose prompt was shorter than 384 tokens
+  and whose generation crossed position 384 with a multi-column wave on the boundary (about half of such requests
+  at K = 4) — typical chat turns, not the long-context benchmarks (prompts of 384+ tokens never see an S_t = 1
+  column; later S_t changes mix only S_t ≥ 2 rows, which take the partials + merge path). Found by running T1
+  (EvalPlus) through the served line with speculative decoding ON: HumanEval 0.537 / 0.530 against 0.939 / 0.915
+  with `--no-spec`, 75 of 164 answers degenerate. Fix: only split 0 writes final rows (`if (split > 0) return;` in
+  the three kernels; 199 / 211 kernels SASS-identical, the 12 instances of the three differ; decode steps carry no
+  S_t = 1 row inside an S > 1 grid, so the decode path is bitwise). The gate gains what would have caught it:
+  `tools/spec_paged_check.py --ctx 300 / 100` (unaligned short contexts whose rounds cross 384; the old library
+  fails them with NaN logits at the wave [383, 384, 385]) on every pool and attention mode, and T1 through the
+  served line with speculative decoding on (must equal the spec-off reference). Gate: `docs/evidence/cand23-all.log`.
 - **The single-stream path is retired.** Gone: `tools/serve_openai.py` with Reservoir Dogs and the residual-stream
   steering hook (`qwn_rmap_*` and the `qwn_ot_*` aliases), the engine's single-stream speculative decoding (MTP
   covering tree, batched FP6 verify, persistent layer kernel, n-gram drafter, sampling), the pre-paged batched decode
