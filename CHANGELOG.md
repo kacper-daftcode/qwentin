@@ -63,6 +63,17 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 - Gate (`docs/evidence/cand20-all.log`, `cand20-matrix.log`): host code only — all 211 kernels keep their SASS bit
   for bit; the library without `TQ_PDL` / `TQ_KV_V4` / `TQ_KV_T4` reproduces the previous one with them bitwise, and
   the served line runs with no `TQ_*` environment at all (needle, A/B texts and speed as before).
+- **The drafter reads the trunk hidden after the final norm.** The paged MTP drafter used to be fed the pre-final-norm
+  residual; the Qwen3.5 / 3.6 MTP head was trained on the normalized hidden (exllamav3's `qwen3_5_mtp`, vLLM and
+  SGLang feed it that), so `mtp_fc_forward` now applies the model's final RMSNorm to every gathered trunk row
+  before the head's own `pre_fc_norm_hidden`. Host code only (211 / 211 kernels SASS-identical) and the outputs
+  are unchanged by construction — the verify decides every token; what changes is how often the drafts are
+  accepted: **+0.17 tokens per round (3.24 → 3.41 on 38 traced prompts), 176 → 179 tok/s at N = 1 and 644 → 657
+  aggregate at N = 8 @32K** on the served line, +7 % on this repository's own code. Found by the drafter
+  retraining study, which otherwise came back negative: a head retrained on 100M on-policy tokens adds only
+  +0.07 tokens per round over the stock head (63–81 % of the rejections are near-ties of the target that a
+  one-layer head cannot resolve). Gate (`docs/evidence/cand21-all.log`): paged logits bitwise with the drafter's
+  trunk hooks on, spec exactness 4K + 32K, the served line's needle 6/6 and A/B texts as before.
 
 ## [v0.11] — 2026-10-20
 

@@ -1,0 +1,40 @@
+[cand21-all] start 02:46:39; cand 0f4f517442ca = e4ee81a engine: the paged MTP drafter reads the trunk hidden; served 43e75cc8d91d
+== gate 0: ruff + pytest, the exported ABI   02:46:39
+[1;32mAll checks passed![0m
+77 passed, 7 skipped in 0.92s
+84 passed in 0.87s
+   exported qwn_*: 59, qwentin.h: 59
+[gate0] PASS
+== gate 1: per-kernel SASS + bitwise vs the served library   02:46:42
+kernels: old 211, new 211, common 211; identical 211, different 0
+   candidate's [config] in plab: [config] TQ_EMBED_FP8=2 TQ_NO_MTP=1 (the other 32 TQ_* switches at their defaults)
+[plab] N=3 cand-1211 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1211 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (v2 file), cand-1211 vs served: bitwise True (25 tensors)
+[plab] 32K x 2 slots + 16 steps, cand-1211 vs served: bitwise True (16 tensors)
+[gate1] PASS
+== gate 2: spec exactness 4K + 32K   02:49:17
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE (v2 file), pure defaults   02:50:36
+   server up after 10 s, pid 620815, 29898 MiB
+   576000 pooled tokens
+   [config] every TQ_* switch at its default
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.711s e2e=11.756s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.67s e2e=11.714s ans='UI-672763-WB' exp=['UI-6727
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.67s e2e=11.734s ans='ZU-821600-AR' exp=['ZU-8216
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.896s e2e=59.947s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.019s e2e=60.07s ans='AB-416549-JJ' exp=['AB-416
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.071s e2e=60.122s ans='ND-297860-GH' exp=['ND-29
+[ab] identical outputs: 10/10
+[ab-vs-cand20] prompts identical True; texts identical to cand20 (the served library, same file): on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 179.1 (min 179.1, max 179.1), aggregate 179.1; 300 tokens in 1.8s; rounds 78 steps 78 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 79.1 (min 74.8, max 98.1), aggregate 657.1; 2400 tokens in 4.5s; rounds 131 steps 131 tokens/round
+   cand20 N=1: 3.80 tokens per round (300 tokens / 79 rounds)
+   cand20 N=8: 17.65 tokens per round (2400 tokens / 136 rounds)
+   cand21 N=1: 3.85 tokens per round (300 tokens / 78 rounds)
+   cand21 N=8: 18.32 tokens per round (2400 tokens / 131 rounds)
+   server log error lines: 0; needle PASS 6 FAIL 0; A/B identical 10/10: 1, texts = cand20: 1; speed rc 0
+[gate3] PASS
+== ALL PASS   02:57:22  (landing: build-qwen/ := the candidate, main := cand-1211 (ff), patches 0125-0126)

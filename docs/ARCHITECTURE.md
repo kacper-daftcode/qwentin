@@ -95,7 +95,9 @@ EXL3 checkpoint ──convert_qwen_tqf.py --mtp-exl3──▶  model-mtp4.tqf  (
   Dequant is a 4096-entry fp16 table lookup in shared memory (`table[(stream >> 4t) & 0xFFF] ×
   scale`); the remaining 0.6 ms/step behind the FP4 kernels is that table lookup (LSU-bound).
 - **Speculative decoding — EXL3 MTP drafter + ragged verify + commit replay.** `qwn_paged_mtp_draft`
-  runs K chained MTP steps for all active slots; `qwn_paged_verify` scores every slot's draft
+  runs K chained MTP steps for all active slots (step 0 reads the trunk hidden after the model's final
+  norm, what the head was trained on; the chained steps read the head's own normalized hidden);
+  `qwn_paged_verify` scores every slot's draft
   segment in one wave with the decode-step kernels (segment-aware GQA attention: one K/V stream
   per slot segment, per-column key splits so the logits equal the sequential decode steps'
   bitwise); `qwn_paged_commit` replays the per-token DeltaNet recurrence over the accepted prefix
