@@ -8,6 +8,42 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [v0.12] — 2026-10-21
+
+Two fixes to speculative decoding on the served line, the engine behind a config struct with the served line as its
+defaults, the retirement of the single-stream path, and a better 16 GB model. **A long-standing bug is fixed:** since
+speculative decoding became the default (2026-10-16), a request whose prompt was shorter than 384 tokens and whose
+answer ran past position 384 could turn into token 0 (`!!!!`) from there on — about half of such requests; long-context
+use was never affected. Found by running T1 (EvalPlus) through the served line with speculative decoding on, which the
+gate now does. The drafter also reads the right hidden state now (+0.17 tokens per round). Engine `40892ff`, library
+`build-qwen/libforward_qwen.so` md5 `5f9cee32da7c`, the served line `--max-slots 12 --num-blocks 4500` with no flags and
+no environment on the opt-5.75 version-2 `.tqf`; the 16 GB line serves `t45v4` (`tools/recipes/qwen3_8-27b-exl3-t45v4.yaml`).
+CUDA 13.1, driver 610.57.04, RTX 5090 at 550 W.
+
+### Numbers pinned at this tag
+
+| | value | log |
+|---|---|---|
+| Pooled KV capacity | **576 000 tokens** (4500 × 128-token pages, 12 slots × up to 256K) at **29 898 MiB** at start (30 300 after a 128K prefill and the 8-stream runs) | `docs/evidence/rel12-table.log` |
+| Needle-in-a-repository | **6/6** at 32K and 128K (3 depths × 3 decoys) | `rel12-table.log`; `cand23-all.log` gate 3 |
+| Time to first token, cold | **11.6 s @32K · 60.1 s @128K** (v0.11: 11.6 / 59.7) | `rel12-table.log` |
+| Decode per stream @32K, N = 1 / 2 / 4 / 8, spec on | **179 / 153 / 114 / 82 tok/s** — the mean of two readings of one prompt per stream (178.8 / 179.2, 159.4 / 147.2, 115.2 / 112.1, 82.4 / 82.3); 3.83 tokens per round at N = 1 (v0.11: 177 / 153 / 106 / 79 at 3.78) | `rel12-table.log` |
+| Decode per stream @32K, spec off | 66 / 62 / 57 / 48 tok/s | `rel12-table.log` |
+| Decode per stream @128K, N = 1 / 2, spec on (off) | **114 / 100 tok/s** (58 / 52) at 2.82 tokens per round (v0.11: 115 / 99) | `rel12-table.log` |
+| Spec A/B | 10/10 identical texts, and the same texts as every gate since `cand12` | `rel12-table.log` |
+| T1 EvalPlus **with speculative decoding on** | HumanEval/+ **93.9 / 91.5**, MBPP/+ **90.7 / 77.8** (= the spec-off reference; before the fix 53.7 / 53.0 with 75 of 164 answers degenerate) | `cand23-all.log` gate 3, `cand23-t1-probe-served-{spec,nospec}.log` |
+| Quality vs the bf16 original | KL 0.0021–0.0027, top-1 99.0–99.1 % — the prefill-path rows re-measured on this library are bitwise the 2026-10-17 rows (4K 0.00235 / 98.97 %, 32K 0.00209 / 99.05 %) plus a new 32K seed-2 cell 0.00256 / 98.96 % | `cand22-all.log` gate 1, `e2e/qw-cand1211_*.json` |
+| **The 16 GB card** (emulated, 2 slots, 400 blocks, `t45v4`) | 51K tokens at 15 604 → 15 922 MiB; needle 3/3 at 32K and 49K; TTFT 12.0 / 18.8 s; **198 / 182 tok/s @32K / 49K** (78 / 77 off); the engine end to end 0.00921 / 97.99 % (4K), 0.00750 / 98.32 % (32K), 0.00999 / 98.09 % (32K s2) vs the previous `t45-s425` 0.01154 / 97.83, 0.00925 / 98.15, 0.01281 / 97.82 on the same tokens; T1 HumanEval/+ 93.9 / 89.6 | `cand24-all.log`, `rel12-p16.log`, `e2e/qw-t45v4_*.json` |
+
+The decode kernels are v0.10's bit for bit except the three segment-attention kernels of the fix, whose change only
+removes the NaN write of blocks that have nothing to write (`cand23-all.log` gate 1: 199 / 211 kernels SASS-identical, the
+paged-decode logits bitwise at N = 3 / 8 and at 32K). The spec-on cells moved with the accepted draft length again
+(the drafter's input fix: 3.78 → 3.83 tokens per round @32K N = 1), a round still costing ~21 ms @32K and ~25 ms @128K.
+
+### Changes
+
 - **The 16 GB model is `t45v4`**: the same 4.25 bpw, a per-tensor allocation chosen under a KL-weighted, floor-free
   sensitivity table (the research repo's chain v4), converted with a 250-row code-heavy calibration set and a
   token-weighted Hessian (`tools/recipes/qwen3_8-27b-exl3-t45v4.yaml`, `tools/recipes/cal250.safetensors`,

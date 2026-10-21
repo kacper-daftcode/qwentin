@@ -1,10 +1,41 @@
 # Evidence pack — the logs behind the README's numbers
 
-Every headline number in the top-level `README.md` (pinned at **v0.11**) is a line in one of the files in this
+Every headline number in the top-level `README.md` (pinned at **v0.12**) is a line in one of the files in this
 directory. The files are verbatim copies of the research project's (`kacper-daftcode/qwentin-internal`) `logs/`,
 `notes/` and `runs/` — nothing was edited or trimmed (the paths `/mnt/nvme/...` and `/root/work/venv/bin/python` are
 the measurement box's). `scripts/` holds the exact shell scripts that produced each log, so every flag of every gate is
 on record. The narrative around the numbers is [`docs/NOTES.md`](../NOTES.md); the release notes, [`CHANGELOG.md`](../../CHANGELOG.md).
+
+## v0.12 (2026-10-21): what was re-measured
+
+v0.12 re-measured every served-line cell of the README on its own library (`5f9cee32da7c` = main `a0834e5`, engine
+`40892ff`) and the version-2 opt-5.75 `.tqf`, each speed cell twice in one run (`rel12-table.log`, `scripts/rel12-table.sh`),
+and measured the new "One 16 GB card" table on the `t45v4` model (`cand24-all.log` gate 3 + `rel12-p16.log`). The quality
+rows of the 32 GB table were re-run on this library at 4K and 32K (bitwise the 2026-10-17 rows) with a new 32K seed-2 cell
+(`cand22-all.log` gate 1, `e2e/qw-cand1211_*.json`); T1 was run with speculative decoding on for the first time
+(`cand23-all.log` gate 3). The vLLM columns carry over from 2026-10-17.
+
+| item | value |
+|---|---|
+| engine source | `src/forward_qwen.cu` + `src/engine/*.cuh` at commit `40892ff` (2026-10-21 09:26 UTC; patches 0109–0127 of the research repo since v0.11's `dd6d21e`); `a0834e5` adds docs and the t45v4 recipe only |
+| served library | `build-qwen/libforward_qwen.so`, md5 `5f9cee32da7c`, built from `40892ff`; landed by `cand23-all.log` (199 / 211 kernels SASS-identical to the previous library `0f4f517442ca`, the 12 that differ are the three segment-attention kernels of the fix; paged-decode logits bitwise) |
+| model files | the 32 GB line: the v0.11 version-2 opt-5.75 `-mtp4.tqf` (unchanged); the 16 GB line: `qwen3_8-27b-exl3-t45v4-mtp4.tqf` (16.70 GB, sealed v2, `cand24-all.log` gate 0) |
+| toolkit, driver, GPU, Python | unchanged from v0.10: nvcc 13.1 V13.1.115, driver 610.57.04, RTX 5090 at 550 W, Python 3.14.4 with torch 2.14.0+cu130, transformers 5.17.0 |
+
+| README statement | file : line | note |
+|---|---|---|
+| 576 000 pooled tokens at 29 898 MiB (30 300 after a 128K prefill and the 8-stream runs) | `rel12-table.log` (`server up ... 29898 MiB`, `... MiB after everything`) | +4 MiB vs v0.11: the drafter's normalized-row buffer |
+| needle 6/6, **TTFT 11.6 s @32K** (11.646 / 11.629 / 11.644 s) **/ 60.1 s @128K** (59.909 / 60.126 / 60.253 s) | `rel12-table.log`, the six `[ 32k/128k depth=... ] PASS` lines | within 0.4 s of v0.11 (prefill kernels unchanged) |
+| spec A/B 10/10 identical, the same texts as `cand21` (and every gate since `cand12`) | `rel12-table.log`, `[ab] ...`, `[ab-vs-cand21] ...` | |
+| 179 / 153 / 114 / 82 tok/s per stream @32K spec on (N = 1 / 2 / 4 / 8; the mean of two readings), 66 / 62 / 57 / 48 off, 114 / 100 @128K (N = 1 / 2; 58 / 52 off) | `rel12-table.log`, the `[speed] ...` lines (`--repeats 2`) | 3.83 tokens per round @32K N = 1 (v0.11: 3.78), 2.82 @128K |
+| T1 EvalPlus with speculative decoding on: HumanEval/+ 93.9 / 91.5, MBPP/+ 90.7 / 77.8 | `cand23-all.log` gate 3 (`[t1] ...` lines); the bug's before / after: `cand23-t1-probe-served-spec.log` (53.7 / 53.0, 75 / 164 degenerate) and `cand23-t1-probe-served-nospec.log` (93.9 / 91.5) | |
+| quality 0.0021–0.0027 / 99.0–99.1 % | `e2e/qw-cand1211_4k_prefill.json` (0.00235 / 98.97 %), `qw-cand1211_32k_prefill.json` (0.00209 / 99.05 %), `qw-cand1211_32k_s2_prefill.json` (0.00256 / 98.96 %), the v0.10 decode-path rows | the first two are bitwise the 2026-10-17 rows (`cand22-all.log` gate 1, `[e2e] ... bitwise True`) |
+| **16 GB**: 51K tokens at 15 604 → 15 922 MiB, needle 3/3 at 49K (TTFT 18.8 s), 198 / 182 tok/s @32K / 49K (78 / 77 off), T1 HumanEval/+ 93.9 / 89.6 | `cand24-all.log` gate 3 (`-- new:` block) | the previous model `t45-s425` on the same line and run: 15 654 → 15 954 MiB, 3/3, 193 / 178 (`-- old:` block) |
+| **16 GB**: needle 3/3 at 32K (TTFT 12.0 s), 198 tok/s @32K N = 1 (twice), 350 aggregate at N = 2, 15 894 MiB after | `rel12-p16.log` (`scripts/rel12-p16.sh`) | |
+| **16 GB** quality 0.0075–0.0100 / 98.0–98.3 % | `e2e/qw-t45v4_4k_prefill.json` (0.00921 / 97.99 %), `qw-t45v4_32k_prefill.json` (0.00750 / 98.32 %), `qw-t45v4_32k_s2_prefill.json` (0.00999 / 98.09 %); `qw-t45s425_*.json` for the previous model | `cand24-all.log` gate 1 (`[gate1] ... better`) |
+
+Carried over from v0.10 / v0.11 without re-measurement: the decode-path quality rows (the decode kernels are v0.10's bit
+for bit except the fixed NaN write), the 8-session mix, the 24 GB variant and the vLLM columns (2026-10-17).
 
 ## v0.11 (2026-10-20): what was re-measured
 

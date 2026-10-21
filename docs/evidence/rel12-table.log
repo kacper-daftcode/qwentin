@@ -1,0 +1,43 @@
+[rel12-table] start 10:53:30; lib 5f9cee32da7c = a0834e5 docs + tools: the 16 GB model is t45v4 -- the KL-wei; file qwen3_8-27b-exl3-opt5.75-mtp4-v2.tqf
+   server up after 10 s, pid 917171, 29898 MiB; 576000 pooled tokens; [config] every TQ_* switch at its default
+   batched server: pool blocks=4500 page=128 max_slots=12 free=4500; trellis-4 K + V (12-bit states, every committed token; in-flight columns exact fp16) 16.50 KiB/token, 576000 pooled tokens; DeltaNet s
+   needle rc 0
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.646s e2e=11.69s ans='FF-699212-PR' exp=['FF-6992
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.629s e2e=11.672s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.644s e2e=11.708s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.909s e2e=59.96s ans='HE-215844-MW' exp=['HE-215
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.126s e2e=60.177s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=60.253s e2e=60.303s ans='ND-297860-GH' exp=['ND-29
+   30106 MiB after the needle
+   A/B rc 0: [ab] identical outputs: 10/10
+   [ab-vs-cand21] texts identical to cand21's run (the same file): on True, off True
+   32k rc 0
+   128k rc 0
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 178.8 (min 178.8, max 178.8), aggregate 178.8; 300 tokens in 1.7s; rounds 78 steps 78 tokens/round 3.83; ttf
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 179.2 (min 179.2, max 179.2), aggregate 179.2; 300 tokens in 1.7s; rounds 78 steps 78 tokens/round 3.83; ttf
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 159.4 (min 126.1, max 159.4), aggregate 285.6; 600 tokens in 2.5s; rounds 103 steps 103 tokens/round 5.81; t
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 147.2 (min 119.6, max 147.2), aggregate 266.8; 600 tokens in 2.6s; rounds 107 steps 107 tokens/round 5.59; t
+[speed] ctx=32768 N=4 spec=on: per-stream tok/s p50 115.2 (min 100.4, max 125.0), aggregate 444.6; 1200 tokens in 3.1s; rounds 113 steps 113 tokens/round 10.58;
+[speed] ctx=32768 N=4 spec=on: per-stream tok/s p50 112.1 (min 104.3, max 122.4), aggregate 444.7; 1200 tokens in 3.1s; rounds 114 steps 114 tokens/round 10.49;
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 82.4 (min 75.0, max 90.0), aggregate 659.7; 2400 tokens in 4.4s; rounds 130 steps 130 tokens/round 18.4; ttf
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 82.3 (min 75.4, max 94.0), aggregate 662.7; 2400 tokens in 4.4s; rounds 130 steps 130 tokens/round 18.4; ttf
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 65.5 (min 65.5, max 65.5), aggregate 65.5; 300 tokens in 4.6s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 65.5 (min 65.5, max 65.5), aggregate 65.5; 300 tokens in 4.6s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=32768 N=2 spec=off: per-stream tok/s p50 62.2 (min 61.8, max 62.2), aggregate 124.0; 600 tokens in 4.9s; rounds 0 steps 300 tokens/round None; ttft 
+[speed] ctx=32768 N=2 spec=off: per-stream tok/s p50 62.4 (min 61.9, max 62.4), aggregate 124.3; 600 tokens in 4.9s; rounds 0 steps 300 tokens/round None; ttft 
+[speed] ctx=32768 N=4 spec=off: per-stream tok/s p50 57.1 (min 56.4, max 57.1), aggregate 227.0; 1200 tokens in 5.4s; rounds 0 steps 300 tokens/round None; ttft
+[speed] ctx=32768 N=4 spec=off: per-stream tok/s p50 57.3 (min 56.6, max 57.3), aggregate 227.7; 1200 tokens in 5.4s; rounds 0 steps 300 tokens/round None; ttft
+[speed] ctx=32768 N=8 spec=off: per-stream tok/s p50 48.4 (min 47.4, max 50.4), aggregate 386.6; 2400 tokens in 7.0s; rounds 0 steps 338 tokens/round None; ttft
+[speed] ctx=32768 N=8 spec=off: per-stream tok/s p50 48.0 (min 47.1, max 49.9), aggregate 383.5; 2400 tokens in 7.1s; rounds 0 steps 338 tokens/round None; ttft
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 113.6 (min 113.6, max 113.6), aggregate 113.6; 300 tokens in 2.8s; rounds 106 steps 106 tokens/round 2.82; 
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 113.8 (min 113.8, max 113.8), aggregate 113.8; 300 tokens in 2.8s; rounds 106 steps 106 tokens/round 2.82; 
+[speed] ctx=131072 N=2 spec=on: per-stream tok/s p50 97.2 (min 92.1, max 97.2), aggregate 189.3; 600 tokens in 3.5s; rounds 110 steps 110 tokens/round 5.44; ttf
+[speed] ctx=131072 N=2 spec=on: per-stream tok/s p50 101.8 (min 96.7, max 101.8), aggregate 198.5; 600 tokens in 3.4s; rounds 109 steps 109 tokens/round 5.49; t
+[speed] ctx=131072 N=1 spec=off: per-stream tok/s p50 57.9 (min 57.9, max 57.9), aggregate 57.9; 300 tokens in 5.3s; rounds 0 steps 299 tokens/round None; ttft 
+[speed] ctx=131072 N=1 spec=off: per-stream tok/s p50 57.9 (min 57.9, max 57.9), aggregate 57.9; 300 tokens in 5.4s; rounds 0 steps 299 tokens/round None; ttft 
+[speed] ctx=131072 N=2 spec=off: per-stream tok/s p50 52.3 (min 51.7, max 52.3), aggregate 104.1; 600 tokens in 6.0s; rounds 0 steps 300 tokens/round None; ttft
+[speed] ctx=131072 N=2 spec=off: per-stream tok/s p50 52.4 (min 51.8, max 52.4), aggregate 104.2; 600 tokens in 6.0s; rounds 0 steps 300 tokens/round None; ttft
+   30300 MiB after everything
+{"status": "ok", "free_blocks": 396, "total_blocks": 4500, "active": 0, "queued": 0, "parked": 4, "prefilling": 0, "prefix_cache_hits": 72, "prefix_cache_tokens": 3531744, "host_parked": 90, "host_parked_gib": 63.25, "host_hits": 0, "host_saves": 94, "host_save_s": 1.67, "host_restore_s": 0.0, "host_save_gbs": 43.5, "host_restore_gbs": 0.0, "host_evict_lru": 4, "host_evict_ttl": 0, "park_ram_ttl_s
+
+[rel12-table] done 11:24:09; server log error lines: 0

@@ -15,13 +15,14 @@ and the exact `--num-blocks` ladder are in `ASSUMPTIONS.md` "16 GiB variant, exa
 | | **qwentin 16 GB variant** (EXL3 t45v4 4.25 bpw + trellis KV + spec, 2 slots) | the same line on the previous model t45-s425 (same library, same run) | vLLM, stock |
 |---|---|---|---|
 | Context | **51K tokens** (`--num-blocks 400`): 15 604 MiB at start, 15 922 MiB after the parking ring, a 49K needle, speed and T1; `--num-blocks 360` = 46K as the safe pick | 15 654 → 15 954 MiB | none: the NVFP4 27B alone loads 17.6 GiB in vLLM (measured in the README's 32 GB table), the FP8 one 27.5 GiB — no stock 27B fits a 16 GB card |
-| Decode, N = 1 | **198 tok/s @32K** (79 without spec), **182 @49K** (77) | 193 / 178 (79 / 77 off; the spec-on cells are one prompt's acceptance, ±3 %) | — |
-| Needle | 3/3 at 49K (TTFT 18.8 s) | 3/3 | — |
+| Decode, N = 1 | **198 tok/s @32K** (78 without spec), **182 @49K** (77); N = 2 @32K: 350 tok/s aggregate (151 off) | 193 / 178 (79 / 77 off; the spec-on cells are one prompt's acceptance, ±3 %) | — |
+| Needle | 3/3 at 32K (TTFT 12.0 s) and at 49K (TTFT 18.8 s) | 3/3 at 49K | — |
 | Quality vs the bf16 original, the engine end to end (KL / top-1; `tools/qwentin_e2e.py`, prefill mode, E4M3 embedding) | **0.00921 / 97.99 %** (4K), **0.00750 / 98.32 %** (32K s1), **0.00999 / 98.09 %** (32K s2) | 0.01154 / 97.83 %, 0.00925 / 98.15 %, 0.01281 / 97.82 % — t45v4 on the same tokens: ΔKL −0.00234 [−0.00311, −0.00169], −0.00175 [−0.00234, −0.00128], −0.00282 [−0.00427, −0.00156]; Δtop-1 +0.16 / +0.17 / +0.26 pt | — |
 | T1 HumanEval/+ through this line, speculative decoding on | 93.9 / 89.6 (the 32 GB stack: 93.9 / 91.5) | — | — |
 | Weights on the device | ~14 GB (the `-mtp4.tqf` is 16.7 GB) | the same | — |
 
-<sub>Provenance: `docs/evidence/cand24-all.log` + `docs/evidence/scripts/cand24-all.sh` (2026-10-21 10:10–10:35 UTC; the served
+<sub>Provenance: `docs/evidence/cand24-all.log` + `docs/evidence/scripts/cand24-all.sh` (2026-10-21 10:10–10:35 UTC) and the 32K
+cells of `docs/evidence/rel12-p16.log` (`scripts/rel12-p16.sh`, 10:53–10:57 UTC; the served
 library md5 `5f9cee32da7c` = main `52b4974`, every switch at its default: fp16 + SR DeltaNet state, the fp16 T4 attention, the
 decode graph), CUDA 13.1, driver 610.57.04, torch 2.14.0+cu130, transformers 5.17.0; the quality cells: the e2e JSONs
 `docs/evidence/e2e/qw-t45v4_*.json` and `qw-t45s425_*.json` (`tools/e2e_frontier.py --vs`); the simulated full-stack rows

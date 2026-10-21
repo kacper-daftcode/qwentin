@@ -1,0 +1,18 @@
+[rel12-p16] start 10:53:30; lib 5f9cee32da7c; file qwen3_8-27b-exl3-t45v4-mtp4.tqf
+   server up, pid 917166, 15604 MiB; 51200 pooled tokens; [config] every TQ_* switch at its default
+   needle 32K rc 0
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.911s e2e=11.951s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.998s e2e=12.036s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.998s e2e=12.055s ans='ZU-821600-AR' exp=['ZU-821
+   15880 MiB after the 32K needle
+   32k speed rc 0
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 197.8 (min 197.8, max 197.8), aggregate 197.8; 300 tokens in 1.6s; rounds 80 steps 80 tokens/round 3.74; ttf
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 197.7 (min 197.7, max 197.7), aggregate 197.7; 300 tokens in 1.6s; rounds 80 steps 80 tokens/round 3.74; ttf
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 180.0 (min 169.4, max 180.0), aggregate 349.4; 600 tokens in 3.7s; rounds 174 steps 174 tokens/round 3.44; t
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 197.5 (min 155.9, max 197.5), aggregate 353.4; 600 tokens in 3.6s; rounds 174 steps 174 tokens/round 3.44; t
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 78.4 (min 78.4, max 78.4), aggregate 78.4; 300 tokens in 3.9s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 78.4 (min 78.4, max 78.4), aggregate 78.4; 300 tokens in 3.9s; rounds 0 steps 299 tokens/round None; ttft p
+[speed] ctx=32768 N=2 spec=off: per-stream tok/s p50 78.4 (min 73.0, max 78.4), aggregate 151.5; 600 tokens in 8.1s; rounds 0 steps 598 tokens/round None; ttft 
+[speed] ctx=32768 N=2 spec=off: per-stream tok/s p50 78.4 (min 73.0, max 78.4), aggregate 151.4; 600 tokens in 8.2s; rounds 0 steps 598 tokens/round None; ttft 
+   15894 MiB after everything
+[rel12-p16] done 10:57:19; server log error lines: 0
