@@ -291,6 +291,12 @@ class BatchedEngine:
                 self.spec = self.spec_on = False
             elif rc != 0:
                 raise RuntimeError(f"qwn_paged_mtp_init failed: {rc} (needs --mtp and a --mtp-exl3 tqf, e.g. ...-mtp4.tqf)")
+        # the drafter's reduced vocabulary (the file's DRAFT lm_head section, TQ_DRAFT_VOCAB=1): a draft step costs
+        # ~0.4 ms instead of 0.8, so --spec-k auto drafts deeper at few clients (6 instead of 4; measured 10-21 on 60
+        # traced prompts: 177.8 -> 188.2 tok/s at N = 1, outputs identical; without the section K = 6 ties K = 4)
+        self.draft_vocab = int(self.L.qwn_draft_vocab_size()) if self.spec and hasattr(self.L, "qwn_draft_vocab_size") else 0
+        if self.spec and self.draft_vocab:
+            print(f"[spec] the drafter uses a reduced vocabulary of {self.draft_vocab} token ids; --spec-k auto = 6 at <= 2 active slots", flush=True)
         self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
         self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
         self.log_admits = os.environ.get("TQ_SERVE_LOG_ADMITS", "1") not in ("", "0")   # one line per admitted request
@@ -726,10 +732,12 @@ class BatchedEngine:
             self._detach(s)
 
     def _spec_k_for(self, n):
-        """Draft depth for n active slots: auto = 4 at n <= 2, 3 at n <= 8, 2 above (measured 10-15: deeper
-        drafts pay at few clients, the verify's per-column attention at many); capped by the wave width."""
+        """Draft depth for n active slots: auto = 4 at n <= 2 (6 with the drafter's reduced vocabulary, whose draft
+        step is half the price), 3 at n <= 8, 2 above (measured 10-15 / 10-21: deeper drafts pay at few clients, the
+        verify's per-column attention at many -- and N = 8 at K = 4 is a 40-column wave that costs 1.5x); capped by
+        the wave width."""
         if self.spec_k == "auto":
-            k = 4 if n <= 2 else (3 if n <= 8 else 2)
+            k = (6 if self.draft_vocab else 4) if n <= 2 else (3 if n <= 8 else 2)
         else:
             k = int(self.spec_k)
         while k > 0 and n * (k + 1) > SPEC_MAX_T:
@@ -1073,7 +1081,7 @@ def make_handler(eng, tok, args):
                                  "park_ring": str(engine_settings(eng.L)["park_ring"]),
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "decoded_tokens": eng.decoded_tokens, "steps": eng.steps,
-                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k,
+                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k, "draft_vocab": getattr(eng, "draft_vocab", 0),
                                  "rounds": eng.rounds, "spec_tokens": eng.spec_tokens,
                                  "tokens_per_round": round(eng.spec_tokens / eng.rounds, 3) if eng.rounds else None,
                                  "spec_verify_cols": eng.spec_cols, "spec_fallbacks": eng.spec_fallbacks,
@@ -1264,7 +1272,8 @@ def serve(args):
                         spec=args.spec, spec_k=args.spec_k, park_ram_ttl=args.park_ram_ttl,
                         cfg_overrides=args.cfg_overrides)
     fb, tb, pg, mb = eng._stats()
-    spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k})" if eng.spec
+    spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k}"
+                 + (f" = {6 if eng.draft_vocab else 4}/3/2 by active slots; draft vocabulary {eng.draft_vocab} ids" if args.spec_k == "auto" else "") + ")" if eng.spec
                  else "speculative decoding OFF (" + (eng.spec_off_reason or getattr(args, "spec_off_reason", "") or "--no-spec") + ")")
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
           f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}; "

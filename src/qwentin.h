@@ -74,6 +74,7 @@ int qwn_init(const char *path);
 int qwn_hidden_size(void);
 int qwn_intermediate_size(void);
 int qwn_vocab_size(void);
+int qwn_draft_vocab_size(void);
 int qwn_num_layers(void);
 int qwn_num_attention_heads(void);
 int qwn_num_key_value_heads(void);

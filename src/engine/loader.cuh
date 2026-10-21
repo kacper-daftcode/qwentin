@@ -617,6 +617,9 @@ extern "C" int qwn_init(const char *path) {
 extern "C" int qwn_hidden_size(void) { return g_qwen.H; }
 extern "C" int qwn_intermediate_size(void) { return g_qwen.I; }
 extern "C" int qwn_vocab_size(void) { return g_qwen.V; }
+// The drafter's reduced vocabulary in use: V' (the DRAFT lm_head section loaded, TQ_DRAFT_VOCAB=1), else 0 -- the
+// server picks a deeper draft (--spec-k auto) when the draft step is this cheap.
+extern "C" int qwn_draft_vocab_size(void) { return g_qwen.draft_on ? g_qwen.draft_V : 0; }
 extern "C" int qwn_num_layers(void) { return g_qwen.L; }
 extern "C" int qwn_num_attention_heads(void) { return g_qwen.nh; }
 extern "C" int qwn_num_key_value_heads(void) { return g_qwen.nkv; }

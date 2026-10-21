@@ -99,6 +99,7 @@ SIGNATURES = {
     "qwn_hidden_size": (C.c_int, []),
     "qwn_intermediate_size": (C.c_int, []),
     "qwn_vocab_size": (C.c_int, []),
+    "qwn_draft_vocab_size": (C.c_int, []),
     "qwn_num_layers": (C.c_int, []),
     "qwn_num_attention_heads": (C.c_int, []),
     "qwn_num_key_value_heads": (C.c_int, []),
