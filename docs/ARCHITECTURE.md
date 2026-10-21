@@ -86,7 +86,7 @@ EXL3 checkpoint ──convert_qwen_tqf.py --mtp-exl3──▶  model-mtp4.tqf  (
   fp16 HMMA GEMMs (prefill, 128-token units) and GEMVs (decode, k-split with programmatic
   dependent launch and one fragment build per input-sharing group). opt-5.75 = 5.75 bpw average
   from a sensitivity measurement: K = 5 on 34 % of the weights, 6 on 55 %, 7 on 10 %, head 6; the
-  16 GB model t45-s425 = two tiers {4, 5} at 4.25 bpw. The bf16 embedding table stays in pinned
+  16 GB model t45v4 = a per-tensor allocation at 4.25 bpw (t45-s425, two tiers {4, 5}, until 2026-10-21). The bf16 embedding table stays in pinned
   host RAM (`TQ_EMBED_HOST=1`, rows read over PCIe).
 - **KV cache — 4-bit trellis-coded K and V** (above). The pool is paged (128-token pages); a
   slot's open page is staged exact in fp16 while its columns are in flight (on the `--kv-v4` pool
@@ -143,7 +143,22 @@ converts either checkpoint. Python: 3.10 or newer (measured with 3.14) with `tor
 cd exllamav3
 python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work-27b-opt5.75 -o /path/to/Qwen3.8-27B-exl3-opt5.75 \
     -rcp /path/to/qwentin/tools/recipes/qwen3_8-27b-exl3-opt5.75.yaml -hb 6 -mb 4 -vb 16 -d 0 -cpi 300
-# The 16 GB model: the two-tier {4,5} recipe at 4.25 bpw (no bpw header in the file, so -b 4.25 is for reporting)
+# The 16 GB model since 2026-10-21: t45v4 = a per-tensor allocation at 4.25 bpw chosen under a KL-weighted, floor-free
+#    sensitivity table (-19 % KL vs the two-tier t45-s425 recipe at the same size), converted with (a) the recipe, (b) the
+#    250-row calibration set tools/recipes/cal250.safetensors (150 windows of permissively licensed code + 100 rows of
+#    exllamav3's default mix; -cd/-cr/-cc) and (c) a token-weighted Hessian: tools/exl3_token_weights_patch.py applied
+#    once to exllamav3's exllamav3/modules/linear.py (idempotent, inert without the env variable) and
+#    EXL3_TOKEN_WEIGHTS = per-token output sensitivities of the opt-5.5 student on the calibration rows
+#    (the research repo's analysis/exl3_fisher.py; 821 MB, not shipped), EXL3_TW_ALPHA=0.25 EXL3_TW_LAMBDA=0.5.
+#    (a) + (b) alone run on stock exllamav3 and carry the allocation; on the 27B opt-5.5 chain the token weights were
+#    about a third of the gain (-0.0001 of -0.0003 KL) and were not measured separately at 4.25 bpw.
+python tools/exl3_token_weights_patch.py /path/to/exllamav3      # once
+EXL3_TOKEN_WEIGHTS=/path/to/fisher-opt55.safetensors EXL3_TW_ALPHA=0.25 EXL3_TW_LAMBDA=0.5 \
+python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work-27b-t45v4 -o /path/to/Qwen3.8-27B-exl3-t45v4 \
+    -rcp /path/to/qwentin/tools/recipes/qwen3_8-27b-exl3-t45v4.yaml -hb 6 -mb 4 \
+    -cd /path/to/qwentin/tools/recipes/cal250.safetensors -cr 250 -cc 2048 -d 0
+# The previous 16 GB model (until 2026-10-21): the two-tier {4,5} recipe at 4.25 bpw (no bpw header in the file, so
+# -b 4.25 is for reporting)
 python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work-27b-t45 -o /path/to/Qwen3.8-27B-exl3-t45-s425 \
     -rcp /path/to/qwentin/tools/recipes/qwen3_8-27b-exl3-t45-s425.yaml -b 4.25 -hb 6 -mb 4 -vb 16 -d 0 -cpi 300
 # (A new recipe for another bitrate: sc_measure.py on the bf16 model -> measure.json, then
@@ -158,8 +173,8 @@ python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work-27b-t45 -o /path/to/Q
 cd qwentin
 TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-opt5.75 \
     -o /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf --mtp-exl3          # 21.3 GB
-TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-t45-s425 \
-    -o /path/to/qwen3_8-27b-exl3-t45-s425-mtp4.tqf --mtp-exl3         # 16.7 GB, the 16 GB variant
+TQ_EMIT_MTP=1 python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-t45v4 \
+    -o /path/to/qwen3_8-27b-exl3-t45v4-mtp4.tqf --mtp-exl3             # 16.7 GB, the 16 GB variant
 ```
 
 `python3 tools/inspect_tqf.py model.tqf` reports the flags, walks the payload (EXL3 records included:
@@ -191,7 +206,9 @@ tools/codebooks/lloyd_kv12a.f32   the codebook's source: 4096 fp32, Lloyd-traine
 tools/gen_codebook_inc.py    lloyd_kv12a.f32 -> src/engine/kv_t4_codebook.inc (tests/test_codebook_inc.py checks the two agree)
 tools/engine_text.py         the engine source in include order as prompt text (needle haystacks, prefill prompts, benches)
 tools/qwentin_abi.py         the same ABI for ctypes (Config, CONFIG_FIELDS, bind(lib)), generated with qwentin.h
-tools/recipes/*.yaml         the exllamav3 per-tensor bitrate recipes of the served models (opt-5.75, t45-s425)
+tools/recipes/*.yaml         the exllamav3 per-tensor bitrate recipes of the served models (opt-5.75, t45v4; t45-s425 = the 16 GB model until 2026-10-21)
+tools/recipes/cal250.safetensors  the 250-row calibration set of t45v4 (exllamav3 -cd format: input_ids [250, 2048])
+tools/exl3_token_weights_patch.py  the token-weighted Hessian capture for exllamav3's linear.py (t45v4's conversion; env-gated)
 tools/code_needle.py         needle-in-a-repository retrieval matrix through the OpenAI API
 tools/spec_speed.py          per-stream decode tok/s at N streams x context, spec on vs off
 tools/spec_server_ab.py      spec on vs off on the same prompts: identical-output count

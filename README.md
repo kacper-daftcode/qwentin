@@ -33,7 +33,8 @@ with `CORPUS` = the vLLM checkout and ~115 / 75 on this repository's own code (2
 [`docs/evidence/README.md`](docs/evidence/README.md); the story behind the numbers: [`docs/NOTES.md`](docs/NOTES.md).</sub>
 
 Smaller cards, emulated on a 5090 with a capped pool ([`docs/VARIANTS.md`](docs/VARIANTS.md)): **16 GB** — the 4.25 bpw
-model, 51K tokens, 184 tok/s @32K; **24 GB** — a full 256K session at FP8 quality, 161 tok/s @32K.
+model (t45v4 since 2026-10-21: −19 % KL at the same size), 51K tokens, 198 tok/s @32K; **24 GB** — a full 256K session at
+FP8 quality, 161 tok/s @32K.
 
 ## Quick start
 

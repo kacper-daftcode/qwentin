@@ -52,7 +52,7 @@ The two production formats and what `tools/inspect_tqf.py` checks for its PASS /
   `0x53d` for a bf16 source with a dropped vision tower. Written by `tools/convert_qwen_tqf.py` with its defaults
   (`--block-scaled always --block-layout qmma-e2m3 --block-scale-policy pow2`, MTP on). 22.6 GB for the 27B.
 - **EXL3 + MTP** (the served format, `tools/serve_batched.py --spec`): `0x800 | 0x400 | 0x1000`, i.e. `0x1c1d`.
-  Written from an exllamav3 checkpoint with `--mtp-exl3`. 21.3 GB for opt-5.75, 16.7 GB for t45-s425.
+  Written from an exllamav3 checkpoint with `--mtp-exl3`. 21.3 GB for opt-5.75, 16.7 GB for t45v4 / t45-s425.
 
 Other combinations run (`0xc1d` = EXL3 with a bf16 MTP head, an older `-mtp.tqf` whose head the engine reads past;
 `0x1d` = plain global-scale FP8 without the drafter, what the pre-2026-10 converter defaults produced from a bf16

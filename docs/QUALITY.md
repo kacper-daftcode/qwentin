@@ -102,7 +102,8 @@ stay in the research repo; the tables below are what `tools/e2e_frontier.py` pri
 | row | 4K: KL / top-1 | 32K s1 (≥ 4K) | 32K s2 (≥ 4K) | file |
 |---|---|---|---|---|
 | **FP8 checkpoint** (`Qwen3.8-27B-FP8` → bf16 via `tools/dequant_fp8_to_bf16.py`, through exllamav3) | **0.00372 / 98.73 %** | **0.00302 / 98.92 %** | **0.00375 / 98.81 %** | `fp8_4k.json`, `fp8_32k.json`, `fp8_32k_s2.json` |
-| served stack, prefill path (engine: EXL3 opt-5.75 + trellis-4 K+V, `fp16sr` state) | 0.00235 / 98.98 % (ΔKL −0.00137 [−0.00168, −0.00109], Δtop-1 +0.25 pt [+0.20, +0.31]) | 0.00209 / 99.09 % (−0.00093 [−0.00118, −0.00071], +0.16 [+0.10, +0.23]); all positions 0.00220 / 99.08 % | not run on s2 | `qw-final-def_4k_prefill.json`, `qw-final-def_32k_prefill.json` |
+| served stack, prefill path (engine: EXL3 opt-5.75 + trellis-4 K+V, `fp16sr` state) | 0.00235 / 98.98 % (ΔKL −0.00137 [−0.00168, −0.00109], Δtop-1 +0.25 pt [+0.20, +0.31]) | 0.00209 / 99.09 % (−0.00093 [−0.00118, −0.00071], +0.16 [+0.10, +0.23]); all positions 0.00220 / 99.08 % | 0.00256 / 98.96 % (−0.00119 [−0.00162, −0.00082], +0.14 [+0.09, +0.20]; 2026-10-21 library) | `qw-final-def_4k_prefill.json`, `qw-final-def_32k_prefill.json`, `qw-cand1211_32k_s2_prefill.json` |
+| the 16 GB tier, prefill path (engine: EXL3 t45v4 + trellis-4 K+V; its previous model t45-s425 in brackets) | 0.00921 / 97.99 % (t45-s425 0.01154 / 97.83 %) | 0.00750 / 98.32 % (0.00925 / 98.15 %) | 0.00999 / 98.09 % (0.01281 / 97.82 %) | `qw-t45v4_4k_prefill.json`, `qw-t45v4_32k_prefill.json`, `qw-t45v4_32k_s2_prefill.json` (`qw-t45s425_*.json`) |
 | served stack, decode path (6 or 8 rows in lockstep) | 0.00295 / 98.83 % on 48 rows (−0.00077 [−0.00100, −0.00056], +0.10 [+0.04, +0.16]; 2026-10-15 library); the 8-row sample of 2026-10-17 reads 0.00406 / 98.58 % | 0.00255 / 98.97 % (−0.00047 [−0.00066, −0.00029], +0.05 [−0.01, +0.11]); all positions 0.00269 / 98.96 % | not run on s2 | `qw-o5.75+kvT4L12fin2+e4m3_4k_dec8.json`, `qw-final-def_4k_dec8.json`, `qw-final-def_32k_dec6.json` |
 | the four 2026-10-17 opt-ins (`TQ_T4_ATTN_F16` `TQ_GRAPH` `TQ_GEMM_FORK` `fp16sr`) vs the same binary without them | −0.00001 … +0.00001 KL, −0.02 … 0.00 pt, every CI across 0 | −0.00001 [−0.00005, +0.00003] | | `qw-final-all_*.json` vs `qw-final-def_*.json` (`--vs`) |
 
@@ -118,7 +119,8 @@ repo's `ASSUMPTIONS.md` "A1/A2 re-measured vs the ORIGINAL bf16", run files `run
 | EXL3 opt-5.25 | 5.25 | 1.0016 | 98.88 % | 0.0032 | 0.049 |
 | EXL3 opt-5.0 | 5.0 | 1.0015 | 98.71 % | 0.0040 | 0.062 |
 | EXL3 opt-4.75 | 4.75 | 1.0022 | 98.51 % | 0.0054 | 0.086 |
-| EXL3 t45-s425 (two tiers {4, 5}; **the 16 GB weights**) | 4.25 | 1.0032 | 97.92 % | 0.0110 | 0.178 |
+| EXL3 t45v4 (the KL-weighted per-tensor allocation; **the 16 GB weights since 2026-10-21**; B300 yardstick, code calibration + token weights) | 4.25 | | 98.08 % | 0.0087 | |
+| EXL3 t45-s425 (two tiers {4, 5}; the 16 GB weights until 2026-10-21) | 4.25 | 1.0032 | 97.92 % | 0.0110 | 0.178 |
 | FP6 E2M3 weights (qwentin's legacy format, simulated bit-exactly) | ~6 | 1.0056 | 97.51 % | 0.0126 | 0.195 |
 | EXL3 opt-4.0 | 4.0 | 1.0049 | 97.62 % | 0.0138 | 0.221 |
 | FP6 + int4-K / E4M3-V KV = the legacy production `.tqf` (from bf16) | ~6 | 1.0062 | 97.36 % | 0.0139 | 0.211 |

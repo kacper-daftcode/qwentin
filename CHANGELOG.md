@@ -8,6 +8,14 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+- **The 16 GB model is `t45v4`**: the same 4.25 bpw, a per-tensor allocation chosen under a KL-weighted, floor-free
+  sensitivity table (the research repo's chain v4), converted with a 250-row code-heavy calibration set and a
+  token-weighted Hessian (`tools/recipes/qwen3_8-27b-exl3-t45v4.yaml`, `tools/recipes/cal250.safetensors`,
+  `tools/exl3_token_weights_patch.py`; the conversion block in docs/ARCHITECTURE.md). Engine end to end vs the previous
+  `t45-s425` on the same tokens: ΔKL −0.00234 / −0.00175 / −0.00282 at 4K / 32K s1 / 32K s2 (−19 %), Δtop-1 +0.16 /
+  +0.17 / +0.26 pt, every CI clear; the 16 GB line itself (2 slots, 400 blocks) 15 922 MiB after a full run, needle 3/3
+  at 49K, 198 / 182 tok/s @32K / 49K, T1 HumanEval/+ 93.9 / 89.6 with speculative decoding on. docs/VARIANTS.md keeps
+  the previous model's cells, re-measured on the same library and run. Gate: `docs/evidence/cand24-all.log`.
 - **FIXED — speculative decoding could turn a short-prompt answer into `!!!!` from position 384 on (present since
   speculative decoding became the default, 2026-10-16).** A verify wave gives every column its own key-split count
   S_t; the first change (1 → 2) is at position 384, so a wave straddling 383 | 384 mixes S_t = 1 and S_t = 2 columns.

@@ -1,0 +1,86 @@
+[cand24-all] start 10:10:03; lib 5f9cee32da7c = 52b4974 docs + evidence: cand23-all.log -- the gate of the s; new /mnt/nvme/models/qwen3_8-27b-exl3-t45v4-mtp4.tqf (16699289236 bytes), shipped /mnt/nvme/models/qwen3_8-27b-exl3-t45-s425-mtp4.tqf (16699944516 bytes)
+== gate 0: the file   10:10:03
+   flags: 0x00001c1d (fp8_qmma_weights, source_bf16_non_quant, dropped_vision, dropped_mtp, has_mtp_section, exl3_weights, 
+   payload hash (BLAKE2b-256 eabe709ec6a945b4...): OK
+   verdict EXL3 + MTP (flags 0x800|0x400|0x1000 + payload):     PASS -- EXL3 trellis weights + EXL3 MTP layer: tools/serve_
+   flags: new 'flags: 0x00001c1d', shipped t45-s425 'flags: 0x00001c1d'
+[gate0] PASS
+== gate 1: engine e2e rows (prefill mode), t45v4 and the shipped t45-s425 on the same library   10:10:26
+== qw-t45s425_4k_prefill on GPU 0 10:10:26
+   KL 0.01154  top1 0.9783  ppl x1.0035  kl16 0.01154
+   exit 0 10:12:02
+== qw-t45v4_4k_prefill on GPU 0 10:12:02
+   KL 0.00921  top1 0.9799  ppl x1.0032  kl16 0.00921
+   exit 0 10:13:36
+== qw-t45s425_32k_prefill on GPU 0 10:13:36
+   KL 0.01014  top1 0.9810  ppl x1.0038  kl16 0.01014
+   exit 0 10:15:18
+== qw-t45v4_32k_prefill on GPU 0 10:15:18
+   KL 0.00819  top1 0.9827  ppl x1.0032  kl16 0.00820
+   exit 0 10:16:59
+== qw-t45s425_32k_s2_prefill on GPU 0 10:16:59
+   KL 0.01216  top1 0.9787  ppl x1.0049  kl16 0.01216
+   exit 0 10:18:40
+== qw-t45v4_32k_s2_prefill on GPU 0 10:18:40
+   KL 0.00957  top1 0.9810  ppl x1.0034  kl16 0.00957
+   exit 0 10:20:21
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+fp8_4k                           4096  0.00372                                  98.73                                            
+qw-t45s425_4k_prefill            4096  0.01154   +0.00782 [+0.00611,+0.00990]   97.83      -0.90 [-1.06,-0.75]                   
+qw-t45v4_4k_prefill              4096  0.00921   +0.00549 [+0.00437,+0.00686]   97.99      -0.74 [-0.86,-0.62]                   
+vsold qw-t45s425_4k_prefill            4096  0.01154                                  97.83                                            
+vsold qw-t45v4_4k_prefill              4096  0.00921   -0.00234 [-0.00311,-0.00169]   97.99      +0.16 [+0.08,+0.25]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+fp8_32k                         32768  0.00302                                  98.92                                            
+qw-t45s425_32k_prefill          32768  0.00925   +0.00623 [+0.00482,+0.00784]   98.15      -0.77 [-0.92,-0.63]                   
+qw-t45v4_32k_prefill            32768  0.00750   +0.00448 [+0.00338,+0.00573]   98.32      -0.60 [-0.73,-0.49]                   
+vsold qw-t45s425_32k_prefill          32768  0.00925                                  98.15                                            
+vsold qw-t45v4_32k_prefill            32768  0.00750   -0.00175 [-0.00234,-0.00128]   98.32      +0.17 [+0.08,+0.25]                   
+tag                               seq       KL                       dKL [CI]    top1            dtop1 pt [CI]  pool GB  tok/card
+fp8_32k_s2                      32768  0.00375                                  98.81                                            
+qw-t45s425_32k_s2_prefill       32768  0.01281   +0.00906 [+0.00606,+0.01274]   97.82      -0.99 [-1.19,-0.82]                   
+qw-t45v4_32k_s2_prefill         32768  0.00999   +0.00624 [+0.00444,+0.00854]   98.09      -0.73 [-0.86,-0.61]                   
+vsold qw-t45s425_32k_s2_prefill       32768  0.01281                                  97.82                                            
+vsold qw-t45v4_32k_s2_prefill         32768  0.00999   -0.00282 [-0.00427,-0.00156]   98.09      +0.26 [+0.16,+0.37]                   
+[gate1] qw-t45v4_4k_prefill vs the shipped t45-s425: dKL -0.00234 [-0.00311,-0.00169] better; dtop-1 +0.16 [+0.08,+0.25] ok
+[gate1] qw-t45v4_32k_prefill vs the shipped t45-s425: dKL -0.00175 [-0.00234,-0.00128] better; dtop-1 +0.17 [+0.08,+0.25] ok
+[gate1] qw-t45v4_32k_s2_prefill vs the shipped t45-s425: dKL -0.00282 [-0.00427,-0.00156] better; dtop-1 +0.26 [+0.16,+0.37] ok
+[gate1] PASS (3 cells)
+== gate 2: spec exactness on the new file (ctx 4096 and the unaligned ctx 300)   10:20:26
+   4k: [spec-check] unpinned band over 122 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 2]) 
+   300: [spec-check] unpinned band over 754 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 300, Ns [1, 2]) 
+[gate2] PASS
+== gate 3: THE 16 GB LINE (2 slots, 400 blocks, --park-ram-gb 16), pure defaults   10:20:57
+-- new: qwen3_8-27b-exl3-t45v4-mtp4.tqf   10:20:57
+   server up, pid 897949, 15604 MiB at start; 51200 pooled tokens; [config] every TQ_* switch at its default
+   park_probe 16K exit 0 (3/3 PASS); 15892 MiB after it (ring allocated)
+   [   48k depth=0.95 rep=0] PASS prompt=48975 ttft=18.759s e2e=18.798s ans='CR-581935-BB' exp=['CR-581
+   [   48k depth=0.50 rep=0] PASS prompt=48982 ttft=18.764s e2e=18.802s ans='RD-844167-UB' exp=['RD-844
+   [   48k depth=0.05 rep=0] PASS prompt=48972 ttft=18.759s e2e=18.798s ans='VC-825886-FF' exp=['VC-825
+   needle 49152 (new-max): rc 0, PASS 3 FAIL 0
+   15896 MiB after the needle at 49152
+   [speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 198.4 (min 198.4, max 198.4), aggregate 198.4; 300 tokens in 1.6s; rounds 80 steps 80 tokens/round
+   [speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 78.9 (min 78.9, max 78.9), aggregate 78.9; 300 tokens in 3.9s; rounds 0 steps 299 tokens/round No
+   [speed] ctx=49152 N=1 spec=on: per-stream tok/s p50 181.6 (min 181.6, max 181.6), aggregate 181.6; 300 tokens in 1.7s; rounds 85 steps 85 tokens/round
+   [speed] ctx=49152 N=1 spec=off: per-stream tok/s p50 77.1 (min 77.1, max 77.1), aggregate 77.1; 300 tokens in 4.0s; rounds 0 steps 299 tokens/round No
+   T1 HumanEval+ with spec on through the 2-slot server   10:23:38
+   humaneval exit 0 10:32:48: pass@1: 0.939 pass@1: 0.896 
+   [t1] t45v4 spec on: [0.939, 0.896] (the 32 GB stack 93.9 / 91.5); degenerate answers 0 / 164 -> ok
+   15922 MiB after everything (the VARIANTS budget: 16 006 MiB at 400 blocks)
+   new: needle PASS 3 FAIL 0; MiB 15604 / 15896 / 15922; server log error lines 0
+-- old: qwen3_8-27b-exl3-t45-s425-mtp4.tqf   10:32:50
+   server up, pid 909556, 15654 MiB at start; 51200 pooled tokens; [config] every TQ_* switch at its default
+   park_probe 16K exit 0 (3/3 PASS); 15942 MiB after it (ring allocated)
+   [   48k depth=0.95 rep=0] PASS prompt=48975 ttft=18.874s e2e=18.913s ans='CR-581935-BB' exp=['CR-581
+   [   48k depth=0.50 rep=0] PASS prompt=48982 ttft=18.854s e2e=18.893s ans='RD-844167-UB' exp=['RD-844
+   [   48k depth=0.05 rep=0] PASS prompt=48972 ttft=18.851s e2e=18.89s ans='VC-825886-FF' exp=['VC-8258
+   needle 49152 (old-max): rc 0, PASS 3 FAIL 0
+   15946 MiB after the needle at 49152
+   [speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 192.5 (min 192.5, max 192.5), aggregate 192.5; 300 tokens in 1.6s; rounds 83 steps 83 tokens/round
+   [speed] ctx=32768 N=1 spec=off: per-stream tok/s p50 78.9 (min 78.9, max 78.9), aggregate 78.9; 300 tokens in 3.9s; rounds 0 steps 299 tokens/round No
+   [speed] ctx=49152 N=1 spec=on: per-stream tok/s p50 178.2 (min 178.2, max 178.2), aggregate 178.2; 300 tokens in 1.8s; rounds 87 steps 87 tokens/round
+   [speed] ctx=49152 N=1 spec=off: per-stream tok/s p50 77.1 (min 77.1, max 77.1), aggregate 77.1; 300 tokens in 4.0s; rounds 0 steps 299 tokens/round No
+   15954 MiB after everything (the VARIANTS budget: 16 006 MiB at 400 blocks)
+   old: needle PASS 3 FAIL 0; MiB 15654 / 15946 / 15954; server log error lines 0
+[gate3] PASS
+== ALL PASS   10:35:33  (landing: docs/VARIANTS.md 16 GB model := t45v4 (recipe + cal250 + the token-weights patch), README's smaller-cards line, tools/recipes, QUALITY.md, CHANGELOG, evidence)
