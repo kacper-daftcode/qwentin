@@ -20,10 +20,11 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
   full lm_head as before (the switch-off cell reproduces the stock drafts round for round). +240 MiB on the device.
   Gate: `docs/evidence/cand25-all.log` (211 / 211 kernels SASS-identical + one new argmax kernel, paged logits bitwise
   with the drafter's hooks on and the new file on / off, spec exactness, the served line, T1 with spec on 93.9 / 91.5).
-- **`--spec-k auto` drafts 6 deep at ≤ 2 active slots when the file carries the reduced vocabulary** (4 before; the
+- **`--spec-k auto` drafts 6 deep at ≤ 2 active slots and ≤ 64K of context when the file carries the reduced vocabulary** (4 before; the
   engine reports it through the new `qwn_draft_vocab_size`, 60 entry points). With the cheap draft step the deeper
   draft pays: 60 traced prompts 177.8 → 188.2 tok/s at N = 1 (K 4 → 6; 3.41 → 3.84 tokens per round), outputs
-  identical; 3 at ≤ 8 and 2 above stay (the verify wave's width rules there). Gate: `docs/evidence/cand26-all.log`.
+  identical; the served line's speed prompt 191 → 209 tok/s; at 128K the drafter's attention per step grows and K = 6 lost
+  7 %, so 4 stays past 64K); 3 at ≤ 8 and 2 above stay (the verify wave's width rules there). Gate: `docs/evidence/cand26-all.log`.
 - **A public yardstick next to ours**: exllamav3's `eval/model_diff.py` on wikitext-2 (100 × 2048 tokens) for the
   served and candidate weights vs the bf16 original — docs/QUALITY.md § 7 (`docs/evidence/wiki2/`). It also shows
   that the 16 GB model `t45v4` (−19 % KL on the code yardstick) reads +7 % on prose: its allocation is code-weighted.

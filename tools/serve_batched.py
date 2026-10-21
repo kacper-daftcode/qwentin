@@ -253,6 +253,7 @@ class Request:
 
 
 SPEC_MAX_T = 64      # verify wave column cap (qwn_paged_verify)
+SPEC_DEEP_MAX_POS = 65536   # --spec-k auto drafts 6 deep (with the reduced vocabulary) only while every active context is <= this
 
 
 class BatchedEngine:
@@ -292,11 +293,12 @@ class BatchedEngine:
             elif rc != 0:
                 raise RuntimeError(f"qwn_paged_mtp_init failed: {rc} (needs --mtp and a --mtp-exl3 tqf, e.g. ...-mtp4.tqf)")
         # the drafter's reduced vocabulary (the file's DRAFT lm_head section, TQ_DRAFT_VOCAB=1): a draft step costs
-        # ~0.4 ms instead of 0.8, so --spec-k auto drafts deeper at few clients (6 instead of 4; measured 10-21 on 60
-        # traced prompts: 177.8 -> 188.2 tok/s at N = 1, outputs identical; without the section K = 6 ties K = 4)
+        # ~0.4 ms instead of 0.8, so --spec-k auto drafts deeper at few clients (6 instead of 4 up to 64K of context;
+        # measured 10-21 on 60 traced prompts: 177.8 -> 188.2 tok/s at N = 1, outputs identical; without the section K = 6
+        # ties K = 4; at 128K it lost 7 %)
         self.draft_vocab = int(self.L.qwn_draft_vocab_size()) if self.spec and hasattr(self.L, "qwn_draft_vocab_size") else 0
         if self.spec and self.draft_vocab:
-            print(f"[spec] the drafter uses a reduced vocabulary of {self.draft_vocab} token ids; --spec-k auto = 6 at <= 2 active slots", flush=True)
+            print(f"[spec] the drafter uses a reduced vocabulary of {self.draft_vocab} token ids; --spec-k auto = 6 at <= 2 active slots up to {SPEC_DEEP_MAX_POS} tokens of context", flush=True)
         self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
         self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
         self.log_admits = os.environ.get("TQ_SERVE_LOG_ADMITS", "1") not in ("", "0")   # one line per admitted request
@@ -731,13 +733,16 @@ class BatchedEngine:
         for s in finished:
             self._detach(s)
 
-    def _spec_k_for(self, n):
+    def _spec_k_for(self, n, max_pos=0):
         """Draft depth for n active slots: auto = 4 at n <= 2 (6 with the drafter's reduced vocabulary, whose draft
         step is half the price), 3 at n <= 8, 2 above (measured 10-15 / 10-21: deeper drafts pay at few clients, the
         verify's per-column attention at many -- and N = 8 at K = 4 is a 40-column wave that costs 1.5x); capped by
-        the wave width."""
+        the wave width. max_pos = the longest active context: past 64K the drafter's own attention per step grows
+        and K = 6 lost 7 % at 128K on the speed prompt (121.7 -> 113.4 tok/s), so the deep draft stops there."""
         if self.spec_k == "auto":
-            k = (6 if self.draft_vocab else 4) if n <= 2 else (3 if n <= 8 else 2)
+            k = 4 if n <= 2 else (3 if n <= 8 else 2)
+            if n <= 2 and self.draft_vocab and max_pos <= SPEC_DEEP_MAX_POS:
+                k = 6          # the cheap draft step pays for two more drafts while the drafter's attention is short
         else:
             k = int(self.spec_k)
         while k > 0 and n * (k + 1) > SPEC_MAX_T:
@@ -753,7 +758,7 @@ class BatchedEngine:
         step when the drafter/verify cannot get pool blocks for the draft positions."""
         slots = list(self.active.keys())
         n = len(slots)
-        K = self._spec_k_for(n)
+        K = self._spec_k_for(n, max(self.active[s].pos for s in slots))
         if K < 1:
             return self._step()
         L = self.L
