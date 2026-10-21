@@ -1,0 +1,52 @@
+[cand26-all] start 22:55:46; cand 3fab0c23401d = 1606cb9 server: the deep draft (K = 6 with the reduced vocab; served 6de98497892a
+== gate 0: ruff + pytest, the exported ABI   22:55:46
+[1;32mAll checks passed![0m
+77 passed, 7 skipped in 0.83s
+84 passed in 0.83s
+[gate0] PASS (60 exports)
+== gate 1: SASS + bitwise   22:55:48
+kernels: old 212, new 212, common 212; identical 212, different 0
+[plab] N=3 cand-1215 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1215 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (dv64k file) cand-1215 vs served: bitwise True (25 tensors)
+[gate1] PASS
+== gate 2: THE SERVED LINE (dv64k file), K auto = 6/3/2   22:57:16
+   server up after 10 s, pid 1262391, 30138 MiB; 576000 pooled tokens; speculative decoding ON (MTP drafter, K=auto = 6/3/2 by active slots; draft vocabulary 65536 ids)
+   /health "draft_vocab": 65536
+   [repro] garbage 0 / 6
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.864s e2e=11.909s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.855s e2e=11.899s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.865s e2e=11.909s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=60.862s e2e=60.909s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=60.956s e2e=61.004s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=61.039s e2e=61.086s ans='ND-297860-GH' exp=['ND-29
+[ab] on: 10 prompts, 2647 tokens in 18.0s = 146.9 tok/s (concurrency 1); per-request mean 146.9 tok/s; rounds 648, tokens/round 4.07
+[ab] off: 10 prompts, 2647 tokens in 44.0s = 60.1 tok/s (concurrency 1); per-request mean 59.7 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[ab-vs-cand21] prompts identical True; texts identical to cand21: on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 209.6 (min 209.6, max 209.6), aggregate 209.6; 300 tokens in 1.5s; rounds 65 steps 65 tokens/round
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 209.5 (min 209.5, max 209.5), aggregate 209.5; 300 tokens in 1.5s; rounds 65 steps 65 tokens/round
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 162.3 (min 127.4, max 162.3), aggregate 289.7; 600 tokens in 2.5s; rounds 97 steps 97 tokens/round
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 162.2 (min 127.2, max 162.2), aggregate 289.4; 600 tokens in 2.5s; rounds 97 steps 97 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 83.5 (min 77.9, max 96.9), aggregate 677.3; 2400 tokens in 4.3s; rounds 129 steps 129 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 86.3 (min 79.7, max 95.0), aggregate 687.1; 2400 tokens in 4.3s; rounds 128 steps 128 tokens/round
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 122.6 (min 122.6, max 122.6), aggregate 122.6; 300 tokens in 2.7s; rounds 105 steps 105 tokens/ro
+   cand25-K4 ctx=32768 N=1: 3.85 tokens per round (300 tokens / 78 rounds)
+   cand25-K4 ctx=32768 N=1: 3.85 tokens per round (300 tokens / 78 rounds)
+   cand25-K4 ctx=32768 N=8: 18.46 tokens per round (2400 tokens / 130 rounds)
+   cand25-K4 ctx=32768 N=8: 18.46 tokens per round (2400 tokens / 130 rounds)
+   cand26-auto6 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand26-auto6 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand26-auto6 ctx=32768 N=2: 6.19 tokens per round (600 tokens / 97 rounds)
+   cand26-auto6 ctx=32768 N=2: 6.19 tokens per round (600 tokens / 97 rounds)
+   cand26-auto6 ctx=32768 N=8: 18.60 tokens per round (2400 tokens / 129 rounds)
+   cand26-auto6 ctx=32768 N=8: 18.75 tokens per round (2400 tokens / 128 rounds)
+   -- T1 HumanEval+ with spec on   23:08:03
+   humaneval exit 0 23:08:04: pass@1: 0.939 pass@1: 0.915 
+   [t1] humaneval spec on, K auto 6: [0.939, 0.915] (must equal 93.9 / 91.5); degenerate 0 / 164 -> ok
+   server log error lines: 0; repro clean 1; needle PASS 6 FAIL 0; A/B 10/10: 1, texts = cand21: 1; speed rc 0/0; T1 rc 0
+   -- the served v2 file (no draft section) on the same line: K auto must stay 4/3/2
+   server up after 10 s, pid 1272474, 29898 MiB; 576000 pooled tokens; speculative decoding ON (MTP drafter, K=auto = 4/3/2 by active slots; draft vocabulary 0 ids)
+   cand26-v2file-K4 ctx=32768 N=1: 3.85 tokens per round (300 tokens / 78 rounds)
+[gate2] PASS
+== ALL PASS   23:08:32  (landing: build-qwen/ := the candidate, main := cand-1215 (ff), patches 0134-0135)
