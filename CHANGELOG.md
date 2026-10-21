@@ -8,7 +8,21 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
-Nothing yet.
+- **The drafter's reduced vocabulary (a DRAFT lm_head section in the `.tqf`, `TQ_DRAFT_VOCAB`).** Every draft step
+  read the full 248 320-row 6-bit lm_head (0.95 GB, 585 µs — 72 % of the step; 2.3 ms of a 21.3 ms round at one
+  stream). The drafter now argmaxes over the 65 536 most frequent token ids through a 0.25 GB EXL3 head built from
+  the checkpoint's own lm_head rows (`tools/draft_head_build.py`, the id list in `tools/draft_vocab/`,
+  `convert_qwen_tqf.py --draft-head`, flag `0x2000`; docs/TQF_FORMAT.md); the verify keeps the full head, so the
+  outputs are the same tokens by construction. Measured on the served line: **191 tok/s at N = 1 @32K (179 before),
+  670 aggregate at N = 8 (646), 122 @128K (114)**; 60 traced prompts: outputs 60/60 identical, tokens per round
+  −0.5 % (99.7 % of the accepted drafts lie in the vocabulary; the 6-bit requantization agrees with the full head's
+  argmax on 99.6 % of the covered positions), tok/s +8.9 %. `TQ_DRAFT_VOCAB=0` or a file without the section = the
+  full lm_head as before (the switch-off cell reproduces the stock drafts round for round). +240 MiB on the device.
+  Gate: `docs/evidence/cand25-all.log` (211 / 211 kernels SASS-identical + one new argmax kernel, paged logits bitwise
+  with the drafter's hooks on and the new file on / off, spec exactness, the served line, T1 with spec on 93.9 / 91.5).
+- **A public yardstick next to ours**: exllamav3's `eval/model_diff.py` on wikitext-2 (100 × 2048 tokens) for the
+  served and candidate weights vs the bf16 original — docs/QUALITY.md § 7 (`docs/evidence/wiki2/`). It also shows
+  that the 16 GB model `t45v4` (−19 % KL on the code yardstick) reads +7 % on prose: its allocation is code-weighted.
 
 ## [v0.12] — 2026-10-21
 

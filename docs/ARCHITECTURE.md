@@ -96,8 +96,10 @@ EXL3 checkpoint ──convert_qwen_tqf.py --mtp-exl3──▶  model-mtp4.tqf  (
   scale`); the remaining 0.6 ms/step behind the FP4 kernels is that table lookup (LSU-bound).
 - **Speculative decoding — EXL3 MTP drafter + ragged verify + commit replay.** `qwn_paged_mtp_draft`
   runs K chained MTP steps for all active slots (step 0 reads the trunk hidden after the model's final
-  norm, what the head was trained on; the chained steps read the head's own normalized hidden);
-  `qwn_paged_verify` scores every slot's draft
+  norm, what the head was trained on; the chained steps read the head's own normalized hidden; the
+  argmax runs over the 65 536 most frequent token ids through a 0.25 GB EXL3 copy of those lm_head
+  rows — the `.tqf`'s DRAFT lm_head section, `TQ_DRAFT_VOCAB` — so a draft step costs ~0.4 ms instead
+  of 0.8); `qwn_paged_verify` scores every slot's draft
   segment in one wave with the decode-step kernels (segment-aware GQA attention: one K/V stream
   per slot segment, per-column key splits so the logits equal the sequential decode steps'
   bitwise); `qwn_paged_commit` replays the per-token DeltaNet recurrence over the accepted prefix
@@ -207,6 +209,8 @@ tools/gen_codebook_inc.py    lloyd_kv12a.f32 -> src/engine/kv_t4_codebook.inc (t
 tools/engine_text.py         the engine source in include order as prompt text (needle haystacks, prefill prompts, benches)
 tools/qwentin_abi.py         the same ABI for ctypes (Config, CONFIG_FIELDS, bind(lib)), generated with qwentin.h
 tools/recipes/*.yaml         the exllamav3 per-tensor bitrate recipes of the served models (opt-5.75, t45v4; t45-s425 = the 16 GB model until 2026-10-21)
+tools/draft_head_build.py    the drafter's reduced-vocabulary lm_head (an EXL3 copy of the 65 536 most frequent rows) for convert_qwen_tqf.py --draft-head
+tools/draft_vocab/           the id list behind it (qwen3_8-27b-ids-64k.txt)
 tools/recipes/cal250.safetensors  the 250-row calibration set of t45v4 (exllamav3 -cd format: input_ids [250, 2048])
 tools/exl3_token_weights_patch.py  the token-weighted Hessian capture for exllamav3's linear.py (t45v4's conversion; env-gated)
 tools/code_needle.py         needle-in-a-repository retrieval matrix through the OpenAI API

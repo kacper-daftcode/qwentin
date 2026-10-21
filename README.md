@@ -1,7 +1,7 @@
 # qwentin
 
 **Qwen3.8-27B on one RTX 5090 (32 GB): 576K pooled context tokens across 12 sessions at FP8 quality, with speculative
-decoding on every stream — 179 / 114 / 82 tok/s per stream at 1 / 4 / 8 streams @32K. On a 16 GB card: 51K tokens,
+decoding on every stream — 191 / 114 / 84 tok/s per stream at 1 / 4 / 8 streams @32K. On a 16 GB card: 51K tokens,
 198 tok/s @32K.**
 
 A from-scratch CUDA inference engine for the 27B hybrid-attention Qwen3.6/3.8 model on one consumer Blackwell GPU
@@ -17,25 +17,28 @@ and `bench/reproduce.sh` re-measures the served line on your card.
 | | **qwentin**, 1 × RTX 5090 | vLLM NVFP4, 1 × RTX 5090 (bf16 KV ; fp8 KV) | vLLM FP8, 2 × RTX 5090 (TP2) |
 |---|---|---|---|
 | Weights, KV cache | EXL3 5.75 bpw, 4-bit trellis K+V (16.5 KiB/token) | NVFP4 4.5 bpw, bf16 ; fp8 K+V | FP8, bf16 K+V |
-| Pooled KV capacity | **576K tokens** (12 slots, 29 898 MiB) | 147–179K ; 283K | 493K over two cards |
+| Pooled KV capacity | **576K tokens** (12 slots, 30 138 MiB) | 147–179K ; 283K | 493K over two cards |
 | Quality vs bf16 (KL / top-1) | **0.0021–0.0027 / 99.0–99.1 %**, EvalPlus = FP8 (93.9 / 91.5 · 90.7 / 77.8 with speculative decoding on) | ≈ 0.04 KL (fake-quant estimate) | 0.0037 / 98.7 % |
-| Decode per stream @32K, N = 1 / 4 / 8 | **179 / 114 / 82 tok/s** (66 / 57 / 48 without spec) | 71.5 / 51.4 / — ; 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 |
-| Decode per stream @128K, N = 1 | **114 tok/s** (58 without spec) | 55.5 ; 66.0 | 65.8 |
+| Decode per stream @32K, N = 1 / 4 / 8 | **191 / 114 / 84 tok/s** (66 / 57 / 48 without spec) | 71.5 / 51.4 / — ; 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 |
+| Decode per stream @128K, N = 1 | **122 tok/s** (58 without spec) | 55.5 ; 66.0 | 65.8 |
 | Cold TTFT, 32K / 128K | 11.6 / 60.1 s | **3.1 / 25.2 s** ; 3.3 / 30.0 s | **4.4 / 24.1 s** |
 | Needle in a repository, 32K + 128K | 6/6 | 6/6 | 6/6 |
 
-<sub>qwentin: engine `40892ff`, library md5 `5f9cee32da7c`, the serve line below, 550 W, CUDA 13.1; every cell measured
-twice in one run (`docs/evidence/rel12-table.log`), the two readings within 2 % except the N = 2 cells (one prompt per
-stream, 153 / 147 tok/s). Since v0.11: the drafter reads the trunk hidden after the final norm (+0.17 tokens per
-round) and a NaN of speculative decoding at position 384 is fixed (CHANGELOG) — the decode kernels are otherwise v0.10's
-bit for bit. Each spec-on cell follows the accepted draft length of its one prompt: 3.83 tokens per round @32K N = 1,
-2.82 @128K at ~21 / 25 ms per round. vLLM `0.32.0rc1.dev281`, same cards, 2026-10-17; the FP8 checkpoint does not fit
+<sub>qwentin: engine `4695fd6`, library md5 `6de98497892a`, the serve line below, 550 W, CUDA 13.1. The N = 1 / 8 @32K and
+the 128K cells are the drafter's reduced-vocabulary file (`docs/evidence/cand25-all.log` gate 3, two readings within
+1 %: 190.8 / 192.3, 670.4 / 670.9 aggregate); the N = 4 cell and the spec-off cells are the v0.12 table on the same
+engine (`rel12-table.log`). Since v0.11: the drafter reads the trunk hidden after the final norm (+0.17 tokens per
+round), a NaN of speculative decoding at position 384 is fixed, and the drafter argmaxes over the 65 536 most frequent
+token ids through a 0.25 GB head instead of the 0.95 GB lm_head (the verify keeps the full head: same tokens, +7–9 %
+decode) — the decode kernels are otherwise v0.10's bit for bit. Each spec-on cell follows the accepted draft length of
+its one prompt: 3.85 tokens per round @32K N = 1, 2.86 @128K at ~19.5 / 23 ms per round. vLLM `0.32.0rc1.dev281`, same cards, 2026-10-17; the FP8 checkpoint does not fit
 one 5090. Cell-by-cell sources: [`docs/evidence/README.md`](docs/evidence/README.md); the story behind the numbers:
 [`docs/NOTES.md`](docs/NOTES.md).</sub>
 
 ## One 16 GB card (v0.12, 2026-10-21)
 
-The 4.25 bpw model `t45v4` (−19 % KL at the same size as the previous `t45-s425`) with the same engine, two sessions,
+The 4.25 bpw model `t45v4` (−19 % KL on the code yardstick at the same size as the previous `t45-s425`; +7 % on
+wikitext-2 prose — the allocation is code-weighted, see `docs/QUALITY.md` § 7) with the same engine, two sessions,
 **emulated on a 5090 under a 16 GiB process budget** — not measured on a physical 16 GB card
 ([`docs/VARIANTS.md`](docs/VARIANTS.md) has the budget convention, the `--num-blocks` ladder and the previous model's cells).
 
@@ -65,10 +68,13 @@ git clone git@github.com:kacper-daftcode/qwentin.git && cd qwentin
 cmake -S . -B build-qwen -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc && make -C build-qwen -j8
 pip install -r requirements.txt                         # torch from the cu130 wheel index first
 
-# convert: exllamav3 with the served recipe (in the exllamav3 checkout, ~40 min on one 5090), then the .tqf (CPU, ~3 min)
+# convert: exllamav3 with the served recipe (in the exllamav3 checkout, ~40 min on one 5090), the drafter's reduced
+# vocabulary (10 s on the GPU; 65 536 token ids, outputs unchanged, decode +8 %), then the .tqf (CPU, ~3 min)
 python convert.py -i /path/to/Qwen3.8-27B -w /path/to/work -o /path/to/Qwen3.8-27B-exl3-opt5.75 \
     -rcp /path/to/qwentin/tools/recipes/qwen3_8-27b-exl3-opt5.75.yaml -hb 6 -mb 4 -vb 16 -d 0 -cpi 300
-python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-opt5.75 -o /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf --mtp-exl3
+python3 tools/draft_head_build.py /path/to/Qwen3.8-27B-exl3-opt5.75 -o /path/to/draft_head_64k.safetensors
+python3 tools/convert_qwen_tqf.py /path/to/Qwen3.8-27B-exl3-opt5.75 -o /path/to/qwen3_8-27b-exl3-opt5.75-mtp4.tqf \
+    --mtp-exl3 --draft-head /path/to/draft_head_64k.safetensors
 
 # serve: the served line -- every other setting is a default of serve_batched.py
 CUDA_VISIBLE_DEVICES=0 python3 -u tools/serve_batched.py \

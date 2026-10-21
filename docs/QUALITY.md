@@ -187,6 +187,7 @@ landing gate runs it that way since `cand23`.
 | **FP8 reference** — the FP8 checkpoint through vLLM, TP2 on two 5090s, bf16 KV | **93.9 / 90.9** | **90.2 / 77.0** | `docs/evidence/evalplus/fp8-vllm-ref-*.log` |
 | **served stack** — EXL3 opt-5.75 + trellis-4 K+V through `serve_batched.py`, 12 slots, 4500 blocks, spec off (spec is bitwise plain decode) | **93.9 / 91.5** | **89.7 / 77.5** | `docs/evidence/evalplus/b2eng-t4-*.log` (2026-10-15) |
 | **served stack, speculative decoding ON** (the served line as is, 2026-10-21, after the segment-attention fix of `cand23`; with the bug it read 53.7 / 53.0 and 75 of 164 answers were `!!!!`) | **93.9 / 91.5** | **90.7 / 77.8** | `docs/evidence/cand23-all.log` gate 3; the before / after of the bug: `cand23-t1-probe-served-{spec,nospec}.log` |
+| served stack, speculative decoding ON with the drafter's reduced vocabulary (`cand25`; the same tokens by construction) | 93.9 / 91.5 | — | `docs/evidence/cand25-all.log` gate 3 |
 | candidate weights: the KL-weighted v4 allocation at 5.6 bpw (not served; spec on, fixed library) | 92.7 / 90.2 | 91.3 / 77.5 | research repo `logs/t1-probe-v456-fixed.log` |
 | EXL3 opt-5.75 + int4 K / E4M3 V (batched server, 2026-10-02) | 92.1 / 89.6 | 89.9 / 77.5 | research repo `runs/evalplus-exl3o575-batched/` |
 | EXL3 opt-6.25 + FP4 K+V (the 2026-10-13 served line) | 93.3 / 89.6 | 90.7 / 77.2 | `runs/evalplus-exl3o6-v4-batched/` |
@@ -206,32 +207,38 @@ template, stop tokens). The ladder rows were produced by the research repo's `ev
 `eval/serve_exl3_openai.py` (an OpenAI server on exllamav3's generator) — not vendored here because it is not
 self-contained; `tools/evalplus.sh` is the part that scores any endpoint.
 
-## 7. Not measured yet: a standard perplexity eval (wikitext-2 / C4)
+## 7. A public yardstick: exllamav3's `model_diff.py` on wikitext-2 (weights only)
 
-No wikitext-2 or C4 perplexity has been measured for any qwentin stack. The yardstick above *is* a perplexity-class
-measurement (`ppl_ratio` is reported: 1.0013 for the served stack at 4K, 1.0016 for FP8) but on the code corpus and
-against the bf16 model's own distribution, not the standard word-level perplexity that papers quote.
+The numbers above are on code tokens and with this repository's own harness; nobody else's figures are comparable to
+them. Since 2026-10-21 the weights are also measured the way EXL3 model cards do it — exllamav3's `eval/model_diff.py`
+(the quantized checkpoint as model A, the bf16 original as model B, 100 rows × 2048 tokens of the wikitext-2 test split,
+the same tool and data for every row; `docs/evidence/wiki2/*.log`, `docs/evidence/scripts/s16-wiki2-kl.sh`):
 
-How it would be run, and why it cannot be yet:
+| weights (bpw) | KL(A‖B) | top-1 agreement | perplexity A (B = 7.0021) | the code yardstick's KL (§ 4) |
+|---|---:|---:|---:|---:|
+| EXL3 opt-6.0 (6.0) | 0.00193 | 98.54 % | 7.0024 | 0.0012 |
+| **EXL3 opt-5.75 (5.75; the served weights)** | **0.00207** | **98.35 %** | 6.9961 | 0.0016 |
+| EXL3 opt-5.6-v4 (5.6; the KL-weighted allocation, not served) | 0.00273 | 98.10 % | 6.9912 | ≈ opt-5.75 at 4K and 32K |
+| EXL3 opt-5.5 (5.5; the shipped recipe) | 0.00274 | 98.11 % | 7.0141 | 0.0023 |
+| EXL3 opt-5.5-R2 (5.5; code calibration + token weights) | 0.00287 | 98.04 % | 7.0096 | 0.00195 |
+| EXL3 opt-5.0 (5.0) | 0.00442 | 97.55 % | 6.9890 | 0.0040 |
+| EXL3 t45-s425 (4.25; the 16 GB weights until 2026-10-21) | 0.01048 | 96.10 % | 6.9575 | 0.0110 |
+| **EXL3 t45v4 (4.25; the 16 GB weights)** | **0.01123** | **96.01 %** | 7.0543 | 0.0087 |
+| EXL3 opt-4.0 (4.0) | 0.01311 | 95.52 % | 6.9734 | 0.0138 |
 
-```bash
-pip install lm-eval
-lm_eval --model local-completions --tasks wikitext \
-    --model_args model=qwen3.8-27b,base_url=http://127.0.0.1:8100/v1/completions,tokenizer=/models/Qwen3.8-27B,tokenizer_backend=huggingface,num_concurrent=1,max_retries=3
-```
+Reading: the wikitext-2 KL of the served opt-5.75 is 0.0021 — the same order as its code-token KL, so the two
+yardsticks agree on the bitrate ladder and on where "near-lossless" begins (≥ 5 bpw). They disagree on the chain-v4
+levers: **code calibration, the token-weighted Hessian and the KL-weighted allocation move quality toward code and
+away from prose** — R2 is 0.00195 vs 0.00227 on code but 0.00287 vs 0.00274 on wikitext-2, and the 16 GB `t45v4` is
+−19 % on code but **+7 % on wikitext-2** against the previous `t45-s425`. The served 32 GB weights (opt-5.75) are the
+plain recipe and carry no such tilt; the 16 GB model is tuned for the project's workload (agentic coding), and a user
+whose workload is prose should prefer `t45-s425` (`tools/recipes/qwen3_8-27b-exl3-t45-s425.yaml`). A perplexity below
+the reference's (t45-s425, opt-5.75 ...) is the calibration-set effect exllamav3 documents; KL is the measure.
 
-`wikitext` (and every loglikelihood task) needs the completions endpoint to return the **prompt's own token logprobs**:
-`lm-eval` sends `{"prompt": ..., "max_tokens": 0, "echo": true, "logprobs": 1}` and reads `choices[0].logprobs.token_logprobs`
-for the prompt tokens (vLLM's `prompt_logprobs`). **The server does not implement this today**: `tools/serve_batched.py`
-ignores `logprobs` / `echo` (it returns text only). The engine side
-is ready — `tools/qwentin_e2e.py` already reads the fp32 logits of every prefill column through the
-`qwn_paged_logits_sink` ABI — so this is a server feature, not an engine one.
-
-**TODO**: (1) `serve_batched.py`: `logprobs` + `echo` on `/v1/completions` (prompt logprobs from the prefill waves'
-logits sink; `top_logprobs` optional), gated behind a flag because it costs a 248K-wide fp32 row per prompt token;
-(2) run `lm_eval` wikitext-2 and C4 (`--tasks wikitext,c4` or the `pile_*`/`c4` configs available in the installed
-lm-eval) against the served line and against the FP8 checkpoint through vLLM on the same box; (3) publish both next to
-the KL table with the same provenance footer. Until then the README does not claim a wikitext / C4 number.
+Not measured yet: the engine end to end on wikitext (the KV cache and the embedding format): `lm-eval`'s `wikitext`
+task needs prompt logprobs on `/v1/completions` (`echo` + `logprobs`), which `tools/serve_batched.py` does not implement
+(the engine side is ready — `tools/qwentin_e2e.py` reads every prefill column's fp32 logits through the
+`qwn_paged_logits_sink` ABI). Until then the README quotes the weights-only wikitext-2 numbers above as such.
 
 ## 8. Needle, speed and the rest
 

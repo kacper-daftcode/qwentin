@@ -4,8 +4,9 @@ Both variants were **emulated on an RTX 5090** with a capped KV pool and a proce
 physical 16 GB or 24 GB card; on a real card the process budget is the card's free memory. The 16 GB model is the
 4.25 bpw EXL3 checkpoint **t45v4** (since 2026-10-21: `tools/recipes/qwen3_8-27b-exl3-t45v4.yaml` with the calibration
 set `tools/recipes/cal250.safetensors` and the token-weighted Hessian, the conversion block in
-[`ARCHITECTURE.md`](ARCHITECTURE.md); −19 % KL at the same size as the previous two-tier `t45-s425` recipe, whose
-numbers are kept below for comparison); the 24 GB card runs the served opt-5.75 model with one slot. Provenance of
+[`ARCHITECTURE.md`](ARCHITECTURE.md); −19 % KL on the code yardstick at the same size as the previous two-tier `t45-s425`
+recipe, whose numbers are kept below for comparison — but **+7 % on wikitext-2 prose** (`QUALITY.md` § 7): the allocation
+is tuned for code, and a prose workload should keep `t45-s425`); the 24 GB card runs the served opt-5.75 model with one slot. Provenance of
 every cell: [`evidence/README.md`](evidence/README.md).
 
 **One 16 GB card** — measured on a 5090 under a 16 GiB process budget, **not on a physical
