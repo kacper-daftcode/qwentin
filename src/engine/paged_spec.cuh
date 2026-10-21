@@ -668,8 +668,9 @@ extern "C" const float *qwn_paged_verify_hidden(int *out_T) {
 // ===================== Paged MTP drafter (stage 3) =====================
 // The MTP head (fc + one full-attention layer + mtp.norm, the shared lm_head) runs over its own paged
 // KV pool on the slots' block tables (one more "layer" of pool rows, FP4 like the main pool). MTP KV
-// slot p of a slot <- (h_p, x_{p+1}): the main model's pre-final-norm hidden at p and the token that
-// followed (the single-stream trunk convention); the MTP forward at slot p predicts x_{p+2}.
+// slot p of a slot <- (h_p, x_{p+1}): the main model's hidden at p after the final norm (what the head was
+// trained on; the slots keep the pre-final-norm rows and mtp_fc_forward applies the norm) and the token that
+// followed; the MTP forward at slot p predicts x_{p+2}.
 // Trunk maintenance, only with qwn_paged_mtp_init(1): prefill waves write the in-wave pairs (col t,
 // col t+1) of every segment plus the cross-wave pair from the slot's remembered last hidden; the decode
 // step writes (last hidden, token) -> slot pos-1; the commit writes the pairs over the accepted columns.
@@ -681,7 +682,7 @@ extern "C" const float *qwn_paged_verify_hidden(int *out_T) {
 #define TQ_MTP_CTL_ROWS 24
 #define TQ_MTP_CTL_COLS 128
 #define TQ_MTP_MAX_K 16
-static float   *g_mtp_fc_in = NULL, *g_mtp_x = NULL, *g_mtp_hid = NULL, *g_mtp_e = NULL;   // [128][2H], [128][H] x 3
+static float   *g_mtp_fc_in = NULL, *g_mtp_x = NULL, *g_mtp_hid = NULL, *g_mtp_e = NULL, *g_mtp_hn = NULL;   // [128][2H], [128][H] x 4
 static int     *g_mtp_ctl = NULL;                    // device ints [TQ_MTP_CTL_ROWS][TQ_MTP_CTL_COLS]
 static int     *g_mtp_draft_d = NULL;                // [TQ_MTP_MAX_K][max_slots]
 static int      h_mtp_ctl[TQ_MTP_CTL_ROWS][TQ_MTP_CTL_COLS];
@@ -697,6 +698,7 @@ static void mtp_paged_free(void) {
     if (g_mtp_x) { cudaFree(g_mtp_x); g_mtp_x = NULL; }
     if (g_mtp_hid) { cudaFree(g_mtp_hid); g_mtp_hid = NULL; }
     if (g_mtp_e) { cudaFree(g_mtp_e); g_mtp_e = NULL; }
+    if (g_mtp_hn) { cudaFree(g_mtp_hn); g_mtp_hn = NULL; }
     if (g_mtp_ctl) { cudaFree(g_mtp_ctl); g_mtp_ctl = NULL; }
     if (g_mtp_draft_d) { cudaFree(g_mtp_draft_d); g_mtp_draft_d = NULL; }
     g_mtp_on = 0;
@@ -727,6 +729,7 @@ extern "C" int qwn_paged_mtp_init(int on) {
         cudaMalloc(&g_mtp_x, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&g_mtp_hid, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&g_mtp_e, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_mtp_hn, (size_t)TQ_MTP_CTL_COLS * H * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&g_mtp_ctl, (size_t)TQ_MTP_CTL_ROWS * TQ_MTP_CTL_COLS * sizeof(int)) != cudaSuccess ||
         cudaMalloc(&g_mtp_draft_d, (size_t)TQ_MTP_MAX_K * g_pg_maxslots * sizeof(int)) != cudaSuccess) {
         mtp_paged_free(); return -6;
@@ -753,7 +756,9 @@ __global__ void k_tq_scatter_rows_nk(float *dst, const int *dst_idx, const float
 }
 
 // fc_in = [norm_emb(embed(tok)), norm_hidden(hidden)] -> x = fc(fc_in) for m columns (device arrays:
-// tokens d_tok, hidden rows d_hidx of hsrc, or hsrc rows 0..m-1 when d_hidx == NULL).
+// tokens d_tok, hidden rows d_hidx of hsrc, or hsrc rows 0..m-1 when d_hidx == NULL). Gathered rows are the
+// trunk's pre-final-norm hiddens and get the model's final norm first; ungathered rows are the head's own
+// post-mtp.norm hidden of the previous draft step.
 static int mtp_fc_forward(const float *hsrc, const int *d_hidx, const int *d_tok, int m) {
     int H = g_qwen.H;
     cudaStream_t st = g_qwen.stream;
@@ -762,7 +767,8 @@ static int mtp_fc_forward(const float *hsrc, const int *d_hidx, const int *d_tok
     const float *hid = hsrc;
     if (d_hidx) {
         k_tq_gather_rows_nk<<<dim3((H + 255) / 256, m), 256, 0, st>>>(g_mtp_hid, hsrc, d_hidx, H);
-        hid = g_mtp_hid;
+        k_tq_qwen_rmsnorm_b<<<dim3(8, m), 1024, 0, st>>>(g_mtp_hn, g_mtp_hid, g_qwen.d_norm, H, g_qwen.eps);
+        hid = g_mtp_hn;
     }
     k_tq_qwen_rmsnorm_b_out<<<dim3(8, m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, H, hid, g_qwen.d_mtp_pre_fc_norm_hidden, H, g_qwen.eps);
     int ret = wide_quant_input(g_mtp_fc_in, 2 * H, m);
