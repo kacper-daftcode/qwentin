@@ -861,7 +861,12 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg(
         size_t pidx = ((size_t)(head * ncols + rcol[tid]) * S + split);
         part_ml[pidx * 2 + 0] = mst[tid]; part_ml[pidx * 2 + 1] = lst[tid];
     }
-    // rows with S_t == 1 (only split 0 reaches here for them): normalize (+ rotate back for int4 V) + gate
+    // Rows with S_t == 1 are final rows of split 0 ONLY: a block of split >= 1 holds such a row with an empty tile
+    // range (lst 0, acc 0) when the wave mixes S_t == 1 and S_t > 1 columns -- the first key-split change at position
+    // 384 -- and used to write 0 * inf = NaN over split 0's result (the served line's spec decode turned to token 0
+    // for ~half of the prompts shorter than 384 tokens that generated past it; found 2026-10-21 by T1 with spec on).
+    if (split > 0) return;
+    // rows with S_t == 1: normalize (+ rotate back for int4 V) + gate
     __syncthreads();
     float *ob = (float *)sm;                                      // 8 rows x 256 (aliases the A fragments)
     for (int rb = 0; rb < nrows; rb += 8) {
@@ -1301,6 +1306,11 @@ __global__ void __launch_bounds__(256, 2) k_tq_paged_attn_q4_gqa_f16(
         size_t pidx = ((size_t)(head * ncols + rcol[tid]) * S + split);
         part_ml[pidx * 2 + 0] = mst[tid]; part_ml[pidx * 2 + 1] = lst[tid];
     }
+    // Rows with S_t == 1 are final rows of split 0 ONLY: a block of split >= 1 holds such a row with an empty tile
+    // range (lst 0, acc 0) when the wave mixes S_t == 1 and S_t > 1 columns -- the first key-split change at position
+    // 384 -- and used to write 0 * inf = NaN over split 0's result (the served line's spec decode turned to token 0
+    // for ~half of the prompts shorter than 384 tokens that generated past it; found 2026-10-21 by T1 with spec on).
+    if (split > 0) return;
     __syncthreads();
     float *ob = (float *)sm;                                      // 8 rows x 256 (aliases the A fragments)
     for (int rb = 0; rb < nrows; rb += 8) {
@@ -1855,7 +1865,12 @@ __global__ void __launch_bounds__(256) k_tq_paged_attn_q4_gqa_seg_t4(
         size_t pidx = ((size_t)(head * ncols + rcol[tid]) * S + split);
         part_ml[pidx * 2 + 0] = mst[tid]; part_ml[pidx * 2 + 1] = lst[tid];
     }
-    // rows with S_t == 1 (only split 0 reaches here for them): normalize + rotate back (rotated V space) + gate
+    // Rows with S_t == 1 are final rows of split 0 ONLY: a block of split >= 1 holds such a row with an empty tile
+    // range (lst 0, acc 0) when the wave mixes S_t == 1 and S_t > 1 columns -- the first key-split change at position
+    // 384 -- and used to write 0 * inf = NaN over split 0's result (the served line's spec decode turned to token 0
+    // for ~half of the prompts shorter than 384 tokens that generated past it; found 2026-10-21 by T1 with spec on).
+    if (split > 0) return;
+    // rows with S_t == 1: normalize + rotate back (rotated V space) + gate
     __syncthreads();
     float *ob = (float *)sm;                                      // 8 rows x 256 (aliases the A fragments)
     for (int rb = 0; rb < nrows; rb += 8) {
