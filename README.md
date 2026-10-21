@@ -1,7 +1,7 @@
 # qwentin
 
 **Qwen3.8-27B on one RTX 5090 (32 GB): 576K pooled context tokens across 12 sessions at FP8 quality, with speculative
-decoding on every stream — 191 / 114 / 84 tok/s per stream at 1 / 4 / 8 streams @32K. On a 16 GB card: 51K tokens,
+decoding on every stream — 210 / 114 / 85 tok/s per stream at 1 / 4 / 8 streams @32K. On a 16 GB card: 51K tokens,
 198 tok/s @32K.**
 
 A from-scratch CUDA inference engine for the 27B hybrid-attention Qwen3.6/3.8 model on one consumer Blackwell GPU
@@ -19,19 +19,20 @@ and `bench/reproduce.sh` re-measures the served line on your card.
 | Weights, KV cache | EXL3 5.75 bpw, 4-bit trellis K+V (16.5 KiB/token) | NVFP4 4.5 bpw, bf16 ; fp8 K+V | FP8, bf16 K+V |
 | Pooled KV capacity | **576K tokens** (12 slots, 30 138 MiB) | 147–179K ; 283K | 493K over two cards |
 | Quality vs bf16 (KL / top-1) | **0.0021–0.0027 / 99.0–99.1 %**, EvalPlus = FP8 (93.9 / 91.5 · 90.7 / 77.8 with speculative decoding on) | ≈ 0.04 KL (fake-quant estimate) | 0.0037 / 98.7 % |
-| Decode per stream @32K, N = 1 / 4 / 8 | **191 / 114 / 84 tok/s** (66 / 57 / 48 without spec) | 71.5 / 51.4 / — ; 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 |
-| Decode per stream @128K, N = 1 | **122 tok/s** (58 without spec) | 55.5 ; 66.0 | 65.8 |
+| Decode per stream @32K, N = 1 / 4 / 8 | **210 / 114 / 85 tok/s** (66 / 57 / 48 without spec) | 71.5 / 51.4 / — ; 75.3 / 58.8 / — | 76.8 / 60.3 / 50.4 |
+| Decode per stream @128K, N = 1 | **123 tok/s** (58 without spec) | 55.5 ; 66.0 | 65.8 |
 | Cold TTFT, 32K / 128K | 11.6 / 60.1 s | **3.1 / 25.2 s** ; 3.3 / 30.0 s | **4.4 / 24.1 s** |
 | Needle in a repository, 32K + 128K | 6/6 | 6/6 | 6/6 |
 
-<sub>qwentin: engine `4695fd6`, library md5 `6de98497892a`, the serve line below, 550 W, CUDA 13.1. The N = 1 / 8 @32K and
-the 128K cells are the drafter's reduced-vocabulary file (`docs/evidence/cand25-all.log` gate 3, two readings within
-1 %: 190.8 / 192.3, 670.4 / 670.9 aggregate); the N = 4 cell and the spec-off cells are the v0.12 table on the same
+<sub>qwentin: engine `4695fd6`, library md5 `3fab0c23401d`, the serve line below, 550 W, CUDA 13.1. The N = 1 / 8 @32K and
+the 128K cells are the drafter's reduced-vocabulary file with `--spec-k auto` = 6 drafts at ≤ 2 streams
+(`docs/evidence/cand26-all.log` gate 2, two readings within 1 %: 209.6 / 209.5 at 4.62 tokens per round, 673 / 685
+aggregate at N = 8); the N = 4 cell and the spec-off cells are the v0.12 table on the same
 engine (`rel12-table.log`). Since v0.11: the drafter reads the trunk hidden after the final norm (+0.17 tokens per
 round), a NaN of speculative decoding at position 384 is fixed, and the drafter argmaxes over the 65 536 most frequent
 token ids through a 0.25 GB head instead of the 0.95 GB lm_head (the verify keeps the full head: same tokens, +7–9 %
 decode) — the decode kernels are otherwise v0.10's bit for bit. Each spec-on cell follows the accepted draft length of
-its one prompt: 3.85 tokens per round @32K N = 1, 2.86 @128K at ~19.5 / 23 ms per round. vLLM `0.32.0rc1.dev281`, same cards, 2026-10-17; the FP8 checkpoint does not fit
+its one prompt: 4.62 tokens per round @32K N = 1 (K = 6), 2.86 @128K (K = 4) at ~22 / 23 ms per round. vLLM `0.32.0rc1.dev281`, same cards, 2026-10-17; the FP8 checkpoint does not fit
 one 5090. Cell-by-cell sources: [`docs/evidence/README.md`](docs/evidence/README.md); the story behind the numbers:
 [`docs/NOTES.md`](docs/NOTES.md).</sub>
 
