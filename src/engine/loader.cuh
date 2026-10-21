@@ -168,7 +168,7 @@ extern "C" int qwn_tqf_blake2b256(const void *data, size_t n, uint8_t *out) {
 // extension (-45). Leaves the file positioned at the payload.
 #define TQF_FORMAT_VERSION 2
 #define TQF_EXT_BYTES 80
-#define TQF_KNOWN_FLAGS 0x1FFFu
+#define TQF_KNOWN_FLAGS 0x3FFFu      // through TQ_FLAG_DRAFT_HEAD (0x2000)
 static int tqf_check_integrity(FILE *f, const char *path, uint32_t header_bytes, uint32_t base_header) {
     uint32_t unknown = g_qwen.flags & ~TQF_KNOWN_FLAGS;
     if (header_bytes == base_header) {
