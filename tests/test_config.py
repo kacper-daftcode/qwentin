@@ -94,7 +94,7 @@ def parse(tmp_path_factory):
 
 DEFAULTS = {
     "TQ_CTX": "262144", "TQ_KV_Q4": "1", "TQ_KV_V4": "1", "TQ_KV_T4": "1", "TQ_DSTATE_BF16": "4", "TQ_EMBED_HOST": "1",
-    "TQ_EMBED_FP8": "0", "TQ_NO_MTP": "0", "TQ_VERIFY_TQF": "0", "TQ_PDL": "1", "TQ_WIDE_ATTN_MMA": "1",
+    "TQ_EMBED_FP8": "0", "TQ_NO_MTP": "0", "TQ_DRAFT_VOCAB": "1", "TQ_VERIFY_TQF": "0", "TQ_PDL": "1", "TQ_WIDE_ATTN_MMA": "1",
     "TQ_PAGED_ATTN_MMA": "1", "TQ_GDN_PREFILL": "1", "TQ_T4_ATTN_F16": "1", "TQ_PAGED_ATTN_ST": "3", "TQ_GRAPH": "1",
     "TQ_GEMM_FORK": "1", "TQ_GEMM_FORK_MAXN": "64", "TQ_EXL3_WIDE_NG16": "1", "TQ_EXL3_BF16_R4": "1", "TQ_PATTN_GQA": "1",
     "TQ_WAVE_MAX": "128", "TQ_WIDE_ATTN_QROWS": "32", "TQ_KV_T4_ASYNC": "1", "TQ_PAGED_TOPK_PAGES": "0",
@@ -134,7 +134,7 @@ def test_rule(parse, assignment, expected):
 
 def test_config_line_lists_the_non_defaults(parse):
     _, line = parse("TQ_CTX=8192", "TQ_KV_T4=0", "TQ_GRAPH=1", "TQ_KV_T4_CODEBOOK=/c.f32")
-    assert line == "[config] TQ_CTX=8192 TQ_KV_T4=0 TQ_KV_T4_CODEBOOK=/c.f32 (the other 31 TQ_* switches at their defaults)"
+    assert line == "[config] TQ_CTX=8192 TQ_KV_T4=0 TQ_KV_T4_CODEBOOK=/c.f32 (the other 32 TQ_* switches at their defaults)"
 
 
 @pytest.mark.parametrize("field, expected", [

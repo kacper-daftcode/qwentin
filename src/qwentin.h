@@ -23,6 +23,7 @@ typedef struct qwn_config {
     int embed_host;             /* TQ_EMBED_HOST */
     int embed_fp8;              /* TQ_EMBED_FP8 */
     int no_mtp;                 /* TQ_NO_MTP */
+    int draft_vocab;            /* TQ_DRAFT_VOCAB */
     int verify_tqf;             /* TQ_VERIFY_TQF */
     int pdl;                    /* TQ_PDL */
     int wide_attn_mma;          /* TQ_WIDE_ATTN_MMA */

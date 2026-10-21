@@ -28,6 +28,34 @@ __global__ void k_tq_batched_argmax(int *out_ids, const float *logits, int V, in
     if (tid == 0) out_ids[c] = si[0];
 }
 
+// The drafter's argmax over the DRAFT lm_head's V' rows (TQ_FLAG_DRAFT_HEAD): the winning row is mapped to its
+// token id through d2t (stored as float: exact below 2^24). Same reduction as k_tq_batched_argmax.
+__global__ void k_tq_batched_argmax_map(int *out_ids, const float *logits, int V, int N, const float *d2t) {
+    tq_pdl_enter();
+    int c = blockIdx.x;
+    if (c >= N) return;
+    const float *row = logits + (size_t)c * V;
+    int tid = threadIdx.x, bs = blockDim.x;
+    float best = -3.402823466e38f; int besti = 0;
+    for (int i = tid; i < V; i += bs) {
+        float v = row[i];
+        if (v > best) { best = v; besti = i; }
+    }
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    sv[tid] = best; si[tid] = besti;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_ids[c] = (int)d2t[si[0]];
+}
+
 // (scale,zp) element size for the Q4 K scale store (fp16).
 static size_t batched_q4s_elem_bytes(void) { return sizeof(__half); }
 

@@ -53,6 +53,8 @@ extern "C" void qwn_free(void) {
             free_qmma(&m->mlp_gate); free_qmma(&m->mlp_up); free_qmma(&m->mlp_down);
             g_qwen.mtp_exl3 = 0;
         }
+        if (g_qwen.draft_on) { free_qmma(&g_qwen.draft_head); g_qwen.draft_on = 0; }
+        if (g_qwen.d_draft_d2t) cudaFree(g_qwen.d_draft_d2t);
         if (g_qwen.d_mtp_pre_fc_norm_emb) cudaFree(g_qwen.d_mtp_pre_fc_norm_emb);
         if (g_qwen.d_mtp_pre_fc_norm_hidden) cudaFree(g_qwen.d_mtp_pre_fc_norm_hidden);
         if (g_qwen.d_mtp_norm) cudaFree(g_qwen.d_mtp_norm);
@@ -493,6 +495,25 @@ static int parse_tqf(const char *path, int upload) {
             g_qwen.has_mtp_section = 0;
             printf("  MTP head section skipped (TQ_NO_MTP)\n");
         } else if (upload) printf("  MTP head section skipped (bf16 projections: the paged drafter needs a --mtp-exl3 file)\n");
+    }
+    // The DRAFT lm_head section (TQ_FLAG_DRAFT_HEAD, convert_qwen_tqf.py --draft-head): read with the MTP head when
+    // TQ_DRAFT_VOCAB=1 (the drafter then argmaxes over its V' rows and maps the row to the token id), read past otherwise.
+    if (g_qwen.flags & TQ_FLAG_DRAFT_HEAD) {
+        int dup = g_qwen.mtp_exl3 && g_cfg.draft_vocab;
+        float meta[4];
+        if (read_exact(f, meta, sizeof(meta), "draft.meta") != 0) { fclose(f); return -1; }
+        g_qwen.f32_count++;
+        int dv = (int)meta[0];
+        if (dv <= 0 || (dv % 128) != 0 || dv > g_qwen.V) {
+            fprintf(stderr, "draft.meta: bad draft vocabulary size %d (V=%d)\n", dv, g_qwen.V); fclose(f); return -1;
+        }
+        if (read_f32(f, &g_qwen.d_draft_d2t, (size_t)dv, "draft.d2t", dup) != 0) { fclose(f); return -1; }
+        if (read_exl3(f, &g_qwen.draft_head, dv, g_qwen.H, "draft.lm_head", dup) != 0) { fclose(f); return -1; }
+        g_qwen.draft_V = dv;
+        g_qwen.draft_on = dup;
+        if (dup) printf("  DRAFT lm_head section loaded: the drafter argmaxes over %d token ids (%d-bit EXL3; TQ_DRAFT_VOCAB=0 = the full lm_head)\n",
+                        dv, g_qwen.draft_head.exl3_kbits);
+        else if (upload) printf("  DRAFT lm_head section skipped (%s)\n", g_qwen.mtp_exl3 ? "TQ_DRAFT_VOCAB=0" : "no MTP head loaded");
     }
 
     long pos = ftell(f);

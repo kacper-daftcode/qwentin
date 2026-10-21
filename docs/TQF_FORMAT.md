@@ -45,6 +45,7 @@ section is *present in the file* is flag `0x400`.
 | `0x400` | `has_mtp_section` | the MTP head section follows the main payload |
 | `0x800` | `exl3_weights` | **EXL3**: Linear slots are exllamav3 trellis records (variable size, see below) |
 | `0x1000` | `mtp_exl3` | the MTP section's 8 projections are EXL3 records (else bf16 matrices) |
+| `0x2000` | `draft_head` | a DRAFT lm_head section follows the MTP section (`--draft-head`; needs `0x1000`) |
 
 The two production formats and what `tools/inspect_tqf.py` checks for its PASS / FAIL lines:
 
@@ -117,6 +118,19 @@ Appended right after the main payload, in this order (`mtp_tensor_specs()` in th
 `non_quant` bf16 matrices (0.85 GB for the 27B; `--mtp-source` and the FP6 recipe write them, the engine reads past them
 since v0.11 -- the single-stream path that drafted with them is retired) or, with `0x1000`, EXL3 records (0.25 GB on the
 device; the batched server's paged drafter, `--mtp-exl3`).
+
+## DRAFT lm_head section (`0x2000`)
+
+Appended right after the MTP section (`tools/convert_qwen_tqf.py --draft-head <safetensors>`, which needs `--mtp-exl3`): the
+paged drafter's reduced vocabulary (EAGLE-3's "draft vocabulary") — the V' most frequent token ids of the served workload,
+whose lm_head rows are re-quantized as one EXL3 Linear so a draft step reads 0.25 GB (65 536 rows at 6 bits) instead of the
+full 0.95 GB lm_head; the verify keeps the full head, so the outputs are bit for bit what they were and only the
+proposed drafts change. Records, in order: `draft.meta` f32 `[4]` = (V', kbits, 0, 0); `draft.d2t` f32 `[V']` = the
+token id of each draft row (stored as float — exact below 2²⁴ — so the argmax kernel maps a row to its id without a
+conversion); `draft.lm_head` = an EXL3 record `[V', h]` (V' a multiple of 128). The engine loads it with the MTP head when
+`TQ_DRAFT_VOCAB=1` (the default) and reads past it otherwise; `tools/inspect_tqf.py` prints `draft_head: V' = ...`. The
+section is built by the research repo's `analysis/draft_head_build.py` (frequency ranking → rows gathered from the
+dequantized checkpoint lm_head → `quantize_exl3`).
 
 ## Format version 2: recorded size, hashes, and a loader that refuses
 

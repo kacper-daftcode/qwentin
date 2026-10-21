@@ -33,6 +33,7 @@ static const tq_switch_t k_tq_switches[] = {
     {"TQ_EMBED_HOST",          &qwn_config::embed_host,          TQ_SW_BOOL, 1},
     {"TQ_EMBED_FP8",           &qwn_config::embed_fp8,           TQ_SW_INT,  0,       0,    2,          1},
     {"TQ_NO_MTP",              &qwn_config::no_mtp,              TQ_SW_BOOL, 0},
+    {"TQ_DRAFT_VOCAB",         &qwn_config::draft_vocab,         TQ_SW_BOOL, 1},
     {"TQ_VERIFY_TQF",          &qwn_config::verify_tqf,          TQ_SW_BOOL, 0},
     {"TQ_PDL",                 &qwn_config::pdl,                 TQ_SW_INT,  1,       0,    2,          0},
     {"TQ_WIDE_ATTN_MMA",       &qwn_config::wide_attn_mma,       TQ_SW_BOOL, 1},

@@ -47,15 +47,16 @@ FLAG_SPARSE_24_E2M3 = 1 << 9
 FLAG_HAS_MTP = 1 << 10
 FLAG_EXL3_WEIGHTS = 1 << 11
 FLAG_MTP_EXL3 = 1 << 12
+FLAG_DRAFT_HEAD = 1 << 13          # a DRAFT lm_head section after the MTP section (convert_qwen_tqf.py --draft-head)
 FLAG_NAMES = {
     FLAG_FP8_QMMA_WEIGHTS: "fp8_qmma_weights", FLAG_TIED_EMBEDDINGS: "tied_embeddings",
     FLAG_SOURCE_BF16_NON_QUANT: "source_bf16_non_quant", FLAG_DROPPED_VISION: "dropped_vision",
     FLAG_DROPPED_MTP: "dropped_mtp", FLAG_BLOCK_SCALED_QMMA: "block_scaled_qmma",
     FLAG_BLOCK_SCALED_ROWMAJOR: "block_scaled_rowmajor", FLAG_BLOCK_SCALED_QMMA_WORDMAJOR: "block_scaled_qmma_wordmajor",
     FLAG_BLOCK_SCALED_E2M3: "block_scaled_e2m3", FLAG_SPARSE_24_E2M3: "sparse_24_e2m3", FLAG_HAS_MTP: "has_mtp_section",
-    FLAG_EXL3_WEIGHTS: "exl3_weights", FLAG_MTP_EXL3: "mtp_exl3",
+    FLAG_EXL3_WEIGHTS: "exl3_weights", FLAG_MTP_EXL3: "mtp_exl3", FLAG_DRAFT_HEAD: "draft_head",
 }
-KNOWN_FLAGS = (FLAG_MTP_EXL3 << 1) - 1
+KNOWN_FLAGS = (FLAG_DRAFT_HEAD << 1) - 1
 FORMAT_VERSION = 2                 # files with the header extension; a file without one is version 1
 EXT_FMT = "<IIQ32s32s"             # format_version, extension_bytes, payload_bytes, payload_hash, header_hash
 EXT_SIZE = struct.calcsize(EXT_FMT)
@@ -360,14 +361,15 @@ def walk_payload(header: TqfHeader, f: BinaryIO | None = None) -> tuple[int, Cou
     offset = header.header_bytes
     slots = list(payload_slots(header))
     mtp_part = list(mtp_slots(header)) if header.flags & FLAG_HAS_MTP else []
-    for section, seq in (("main", slots), ("mtp", mtp_part)):
+
+    def walk(section: str, seq: list[Slot], record_is_exl3: bool) -> None:
+        nonlocal offset
         for slot in seq:
             if slot.kind == "non_quant":
                 size = non_quant_bytes(slot.count)
             elif slot.kind == "f32":
                 size = f32_bytes(slot.count)
             elif slot.kind == "qm8":
-                record_is_exl3 = exl3 if section == "main" else mtp_exl3
                 if record_is_exl3:
                     if f is None:
                         raise ValueError("an EXL3 file needs the open file to size its records")
@@ -384,8 +386,25 @@ def walk_payload(header: TqfHeader, f: BinaryIO | None = None) -> tuple[int, Cou
                     size = qmma_bytes(slot.shape[0], slot.shape[1], block_scaled, e2m3)
             else:
                 raise ValueError(slot.kind)
-            counts[slot.kind if section == "main" else f"mtp_{slot.kind}"] += 1
+            counts[slot.kind if section == "main" else f"{section}_{slot.kind}"] += 1
             offset += size
+
+    walk("main", slots, exl3)
+    walk("mtp", mtp_part, mtp_exl3)
+    if header.flags & FLAG_DRAFT_HEAD:
+        # the DRAFT lm_head section (convert_qwen_tqf.py --draft-head): its sizes come from its own meta record --
+        # f32 (V', kbits, 0, 0), then d2t f32 [V'] (token ids as floats), then the EXL3 record of the [V', H] head
+        if f is None:
+            raise ValueError("a draft-head file needs the open file to size its section")
+        f.seek(offset)
+        vprime, dkbits, _, _ = struct.unpack("<4f", read_exact(f, 16))
+        vprime = int(vprime)
+        if vprime <= 0 or vprime % 128 or vprime > header.vocab_size:
+            raise ValueError(f"draft.meta: bad draft vocabulary size {vprime}")
+        details["draft_vocab"] = vprime
+        details["draft_kbits"] = int(dkbits)
+        walk("draft", [Slot("draft.meta", "f32", 4), Slot("draft.d2t", "f32", vprime),
+                       Slot("draft.lm_head.weight", "qm8", vprime * header.hidden_size, (vprime, header.hidden_size))], True)
     return offset - header.header_bytes, counts, details
 
 
@@ -487,6 +506,8 @@ def inspect(path: Path, verbose: bool = True, verify: bool = False) -> dict:
             print(f"exl3_bitrates (trellis Linears incl. MTP): {hist}")
             print(f"exl3_codebooks: {dict(details['exl3_codebooks'])}")
             print(f"exl3_bf16_linears (kept unquantized by the checkpoint): {len(details['exl3_bf16_linears'])}")
+        if "draft_vocab" in details:
+            print(f"draft_head: V' = {details['draft_vocab']} token ids, {details['draft_kbits']}-bit EXL3 (the drafter's reduced vocabulary; the verify keeps the full lm_head)")
         print()
         print("== Payload validation ==")
         if walk_error:

@@ -37,6 +37,10 @@
 #define TQ_FLAG_EXL3_WEIGHTS (1u << 11)
 // The MTP section's 8 projections are EXL3 records (convert_qwen_tqf.py --mtp-exl3) instead of bf16.
 #define TQ_FLAG_MTP_EXL3 (1u << 12)
+// A DRAFT lm_head section after the MTP section (convert_qwen_tqf.py --draft-head): f32 meta (V', kbits, 0, 0),
+// f32 d2t[V'] (the token id of each draft row), the EXL3 record of a [V', H] head. The paged drafter argmaxes
+// over this reduced vocabulary (TQ_DRAFT_VOCAB=1); the verify keeps the full lm_head, so outputs do not change.
+#define TQ_FLAG_DRAFT_HEAD (1u << 13)
 
 // Set once at load time: 1 if QMMA weights are dense 6-bit E2M3 (mixed-format
 // E2M3 weights x E4M3 activations), 0 for the default E4M3 weight path.
@@ -172,6 +176,12 @@ typedef struct {
     tq_layer_t mtp_layer;
     tq_qmma_weight_t mtp_fc_x;
     int mtp_exl3;
+    // The DRAFT lm_head (TQ_FLAG_DRAFT_HEAD, loaded with the MTP head when TQ_DRAFT_VOCAB=1): draft_V rows of
+    // the lm_head over the V' most frequent token ids; d_draft_d2t[V'] maps a draft row to its token id (as float).
+    tq_qmma_weight_t draft_head;
+    float *d_draft_d2t;
+    int draft_V;
+    int draft_on;
     uint16_t *d_mtp_pre_fc_norm_emb;
     uint16_t *d_mtp_pre_fc_norm_hidden;
     uint16_t *d_mtp_norm;

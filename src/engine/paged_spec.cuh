@@ -975,9 +975,17 @@ static int mtp_draft_body(int N, int K, int max_pos) {
         tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
                   g_mtp_hid, g_wide_h, g_qwen.d_mtp_norm, H, g_qwen.eps);         // post-norm hidden: next step + head
         if ((ret = wide_quant_input(g_mtp_hid, H, N)) != 0) { ret = -15; break; }
-        if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) { ret = -15; break; }
-        tq_launch(g_pdl_small, k_tq_batched_argmax, dim3(N), dim3(256), 0, g_qwen.stream,
-                  g_mtp_draft_d + (size_t)k * g_pg_maxslots, g_pg_logits, g_qwen.V, N);
+        if (g_qwen.draft_on) {
+            // the DRAFT lm_head (TQ_FLAG_DRAFT_HEAD, TQ_DRAFT_VOCAB=1): argmax over the V' most frequent token ids
+            // through a V' x H head (a fraction of the full lm_head's bytes per step), the row mapped to its token id
+            if ((ret = wide_proj(&g_qwen.draft_head, g_pg_logits, N)) != 0) { ret = -15; break; }
+            tq_launch(g_pdl_small, k_tq_batched_argmax_map, dim3(N), dim3(256), 0, g_qwen.stream,
+                      g_mtp_draft_d + (size_t)k * g_pg_maxslots, g_pg_logits, g_qwen.draft_V, N, (const float *)g_qwen.d_draft_d2t);
+        } else {
+            if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) { ret = -15; break; }
+            tq_launch(g_pdl_small, k_tq_batched_argmax, dim3(N), dim3(256), 0, g_qwen.stream,
+                      g_mtp_draft_d + (size_t)k * g_pg_maxslots, g_pg_logits, g_qwen.V, N);
+        }
     }
     return ret;
 }

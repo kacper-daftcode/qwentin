@@ -73,6 +73,12 @@ FLAG_EXL3_WEIGHTS = 1 << 11
 # The MTP section's 8 projections (fc, q/k/v/o, gate/up/down) are EXL3 trellis records from the EXL3 checkpoint
 # (--mtp-exl3; the norms stay bf16) instead of bf16 matrices: 0.85 -> ~0.25 GB on the device for the paged drafter.
 FLAG_MTP_EXL3 = 1 << 12
+# A DRAFT lm_head section after the MTP section (--draft-head): the paged drafter argmaxes over a reduced
+# vocabulary of V' token ids (EAGLE-3's draft vocabulary) through a V' x H EXL3 head instead of the full
+# lm_head; the verify keeps the full head, so the outputs do not change. Records: f32 draft.meta[4] = (V',
+# kbits, 0, 0), f32 draft.d2t[V'] (the token id of each draft row, stored as float: exact below 2^24), then
+# the EXL3 record of draft.lm_head [V', H].
+FLAG_DRAFT_HEAD = 1 << 13
 
 COMMON_SUFFIXES = (
     "input_layernorm.weight",
@@ -754,6 +760,47 @@ def write_exl3_record(f, store: TensorStore, spec: TensorSpec, dry_run: bool) ->
     return size
 
 
+class FileTensorStore:
+    """TensorStore's interface (names / get) over ONE safetensors file -- the draft head of --draft-head."""
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.handle = None
+
+    def __enter__(self):
+        self.handle = safe_open(self.path, framework="pt", device="cpu")
+        self.handle.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.__exit__(*exc)
+        self.handle = None
+
+    def names(self) -> set[str]:
+        return set(self.handle.keys())
+
+    def get(self, name: str) -> torch.Tensor:
+        return self.handle.get_tensor(name)
+
+
+def draft_head_specs(store, hidden: int) -> tuple[int, int, list[TensorSpec]]:
+    """The draft-head section's records from a draft-head safetensors (analysis/draft_head_build.py of the research
+    repo): draft.d2t int32 [V'] + draft.lm_head.{trellis, suh, svh, mul1}. Returns (V', kbits, [meta, d2t, lm_head])."""
+    names = store.names()
+    for n in ("draft.d2t", "draft.lm_head.trellis", "draft.lm_head.suh", "draft.lm_head.svh"):
+        if n not in names:
+            raise KeyError(f"--draft-head: {n} missing")
+    d2t = store.get("draft.d2t")
+    trellis = store.get("draft.lm_head.trellis")
+    vprime = int(d2t.numel())
+    kbits = int(trellis.shape[2]) // 16
+    if trellis.dim() != 3 or tuple(trellis.shape[:2]) != (hidden // 16, vprime // 16) or vprime % 128:
+        raise ValueError(f"--draft-head: trellis {tuple(trellis.shape)} does not match [V'={vprime}, H={hidden}] (V' must be a multiple of 128)")
+    if d2t.dtype not in (torch.int32, torch.int64) or int(d2t.min()) < 0 or len(torch.unique(d2t)) != vprime:
+        raise ValueError("--draft-head: draft.d2t must be distinct non-negative token ids")
+    return vprime, kbits, [TensorSpec("draft.meta", (4,), "f32"), TensorSpec("draft.d2t", (vprime,), "f32"),
+                           TensorSpec("draft.lm_head.weight", (vprime, hidden), "qm8")]
+
+
 def qmma_source_tensor(store: TensorStore, spec: TensorSpec) -> torch.Tensor:
     """Checkpoint tensor with source FP8 block scales applied (true float values).
 
@@ -907,7 +954,8 @@ def mtp_is_projection(spec: TensorSpec) -> bool:
 
 
 def build_header(config, dtype_id: int, names: set[str], block_scaled: bool, block_layout: str,
-                 emit_mtp: bool = False, exl3: bool = False, mtp_exl3: bool = False) -> bytes:
+                 emit_mtp: bool = False, exl3: bool = False, mtp_exl3: bool = False,
+                 draft_head: bool = False) -> bytes:
     text = as_text_config(config)
     rope = getattr(text, "rope_parameters", {}) or {}
     layer_types = list(text.layer_types)
@@ -942,6 +990,8 @@ def build_header(config, dtype_id: int, names: set[str], block_scaled: bool, blo
             flags |= FLAG_MTP_EXL3
     if exl3:
         flags |= FLAG_EXL3_WEIGHTS
+    if draft_head:
+        flags |= FLAG_DRAFT_HEAD
 
     encoded_layer_types = bytes(layer_type_id(layer_type) for layer_type in layer_types)
     fixed = struct.pack(
@@ -1022,6 +1072,7 @@ def write_tqf(
     exl3_mode: str = "auto",
     mtp_source: str | None = None,
     mtp_exl3: bool = False,
+    draft_head: str | None = None,
 ) -> dict[str, Any]:
     model_dir = Path(model_path)
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -1100,9 +1151,18 @@ def write_tqf(
                       f"{' ...' if len(missing_mtp) > 3 else ''} (no speculative decoding from this file)")
         if emit_mtp and mtp_exl3:
             print(f"  MTP projections as EXL3 records (flag 0x{FLAG_MTP_EXL3:x})")
+        draft_store_cm = None
+        draft_specs: list[TensorSpec] = []
+        if draft_head:
+            if not (emit_mtp and mtp_exl3):
+                raise ValueError("--draft-head needs the EXL3 MTP section (--mtp-exl3 on an EXL3 checkpoint)")
+            draft_store_cm = FileTensorStore(Path(draft_head))
+            draft_store = draft_store_cm.__enter__()
+            vprime, draft_kbits, draft_specs = draft_head_specs(draft_store, int(as_text_config(cfg).hidden_size))
+            print(f"  DRAFT lm_head section: V' = {vprime} ids, {draft_kbits}-bit EXL3 (flag 0x{FLAG_DRAFT_HEAD:x}; {draft_head})")
 
         header = add_extension(build_header(cfg, dtype_id, store.names(), block_scaled, block_layout, emit_mtp, exl3,
-                                            emit_mtp and mtp_exl3))
+                                            emit_mtp and mtp_exl3, bool(draft_specs)))
         bytes_written = len(header)
         kind_counts: dict[str, int] = {}
         output_file = None
@@ -1191,6 +1251,15 @@ def write_tqf(
                     bytes_written += size
                     if dry_run:
                         print(f"  {spec.name:72s} {spec.shape!s:18s} {spec.kind}")
+            if draft_specs:
+                print("  -- DRAFT lm_head section (--draft-head) --")
+                meta, d2t_spec, head_spec = draft_specs
+                kind_counts["f32"] = kind_counts.get("f32", 0) + 2
+                kind_counts["qm8"] = kind_counts.get("qm8", 0) + 1
+                vprime = d2t_spec.shape[0]
+                bytes_written += write_f32(output_file, torch.tensor([float(vprime), float(draft_kbits), 0.0, 0.0]), meta, dry_run)
+                bytes_written += write_f32(output_file, draft_store.get("draft.d2t").to(torch.float32), d2t_spec, dry_run)
+                bytes_written += write_exl3_record(output_file, draft_store, head_spec, dry_run)
             if output_file is not None:
                 digest = output_file.h.digest()
                 output_file.f.seek(0)
@@ -1201,6 +1270,8 @@ def write_tqf(
                 output_file.f.close()
             if mtp_store_cm is not None:
                 mtp_store_cm.__exit__(None, None, None)
+            if draft_store_cm is not None:
+                draft_store_cm.__exit__(None, None, None)
 
     return {
         "model": str(model_dir),
@@ -1219,6 +1290,8 @@ def write_tqf(
         "emit_mtp": emit_mtp,
         "mtp_exl3": bool(emit_mtp and mtp_exl3),
         "mtp_tensor_count": len(mtp_specs) if emit_mtp else 0,
+        "draft_head": draft_head,
+        "draft_vocab": draft_specs[1].shape[0] if draft_specs else 0,
     }
 
 
@@ -1308,6 +1381,14 @@ def main() -> None:
         help="EXL3 source: store the MTP projections as its EXL3 records (flag 0x1000; the -mtp4.tqf of the README) "
              "instead of bf16 matrices (the batched server's paged drafter reads them; the single-stream MTP path cannot)",
     )
+    parser.add_argument(
+        "--draft-head",
+        default=None,
+        help="a draft-head safetensors (draft.d2t int32 [V'] + draft.lm_head.{trellis,suh,svh,mul1}, the research repo's "
+             "analysis/draft_head_build.py): append the DRAFT lm_head section (flag 0x2000) -- the paged drafter argmaxes "
+             "over the V' most frequent token ids through this smaller head; the verify keeps the full lm_head, so the "
+             "outputs are unchanged. Needs --mtp-exl3",
+    )
     args = parser.parse_args()
     recipe = resolve_recipe(args)
     global MTP_EMIT_DEFAULT
@@ -1330,6 +1411,7 @@ def main() -> None:
         args.exl3,
         args.mtp_source,
         args.mtp_exl3,
+        args.draft_head,
     )
     print(json.dumps(summary, indent=2))
     if not args.dry_run:
