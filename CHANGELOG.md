@@ -8,6 +8,18 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+- **The verify wave runs 33..64 columns in ONE pass over the weights** (`k_tq_exl3_wide_gemm<KB, 8, F32>`: 64-token
+  EXL3 units with fp32 accumulators, the decode step's numerics). The verify used to cap its GEMM units at 32 tokens,
+  so a wave of N (K + 1) > 32 columns ran as a 32-column pass plus a tail pass that re-read and re-decoded every Linear:
+  at 12 slots with K = 2 (the `--spec-k auto` rule above 8 slots) every round paid it — 49.5 ms per round vs 31.3 at
+  K = 1 on the frozen code corpus at 32K; at 8 slots K = 4 cost 48.5 vs 33.7 at K = 3. Now (same corpus, 12 slots):
+  K 2 / 3 / 4 = 40.1 / 45.8 / 53.2 ms per round = **861 / 984 / 1022 tok/s aggregate (698 before)**; 8 slots K = 4 39.6 ms.
+  Every column is bit-identical to plain decode's (`spec_paged_check.py` at 36 / 40 / 48 / 60 columns, ctx 300, the
+  standard cells: 0 differing logits); the ≤ 32-column waves, decode and prefill are untouched (212 / 212 kernels
+  SASS-identical, 7 new). The engine reports the one-pass width (`qwn_verify_onepass_cols`, 61 entry points) and
+  **`--spec-k auto` drafts 3 deep above 8 active slots** (2 before; the table reads 6/3/3 with the reduced vocabulary)
+  — with an older library the server keeps 2. `/health` reports `verify_onepass`. `tools/spec_paged_check.py` gained
+  `--kmax` / `--k-fixed` (pinned wave widths) and `--bench` cells at 40 / 36 columns. Gate: `docs/evidence/cand27-all.log`.
 - **The drafter's reduced vocabulary (a DRAFT lm_head section in the `.tqf`, `TQ_DRAFT_VOCAB`).** Every draft step
   read the full 248 320-row 6-bit lm_head (0.95 GB, 585 µs — 72 % of the step; 2.3 ms of a 21.3 ms round at one
   stream). The drafter now argmaxes over the 65 536 most frequent token ids through a 0.25 GB EXL3 head built from

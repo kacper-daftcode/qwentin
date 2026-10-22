@@ -297,8 +297,13 @@ class BatchedEngine:
         # measured 10-21 on 60 traced prompts: 177.8 -> 188.2 tok/s at N = 1, outputs identical; without the section K = 6
         # ties K = 4; at 128K it lost 7 %)
         self.draft_vocab = int(self.L.qwn_draft_vocab_size()) if self.spec and hasattr(self.L, "qwn_draft_vocab_size") else 0
+        # the verify wave's one-pass width (fp32 64-token GEMM units, session 17): up to 64 columns the wave reads the
+        # weights once; an older engine (no getter) paid a second pass past 32 columns, so its K table stays narrower
+        self.verify_onepass = int(self.L.qwn_verify_onepass_cols()) if self.spec and hasattr(self.L, "qwn_verify_onepass_cols") else 32
         if self.spec and self.draft_vocab:
             print(f"[spec] the drafter uses a reduced vocabulary of {self.draft_vocab} token ids; --spec-k auto = 6 at <= 2 active slots up to {SPEC_DEEP_MAX_POS} tokens of context", flush=True)
+        if self.spec:
+            print(f"[spec] verify waves of up to {self.verify_onepass} columns in one pass over the weights; --spec-k auto = {self.spec_k_table()} by active slots", flush=True)
         self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
         self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
         self.log_admits = os.environ.get("TQ_SERVE_LOG_ADMITS", "1") not in ("", "0")   # one line per admitted request
@@ -733,14 +738,24 @@ class BatchedEngine:
         for s in finished:
             self._detach(s)
 
+    def spec_k_table(self):
+        """The auto rule as text: K at <= 2 / <= 8 / > 8 active slots."""
+        k2 = 6 if self.draft_vocab else 4
+        return f"{k2}/3/3" if self.verify_onepass >= 64 else f"{k2}/3/2"
+
     def _spec_k_for(self, n, max_pos=0):
         """Draft depth for n active slots: auto = 4 at n <= 2 (6 with the drafter's reduced vocabulary, whose draft
-        step is half the price), 3 at n <= 8, 2 above (measured 10-15 / 10-21: deeper drafts pay at few clients, the
-        verify's per-column attention at many -- and N = 8 at K = 4 is a 40-column wave that costs 1.5x); capped by
-        the wave width. max_pos = the longest active context: past 64K the drafter's own attention per step grows
-        and K = 6 lost 7 % at 128K on the speed prompt (121.7 -> 113.4 tok/s), so the deep draft stops there."""
+        step is half the price), 3 at n <= 8, and above 8 -- with an engine whose verify wave runs up to 64 columns
+        in one pass over the weights (qwn_verify_onepass_cols, session 17) -- 3 as well (36..48-column waves; measured
+        10-22 on the frozen corpus at 32K, 12 slots: K 2 / 3 / 4 = 861 / 984 / 1022 tok/s aggregate on the one-pass
+        engine vs 698 served; K 3 keeps the margin on lower-acceptance text, K 4 does not), 2 with an older engine
+        (its wave paid a second pass over the weights past 32 columns). K = 4 at 3..8 slots was NOT adopted: +3.7 %
+        on code at N = 8 (885 -> 917) but the K 3 -> 4 round costs +19 % and the vLLM prompts' acceptance gains ~12 %.
+        Capped by the wave width. max_pos = the longest active context: past 64K the drafter's own attention per
+        step grows and K = 6 lost 7 % at 128K on the speed prompt (121.7 -> 113.4 tok/s), so the deep draft stops
+        there."""
         if self.spec_k == "auto":
-            k = 4 if n <= 2 else (3 if n <= 8 else 2)
+            k = 4 if n <= 2 else (3 if (n <= 8 or self.verify_onepass >= 64) else 2)
             if n <= 2 and self.draft_vocab and max_pos <= SPEC_DEEP_MAX_POS:
                 k = 6          # the cheap draft step pays for two more drafts while the drafter's attention is short
         else:
@@ -1086,7 +1101,7 @@ def make_handler(eng, tok, args):
                                  "park_ring": str(engine_settings(eng.L)["park_ring"]),
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "decoded_tokens": eng.decoded_tokens, "steps": eng.steps,
-                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k, "draft_vocab": getattr(eng, "draft_vocab", 0),
+                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k, "draft_vocab": getattr(eng, "draft_vocab", 0), "verify_onepass": getattr(eng, "verify_onepass", 32),
                                  "rounds": eng.rounds, "spec_tokens": eng.spec_tokens,
                                  "tokens_per_round": round(eng.spec_tokens / eng.rounds, 3) if eng.rounds else None,
                                  "spec_verify_cols": eng.spec_cols, "spec_fallbacks": eng.spec_fallbacks,
@@ -1278,7 +1293,7 @@ def serve(args):
                         cfg_overrides=args.cfg_overrides)
     fb, tb, pg, mb = eng._stats()
     spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k}"
-                 + (f" = {6 if eng.draft_vocab else 4}/3/2 by active slots; draft vocabulary {eng.draft_vocab} ids" if args.spec_k == "auto" else "") + ")" if eng.spec
+                 + (f" = {eng.spec_k_table()} by active slots; draft vocabulary {eng.draft_vocab} ids; one-pass verify wave {eng.verify_onepass} columns" if args.spec_k == "auto" else "") + ")" if eng.spec
                  else "speculative decoding OFF (" + (eng.spec_off_reason or getattr(args, "spec_off_reason", "") or "--no-spec") + ")")
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
           f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}; "
