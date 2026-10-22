@@ -6,6 +6,16 @@ directory. The files are verbatim copies of the research project's (`kacper-daft
 the measurement box's). `scripts/` holds the exact shell scripts that produced each log, so every flag of every gate is
 on record. The narrative around the numbers is [`docs/NOTES.md`](../NOTES.md); the release notes, [`CHANGELOG.md`](../../CHANGELOG.md).
 
+## main, 2026-10-22: the README table re-measured
+
+The README's 32 GB table was re-measured on one library (`9be3c8e7513d` = main `fbf26a6`, engine `fec7211`; the served
+reduced-vocabulary file), each speed cell twice in one run (`rel13-table.log`, `scripts/rel13-table.sh`): 576 000 pooled
+tokens at 30 138 MiB (30 586 after everything), needle 6/6 (TTFT 11.36–11.38 s @32K, 58.4–58.5 s @128K), A/B 10/10 with
+`cand21`'s texts, **212.6 / 165.8 / 119.8 / 88.4 / 64.3 tok/s per stream @32K spec on at N = 1 / 2 / 4 / 8 / 12** (65.8 /
+62.5 / 57.2 / 48.4 / 41.7 off; 774 / 788 aggregate at 12), **123.6 / 102.2 @128K at N = 1 / 2** (57.9 / 52.7 off). The later
+`cand-1218` (one norm block per row from 16 rows up) changes only the prefill waves, bitwise, and its gate read the TTFT at
+11.35 / 58.5–58.7 s on the current library `b2e93405f8a6`.
+
 ## v0.12 (2026-10-21): what was re-measured
 
 v0.12 re-measured every served-line cell of the README on its own library (`5f9cee32da7c` = main `a0834e5`, engine
