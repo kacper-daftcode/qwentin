@@ -1,0 +1,59 @@
+[cand28-all] start 02:49:04; cand 3ae4cf2 server: --spec-k auto adapts the draft depth to the ; library (served) 9be3c8e7513d
+== gate 0: ruff + pytest, the exported ABI   02:49:04
+[1;32mAll checks passed![0m
+77 passed, 7 skipped in 0.87s
+84 passed in 0.87s
+[gate0] PASS (61 exports)
+== gate 1: THE SERVED LINE, K auto = 6/3/3 + adaptive   02:49:06
+   server up after 10 s, pid 1668966, 30138 MiB; 576000 pooled tokens; speculative decoding ON (MTP drafter, K=auto = 6/3/3 by active slots; draft vocabulary 65536 ids; one-pass verify wave 64 columns; adaptive: 6 at <= 4 slots when p_hat >= 0.82 / 4 at <= 6 slots when p_hat >= 0.78)
+   /health "draft_vocab": 65536
+   /health "verify_onepass": 64
+   /health "spec_p_hat": 0.0
+   [repro] garbage 0 / 6
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.439s e2e=11.483s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.422s e2e=11.466s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.427s e2e=11.471s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=58.743s e2e=58.79s ans='HE-215844-MW' exp=['HE-215
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=58.808s e2e=58.856s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=58.788s e2e=58.835s ans='ND-297860-GH' exp=['ND-29
+[ab] on: 10 prompts, 2647 tokens in 17.7s = 149.7 tok/s (concurrency 1); per-request mean 149.7 tok/s; rounds 648, tokens/round 4.07
+[ab] off: 10 prompts, 2647 tokens in 43.3s = 61.1 tok/s (concurrency 1); per-request mean 60.7 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[ab-vs-cand21] prompts identical True; texts identical to cand21: on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 212.5 (min 212.5, max 212.5), aggregate 212.5; 300 tokens in 1.5s; rounds 65 steps 65 to
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 212.5 (min 212.5, max 212.5), aggregate 212.5; 300 tokens in 1.5s; rounds 65 steps 65 to
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 166.6 (min 132.0, max 166.6), aggregate 298.6; 600 tokens in 2.3s; rounds 92 steps 92 to
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 166.7 (min 132.2, max 166.7), aggregate 298.9; 600 tokens in 2.3s; rounds 92 steps 92 to
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 88.6 (min 79.5, max 96.0), aggregate 698.6; 2400 tokens in 4.2s; rounds 129 steps 129 to
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 83.7 (min 78.4, max 98.5), aggregate 691.0; 2400 tokens in 4.2s; rounds 128 steps 128 to
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 66.6 (min 61.8, max 74.9), aggregate 803.5; 3600 tokens in 5.7s; rounds 139 steps 139 t
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 65.9 (min 59.4, max 74.8), aggregate 792.2; 3600 tokens in 5.7s; rounds 135 steps 135 t
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 124.1 (min 124.1, max 124.1), aggregate 124.1; 300 tokens in 2.6s; rounds 105 steps 105
+   cand27 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand27 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand27 ctx=32768 N=2: 6.19 tokens per round (600 tokens / 97 rounds)
+   cand27 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand27 ctx=32768 N=8: 18.32 tokens per round (2400 tokens / 131 rounds)
+   cand27 ctx=32768 N=8: 18.60 tokens per round (2400 tokens / 129 rounds)
+   cand28 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand28 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand28 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand28 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand28 ctx=32768 N=8: 18.60 tokens per round (2400 tokens / 129 rounds)
+   cand28 ctx=32768 N=8: 18.75 tokens per round (2400 tokens / 128 rounds)
+   -- the adaptive K: design-note answers (table vs auto must tie) and code continuation (auto must win at N = 4)   03:04:20
+   design N=4: table 468.1 tok/s, auto 486.8 tok/s (p_hat after 0.7033)
+   design N=6: table 583.7 tok/s, auto 598.4 tok/s (p_hat after 0.7938)
+   continue N=4: table 585.8 tok/s, auto 658.5 tok/s (p_hat after 0.8765)
+   continue N=6: table 734.9 tok/s, auto 803.3 tok/s (p_hat after 0.8797)
+   [adk] design N=4: table 468.1 auto 486.8 (+4.0 %) -> tie
+   [adk] design N=6: table 583.7 auto 598.4 (+2.5 %) -> tie
+   [adk] continue N=4: table 585.8 auto 658.5 (+12.4 %) -> auto wins
+   [adk] continue N=6: table 734.9 auto 803.3 (+9.3 %) (informational)
+   -- T1 HumanEval+ with spec on   03:20:39
+   humaneval exit 0 03:23:56: pass@1: 0.939 pass@1: 0.915 
+   [t1] humaneval spec on, K auto adaptive: [0.939, 0.915] (must equal 93.9 / 91.5); degenerate 0 / 164 -> ok
+   /health after T1: "spec_p_hat": 0.871
+   server log error lines: 0; repro clean 1; needle PASS 6 FAIL 0; A/B 10/10: 1, texts = cand21: 1; speed rc 0/0/0; adaptive cells ok 1 rc 0; T1 rc 0
+[gate1] PASS
+== ALL PASS   03:24:00  (landing: main := cand-1217 (ff), patches 0141-0142; the library stays 9be3c8e7)
