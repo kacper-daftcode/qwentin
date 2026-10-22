@@ -21,7 +21,7 @@ Per (ctx, N):
   5. parking: save / reset / restore a slot right after a commit (inside phase 3).
 --bench: verify-wave ms vs decode-step ms at T columns, and the commit replay ms.
 usage: spec_paged_check.py --tqf MODEL.tqf --model-dir HF_DIR [--lib LIB] [--ctx 4096] [--n 1,3,8] [--rounds 6]
-                           [--distinct 3] [--no-pin] [--bench]
+                           [--distinct 3] [--no-pin] [--kmax 4] [--k-fixed] [--bench]
 The README's "spec exactness ALL PASS" gate is `--no-pin --ctx 4096` and `--ctx 32768` with the served env in front
 (TQ_KV_T4=1; the per-column key splits of the verify wave make it bitwise without pins). Vendored from the qwen256k
 research harness (analysis/spec_paged_check.py); its text is the engine source (tools/engine_text.py).
@@ -46,6 +46,10 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--band", type=int, default=0,
                 help="also compare plain decode at N against the same slots inside a lockstep decode of this width "
                      "(teacher-forced): the decode path's own batch-size band of near-tie flips, for reference")
+ap.add_argument("--kmax", type=int, default=4, help="draft depths K_i run 0..KMAX (mixed per slot and round)")
+ap.add_argument("--k-fixed", action="store_true",
+                help="every slot drafts KMAX in every round (T = N (KMAX + 1) columns: pins the wave width, e.g. the "
+                     "33..64-column waves of the fp32 64-token GEMM units)")
 args = ap.parse_args()
 
 for k, v in {"TQ_CTX": "262144", "TQ_KV_Q4": "1", "TQ_KV_V4": "1", "TQ_EMBED_FP8": "2", "TQ_PAGED_ATTN_MMA": "1",
@@ -64,9 +68,14 @@ from transformers import AutoTokenizer  # noqa: E402
 
 Ns = [int(x) for x in args.n.split(",")]
 Nmax = max(max(Ns), args.band)
-KMAX = 4
+KMAX = args.kmax
 R = args.rounds
-S = (KMAX + 1) * R + 4                       # teacher tokens per slot (rounds commit <= 5 each) + spare steps
+S = (KMAX + 1) * R + 4                       # teacher tokens per slot (rounds commit <= KMAX + 1 each) + spare steps
+
+
+def draft_k(s, r):
+    """Slot s's draft depth in round r: mixed 0..KMAX, or KMAX for every slot (--k-fixed)."""
+    return KMAX if args.k_fixed else (s + r) % (KMAX + 1)
 L = load_lib(args.lib)
 L.qwn_vocab_size.restype = ctypes.c_int
 L.qwn_paged_logits_sink.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -92,8 +101,8 @@ def sink_on(on):
 tok = AutoTokenizer.from_pretrained(args.model_dir)
 text = engine_source_text(REPO)
 all_ids = tok(text, add_special_tokens=False).input_ids
-print(f"[spec-check] lib={args.lib} ctx={args.ctx} Ns={Ns} rounds={R} S={S} pin={'off' if args.no_pin else PIN} "
-      f"env TQ_PDL={os.environ['TQ_PDL']} corpus={len(all_ids)} tokens", flush=True)
+print(f"[spec-check] lib={args.lib} ctx={args.ctx} Ns={Ns} rounds={R} S={S} kmax={KMAX}{' fixed' if args.k_fixed else ''} "
+      f"pin={'off' if args.no_pin else PIN} env TQ_PDL={os.environ['TQ_PDL']} corpus={len(all_ids)} tokens", flush=True)
 rng = random.Random(args.seed)
 fails = 0
 
@@ -281,7 +290,7 @@ def run_case(N):
         cols, segs = [], []
         Ks = []
         for s in range(N):
-            K = (s + r) % (KMAX + 1)
+            K = draft_k(s, r)
             Ks.append(K)
             off = len(cols)
             for j in range(K + 1):
@@ -330,7 +339,7 @@ def run_case(N):
     while all(cur[s] + KMAX + 1 <= S for s in range(N)):
         cols, segs, drafts = [], [], []
         for s in range(N):
-            K = (s + rounds) % (KMAX + 1)
+            K = draft_k(s, rounds)
             off = len(cols)
             d = [t[s][cur[s]]]
             for j in range(1, K + 1):
@@ -399,7 +408,7 @@ def bench():
         ms = time_it(dec, args.bench_iters)
         res[("decode", N)] = ms
         print(f"  decode step N={N:2d}: {ms:7.2f} ms", flush=True)
-    for (N, K) in [(1, 0), (1, 3), (2, 3), (4, 3), (8, 3), (8, 7), (12, 4), (16, 3)]:
+    for (N, K) in [(1, 0), (1, 3), (2, 3), (4, 3), (8, 3), (8, 4), (8, 7), (12, 2), (12, 4), (16, 3)]:
         if N > Nmax:
             continue
         T = N * (K + 1)

@@ -141,6 +141,7 @@ SIGNATURES = {
     "qwn_gdn_prefill_ab": (C.c_int, [C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p]),
     "qwn_paged_prefill_batch": (C.c_int, [C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_void_p]),
     "qwn_paged_verify": (C.c_int, [C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_void_p]),
+    "qwn_verify_onepass_cols": (C.c_int, []),
     "qwn_paged_commit": (C.c_int, [C.c_void_p, C.c_void_p, C.c_int]),
     "qwn_paged_verify_hidden": (C.c_void_p, [C.c_void_p]),
     "qwn_paged_mtp_init": (C.c_int, [C.c_int]),

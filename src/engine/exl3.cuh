@@ -225,16 +225,32 @@ __global__ void __launch_bounds__(128) k_tq_exl3_bfrag(tq_bfrag_set set, const f
 // 64-token units (one copy per block, double-buffered, one barrier per stage, LDS.128 reads) -- bitwise, but +9 % per
 // prefill wave (76.1 vs 69.7 ms at 32K): the two 38 KB blocks per SM shrink L1 under the weight ring and the LDS
 // wavefronts equal the L1-hit LDG.128s they replace. The register double buffer of the 128-token units is the keeper.
-template <int KB, int NG>
+// 64-token units with fp32 accumulators (NG = 8, F32; session 17): the verify wave's units for 33..64 columns. The verify
+// used to cap its units at 32 tokens (fp32 accumulators = the decode step's numerics), so a wave of 33..64 columns ran
+// as a 32-column pass plus a tail pass over the SAME weights with 8..32-token units -- a second full read + decode of
+// every Linear per wave (N = 8 slots at K = 4: 40 columns, the tail pass cost ~22 ms of kernel time per round; N = 12 at
+// K = 2: 36 columns, the served rule's regime at full occupancy). The F32 instantiation keeps the decode-size path per
+// column (fp32 MMA, the unpaired codeword decode, the same k-walk and k-splits), so every column is bit-identical to the
+// 32-token units' and to the decode step's; token groups past nvar_u skip their MMAs (the B fragments there are the
+// pad) -- and skip their B-fragment loads, which is what makes the unit fast. Measured 2026-10-22 on the 32K verify
+// wave, 12 slots prefilled (spec_paged_check.py --bench), T = 40 / 36 / 60 / 64 columns: the served two-pass wave
+// 41.0 / 42.6 / 48.8 / 47.6 ms; this unit loading every group's B fragments 41.1 / 42.4 / 54.3 / 58.4 (no gain: the
+// dead groups' loads sit on each tile's critical path); loading the live groups only 32.75 / 34.4 / 43.5 / 47.4 --
+// T = 40 costs 4.9 ms over T = 32 (27.85) instead of 13.2. At 8 live groups (T = 64) the fp32 MMAs bound it like the
+// two passes did. The 128-token unit's B double buffer (BPF) measured the same (32.3 at PF 2, 33.0 at PF 4) but its
+// PF = 2 build computed wrong columns (PF 4 + BPF was exact) -- not root-caused, so the F32 unit keeps the NG <= 4
+// schedule: a 4-tile weight ring, B fragments loaded right before their MMAs.
+template <int KB, int NG, bool F32 = false>
 __global__ void __launch_bounds__(256, (NG <= 2) ? ((KB == 7) ? 2 : 4) : (NG >= 16 ? TQ_EXL3_NG16_BLOCKS : 2))
 k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
                     const uint16_t *trellis, const uint32_t *bfrag,
                     const uint16_t *svh, int M, int Kt16, int nvar,
                     int GP, int g_base, int ntg, int k_splits, int per, int *ctr) {
+    static_assert(!F32 || NG == 8, "the fp32-accumulate wide unit is the 64-token one");
     constexpr int NW = 8 * KB;
-    constexpr int PF = (NG <= 4) ? 4 : (NG >= 16 ? TQ_EXL3_NG16_PF : 2);   // tiles in flight per warp (register ring)
+    constexpr int PF = (NG <= 4 || F32) ? 4 : (NG >= 16 ? TQ_EXL3_NG16_PF : 2);   // tiles in flight per warp (register ring)
     constexpr bool BPF = (NG >= 16);                // B fragments double-buffered one tile ahead
-    constexpr bool PAIR = (TQ_EXL3_PAIR != 0) && (NG >= 8);   // paired codeword decode (tq_exl3_mul1x2); decode N unchanged
+    constexpr bool PAIR = (TQ_EXL3_PAIR != 0) && (NG >= 8) && !F32;   // paired codeword decode (tq_exl3_mul1x2); decode N unchanged
     constexpr int RW = 2 * tq_exl3_win<KB>::NGRP;   // words per lane per tile
     __shared__ int s_unit;
     __shared__ __align__(16) float s_red[8][128];
@@ -275,8 +291,8 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
         // Wide N (prefill) is tensor-pipe bound (ncu: 79 % tensor active, math-pipe throttle),
         // and GeForce runs f16-accumulate MMAs at twice the f32-accumulate rate: accumulate
         // TQ_EXL3_FOLD tiles (16*FOLD products) in fp16 and fold into the fp32 accumulators.
-        // Decode-size N keeps the f32 MMA (tensor work is negligible there).
-        constexpr bool ACC16 = (NG >= 8);
+        // Decode-size N keeps the f32 MMA (tensor work is negligible there); so does the verify wave's F32 unit.
+        constexpr bool ACC16 = (NG >= 8) && !F32;
         constexpr int FOLD = 8;
         uint32_t ch[ACC16 ? NG : 1][2];
         #pragma unroll
@@ -300,6 +316,10 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
             if (NG >= 2) {
                 #pragma unroll
                 for (int g = 0; g < NG; g += 2) {
+                    if (F32 && g * 8 >= nvar_u) {   // dead token groups of a ragged verify wave: no B load (their MMAs are skipped)
+                        bw[g][0] = bw[g][1] = bw[g + 1][0] = bw[g + 1][1] = 0u;
+                        continue;
+                    }
                     uint4 q = __ldg((const uint4 *)(bp + (size_t)(g >> 1) * 128));
                     bw[g][0] = q.x; bw[g][1] = q.y; bw[g + 1][0] = q.z; bw[g + 1][1] = q.w;
                 }
@@ -311,6 +331,7 @@ k_tq_exl3_wide_gemm(float *out, float *partials, size_t split_stride,
         auto mma_b = [&](uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, const uint32_t (&bw)[NG][2]) {
             #pragma unroll
             for (int g = 0; g < NG; g++) {
+                if (F32 && g * 8 >= nvar_u) break;   // ragged verify wave: token groups past the live columns (uniform per unit)
                 if (ACC16) {
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -662,17 +683,17 @@ static uint32_t *g_exl3_b = NULL; static size_t g_exl3_b_words = 0;
 #define TQ_EXL3_CTR_SLOTS 16
 static int *g_exl3_ctr = NULL;                 // [TQ_EXL3_CTR_SLOTS][TQ_EXL3_CTR_STRIDE]
 static unsigned g_exl3_ctr_next = 0;
-static int g_exl3_grid[9][5];                  // resident blocks per (KB, log2 NG), 0 = not queried
+static int g_exl3_grid[9][6];                  // resident blocks per (KB, log2 NG; 5 = the fp32 64-token unit), 0 = not queried
 static int g_exl3_nsm = 0;
 
 // Resident block capacity of one instantiation (occupancy x SMs), cached.
-template <int KB, int NG>
+template <int KB, int NG, bool F32 = false>
 static int exl3_gemm_cap(void) {
-    int lg = (NG == 1) ? 0 : (NG == 2) ? 1 : (NG == 4) ? 2 : (NG == 8) ? 3 : 4;
+    int lg = F32 ? 5 : (NG == 1) ? 0 : (NG == 2) ? 1 : (NG == 4) ? 2 : (NG == 8) ? 3 : 4;
     int &cap = g_exl3_grid[KB][lg];
     if (cap == 0) {
         int nb = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_tq_exl3_wide_gemm<KB, NG>, 256, 0) != cudaSuccess || nb < 1) nb = 1;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_tq_exl3_wide_gemm<KB, NG, F32>, 256, 0) != cudaSuccess || nb < 1) nb = 1;
         if (g_exl3_nsm == 0) {
             int dev = 0; cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&g_exl3_nsm, cudaDevAttrMultiProcessorCount, dev);
@@ -687,12 +708,15 @@ static int exl3_gemm_cap(void) {
 // one dequantized tile should feed as many MMAs as possible (the dequant is the cost there),
 // but a unit set must still fill the resident blocks: take the largest NG whose
 // (feature blocks x token groups) covers >= 3/4 of the capacity, else the smallest (NG=4).
-// g_exl3_ng_max caps the unit width (the verify wave sets 4: fp32 accumulators at any T <= 64).
+// g_exl3_ng_max caps the unit width; g_exl3_vf = the verify wave's regime (fp32 accumulators at every unit width: it
+// sets ng_max 8, so 33..64 columns run as ONE pass of 64-token F32 units -- until session 17 it set 4 and such a wave
+// paid a second pass over the weights for its tail).
 static int g_exl3_ng_max = 16;
+static int g_exl3_vf = 0;
 static int exl3_unit_ng(int N, int MB) {
     int g = wide_ng(N);
     if (g <= 4) return g;
-    if (g_exl3_ng_max < 8) return g_exl3_ng_max;
+    if (g_exl3_ng_max <= 8) return g_exl3_ng_max;
     // measured (5090, 128 tokens, fp16-accumulate MMAs): 64-token units are the best trade
     // between dequant amortization and k-split partial traffic for every projection except the
     // lm_head, whose 1940 feature blocks fill the GPU with 128-token units and no split
@@ -756,10 +780,10 @@ static int exl3_gemm_cap_decode(int N) {
     }
 }
 
-template <int KB, int NG>
+template <int KB, int NG, bool F32 = false>
 static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, const tq_qmma_weight_t *w,
                             const uint32_t *bp, int M, int Kt16, int N, int Gt, int g_base, cudaStream_t st) {
-    int cap = exl3_gemm_cap<KB, NG>();
+    int cap = exl3_gemm_cap<KB, NG, F32>();
     int ntg = (N + 8 * NG - 1) / (8 * NG);
     int units = (M / 128) * ntg;
     if (units > 8192) return -117;                // arrival counters
@@ -785,7 +809,7 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
     int total = units * ks;
     int grid = total < cap ? total : cap;
     int *ctr = g_exl3_ctr + (size_t)(g_exl3_ctr_next++ % TQ_EXL3_CTR_SLOTS) * TQ_EXL3_CTR_STRIDE;
-    tq_launch(g_pdl_on, k_tq_exl3_wide_gemm<KB, NG>, dim3(grid), dim3(256), 0, st, out, pout, split_stride,
+    tq_launch(g_pdl_on, k_tq_exl3_wide_gemm<KB, NG, F32>, dim3(grid), dim3(256), 0, st, out, pout, split_stride,
               w->d_exl3_trellis, bp, w->d_exl3_svh, M, Kt16, N, (Gt + 1) / 2, g_base, ntg, ks, per, ctr);
     if (g_cfg.exl3_debug) {   // counters must be back at zero after every launch
         int h[2 + 64];
@@ -793,19 +817,21 @@ static int exl3_launch_gemm(float *out, float *partials, size_t split_stride, co
         cudaMemcpy(h, ctr, sizeof(h), cudaMemcpyDeviceToHost);
         int bad = 0;
         for (int i = 0; i < 2 + 64; i++) if (h[i]) bad++;
-        fprintf(stderr, "[exl3-gemm] KB=%d NG=%d M=%d K=%d N=%d ntg=%d ks=%d per=%d grid=%d units=%d ctr0=%d ctr1=%d nonzero=%d err=%s\n",
-                KB, NG, M, Kt16 * 16, N, ntg, ks, per, grid, units, h[0], h[1], bad, cudaGetErrorString(cudaGetLastError()));
+        fprintf(stderr, "[exl3-gemm] KB=%d NG=%d%s M=%d K=%d N=%d ntg=%d ks=%d per=%d grid=%d units=%d ctr0=%d ctr1=%d nonzero=%d err=%s\n",
+                KB, NG, F32 ? " f32" : "", M, Kt16 * 16, N, ntg, ks, per, grid, units, h[0], h[1], bad, cudaGetErrorString(cudaGetLastError()));
     }
     return 0;
 }
 
-#define TQ_EXL3_LAUNCH(KB_, NG_) \
-    return exl3_launch_gemm<KB_, NG_>(out + (size_t)n0 * M, NULL, split_stride, w, bp, M, Kt16, nn, Gt, n0 / 8, st)
+#define TQ_EXL3_LAUNCH(KB_, NG_, F32_) \
+    return exl3_launch_gemm<KB_, NG_, F32_>(out + (size_t)n0 * M, NULL, split_stride, w, bp, M, Kt16, nn, Gt, n0 / 8, st)
+// G = 8 is the fp16-accumulate 64-token unit of the prefill waves, or -- in the verify wave's regime -- its fp32 twin.
 #define TQ_EXL3_SWITCH_NG(KB_) \
     switch (G) { \
-        case 1: TQ_EXL3_LAUNCH(KB_, 1); case 2: TQ_EXL3_LAUNCH(KB_, 2); \
-        case 4: TQ_EXL3_LAUNCH(KB_, 4); case 8: TQ_EXL3_LAUNCH(KB_, 8); \
-        case 16: TQ_EXL3_LAUNCH(KB_, 16); default: return -113; }
+        case 1: TQ_EXL3_LAUNCH(KB_, 1, false); case 2: TQ_EXL3_LAUNCH(KB_, 2, false); \
+        case 4: TQ_EXL3_LAUNCH(KB_, 4, false); \
+        case 8: if (g_exl3_vf) TQ_EXL3_LAUNCH(KB_, 8, true); else TQ_EXL3_LAUNCH(KB_, 8, false); \
+        case 16: TQ_EXL3_LAUNCH(KB_, 16, false); default: return -113; }
 
 // Tokens [n0, n0+nn) of the prepared fragments with NG-wide units.
 static int exl3_launch_part(const tq_qmma_weight_t *w, const uint32_t *bp, float *out, int n0, int nn, int G, int Gt,

@@ -16,8 +16,8 @@
 //    in_proj_qkv output and (b, a) of every column are kept per layer (g_vf_x/b/a, ~40 KB per column
 //    per layer) so qwn_paged_commit can replay the accepted prefix into the slot state: one read + one
 //    write of the slot's state per commit whatever the accepted length. No per-slot scratch state.
-//  - GEMMs run at T columns with 32-token units at most (g_exl3_ng_max = 4: fp32 accumulators, the
-//    decode step's regime) and the in_proj_b/a pair kernel at any T.
+//  - GEMMs run at T columns in the decode step's fp32-accumulate regime (g_exl3_vf: 32-token units up to 32
+//    columns, one pass of 64-token fp32 units for 33..64 -- session 17) and the in_proj_b/a pair kernel at any T.
 // With the split pickers pinned (TQ_QMMA_SF_K_SPLIT, TQ_PAGED_GQA_SPLIT) the column logits are
 // bit-identical to the decode step's (analysis/spec_paged_check.py); unpinned, a column's k-splits
 // follow T instead of N (the same "not batch-invariant" band as decode at different N).
@@ -556,10 +556,12 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     int pdl = g_cfg.pdl;
     g_pdl_on = pdl != 0;
     g_pdl_small = pdl == 2;
-    // 32-token GEMM units, and the GEMM k-splits / attention key-splits of the slot count rather than the column
-    // count: the committed tokens equal plain decode's at that client count bit for bit (except a wave crossing a
-    // 128-key tile boundary)
-    g_exl3_ng_max = 4;
+    // fp32-accumulate GEMM units (32-token ones up to 32 columns, ONE pass of 64-token F32 units for 33..64 -- session
+    // 17; a 32-token cap used to cost a second pass over the weights for the tail), and the GEMM k-splits / attention
+    // key-splits of the slot count rather than the column count: the committed tokens equal plain decode's at that
+    // client count bit for bit (except a wave crossing a 128-key tile boundary)
+    g_exl3_ng_max = 8;
+    g_exl3_vf = 1;
     g_split_n_override = K;
     g_vf_K = 0;
     int ret = 1;
@@ -569,6 +571,7 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
     g_attn_seg_c0 = g_attn_seg_n = NULL; g_attn_seg_cnt = 0; g_attn_seg_qt = 0;
     g_split_n_override = 0;
     g_exl3_ng_max = 16;
+    g_exl3_vf = 0;
     g_pdl_on = g_pdl_small = 0;
     if (ret != 0) { cudaStreamSynchronize(g_qwen.stream); return ret; }
     g_vf_K = K; g_vf_T = T;
@@ -577,6 +580,11 @@ extern "C" int qwn_paged_verify(const int *tokens, const int *col_slot, const in
         cudaMemcpyAsync(out_argmax, g_vf_argmax, (size_t)T * sizeof(int), cudaMemcpyDeviceToHost, g_qwen.stream);
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -10;
 }
+
+// The verify wave's column count up to which its GEMMs run as ONE pass over the weights (the fp32 64-token units,
+// session 17) -- the server's --spec-k auto picks draft depths whose waves fit it; an older engine (no entry point)
+// is taken as 32, where a wider wave paid a second pass.
+extern "C" int qwn_verify_onepass_cols(void) { return TQ_VF_MAX_T; }
 
 // Commit the first n_accept[i] columns of segment seg_idx[i] of the pending verify wave into the slot's
 // DeltaNet state (conv window + recurrence replayed from the kept inputs; the KV is already in the

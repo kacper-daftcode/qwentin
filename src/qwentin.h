@@ -132,6 +132,7 @@ int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, const int *c
 
 /* engine/paged_spec.cuh */
 int qwn_paged_verify(const int *tokens, const int *col_slot, const int *col_pos, const int *seg_slot, const int *seg_off, const int *seg_len, int K, int T, int *out_argmax);
+int qwn_verify_onepass_cols(void);
 int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M);
 const float *qwn_paged_verify_hidden(int *out_T);
 int qwn_paged_mtp_init(int on);
