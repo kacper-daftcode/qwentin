@@ -1,0 +1,72 @@
+[cand27-all] start 00:57:14; cand 9be3c8e7513d = 0519d34 server + docs: --spec-k auto drafts 3 deep above 8 a; served 3fab0c23401d
+== gate 0: ruff + pytest, the exported ABI   00:57:14
+[1;32mAll checks passed![0m
+77 passed, 7 skipped in 0.82s
+84 passed in 0.83s
+[gate0] PASS (61 exports)
+== gate 1: SASS + bitwise   00:57:16
+kernels: old 212, new 219, common 212; identical 212, different 0
+[plab] N=3 cand-1216 vs served: bitwise True (25 tensors)
+[plab] N=8 cand-1216 vs served: bitwise True (25 tensors)
+[plab] N=3 --mtp-on (dv64k file) cand-1216 vs served: bitwise True (25 tensors)
+[gate1] PASS
+== gate 2: spec exactness -- the 33..64-column waves + the standard cells   00:58:46
+   4k-n8k4: [spec-check] unpinned band over 406 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [8]) 
+   4k-n12k2: [spec-check] unpinned band over 387 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [12]) 
+   4k-n12k4: [spec-check] unpinned band over 602 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [12]) 
+   300-n8k4: [spec-check] unpinned band over 2191 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 300, Ns [8]) 
+   32k-n12k3: [spec-check] unpinned band over 459 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [12]) 
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+   300: [spec-check] unpinned band over 982 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 300, Ns [1, 3]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE (dv64k file), K auto = 6/3/3, one-pass wave 64   01:02:41
+   server up after 10 s, pid 1551994, 30138 MiB; 576000 pooled tokens; speculative decoding ON (MTP drafter, K=auto = 6/3/3 by active slots; draft vocabulary 65536 ids; one-pass verify wave 64 columns)
+   /health "draft_vocab": 65536
+   /health "verify_onepass": 64
+   [repro] garbage 0 / 6
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.514s e2e=11.558s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.492s e2e=11.536s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.501s e2e=11.545s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=59.066s e2e=59.113s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=59.021s e2e=59.068s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=59.021s e2e=59.068s ans='ND-297860-GH' exp=['ND-29
+[ab] on: 10 prompts, 2647 tokens in 17.7s = 149.6 tok/s (concurrency 1); per-request mean 149.7 tok/s; rounds 648, tokens/round 4.07
+[ab] off: 10 prompts, 2647 tokens in 43.4s = 60.9 tok/s (concurrency 1); per-request mean 60.6 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[ab-vs-cand21] prompts identical True; texts identical to cand21: on True, off True
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 212.1 (min 212.1, max 212.1), aggregate 212.1; 300 tokens in 1.5s; rounds 65 steps 65 tokens/round
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 212.3 (min 212.3, max 212.3), aggregate 212.3; 300 tokens in 1.5s; rounds 65 steps 65 tokens/round
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 165.2 (min 129.4, max 165.2), aggregate 294.6; 600 tokens in 2.4s; rounds 97 steps 97 tokens/round
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 166.4 (min 131.9, max 166.4), aggregate 298.3; 600 tokens in 2.3s; rounds 92 steps 92 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 88.6 (min 80.2, max 97.1), aggregate 709.1; 2400 tokens in 4.2s; rounds 131 steps 131 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 85.8 (min 78.0, max 106.3), aggregate 700.0; 2400 tokens in 4.2s; rounds 129 steps 129 tokens/roun
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 66.1 (min 59.7, max 74.5), aggregate 799.5; 3600 tokens in 5.8s; rounds 145 steps 145 tokens/roun
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 68.4 (min 59.9, max 80.4), aggregate 799.7; 3600 tokens in 5.7s; rounds 136 steps 136 tokens/roun
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 123.9 (min 123.9, max 123.9), aggregate 123.9; 300 tokens in 2.6s; rounds 105 steps 105 tokens/ro
+   cand26-served ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand26-served ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand26-served ctx=32768 N=2: 6.19 tokens per round (600 tokens / 97 rounds)
+   cand26-served ctx=32768 N=2: 6.19 tokens per round (600 tokens / 97 rounds)
+   cand26-served ctx=32768 N=8: 18.60 tokens per round (2400 tokens / 129 rounds)
+   cand26-served ctx=32768 N=8: 18.75 tokens per round (2400 tokens / 128 rounds)
+   cand27 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand27 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand27 ctx=32768 N=2: 6.19 tokens per round (600 tokens / 97 rounds)
+   cand27 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand27 ctx=32768 N=8: 18.32 tokens per round (2400 tokens / 131 rounds)
+   cand27 ctx=32768 N=8: 18.60 tokens per round (2400 tokens / 129 rounds)
+   cand27-n12 ctx=32768 N=12: 24.83 tokens per round (3600 tokens / 145 rounds)
+   cand27-n12 ctx=32768 N=12: 26.47 tokens per round (3600 tokens / 136 rounds)
+   -- T1 HumanEval+ with spec on   01:17:59
+   humaneval exit 0 01:21:17: pass@1: 0.939 pass@1: 0.915 
+   [t1] humaneval spec on, K auto 6/3/3: [0.939, 0.915] (must equal 93.9 / 91.5); degenerate 0 / 164 -> ok
+   server log error lines: 0; repro clean 1; needle PASS 6 FAIL 0; A/B 10/10: 1, texts = cand21: 1; speed rc 0/0/0; T1 rc 0
+   -- the SERVED library on the same server line: K auto must read 6/3/2 (no getter), and its N = 12 cell is the baseline
+   server up after 10 s, pid 1581574, 30138 MiB; 576000 pooled tokens; speculative decoding ON (MTP drafter, K=auto = 6/3/2 by active slots; draft vocabulary 65536 ids; one-pass verify wave 32 columns)
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 55.1 (min 52.4, max 59.4), aggregate 666.3; 3600 tokens in 6.6s; rounds 153 steps 153 tokens/roun
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 57.2 (min 53.1, max 59.3), aggregate 679.9; 3600 tokens in 6.5s; rounds 154 steps 154 tokens/roun
+   served-n12 ctx=32768 N=12: 23.53 tokens per round (3600 tokens / 153 rounds)
+   served-n12 ctx=32768 N=12: 23.38 tokens per round (3600 tokens / 154 rounds)
+[gate3] PASS
+== ALL PASS   01:26:23  (landing: build-qwen/ := the candidate, main := cand-1216 (ff), patches 0138-0139)
