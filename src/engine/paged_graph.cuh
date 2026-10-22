@@ -370,7 +370,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -92;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -93;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
@@ -395,7 +395,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -97;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
@@ -428,7 +428,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
     }
     if (g_pg_sink) {     // every column's logits; the head in decode-size chunks (f32 accumulators)
         if (T > g_pg_sink_cap) return -106;
-        k_tq_qwen_rmsnorm_b<<<dim3(8, T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+        k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
         for (int c0 = 0; c0 < T; c0 += g_pg_sink_head) {
             int nc = T - c0 < g_pg_sink_head ? T - c0 : g_pg_sink_head;
             if ((ret = wide_quant_input(g_wide_norm + (size_t)c0 * H, H, nc)) != 0) return -107;
@@ -448,7 +448,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         fk[Kf++] = k;
     }
     if (Kf > 0) {
-        k_tq_qwen_rmsnorm_b<<<dim3(8, Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
+        k_tq_qwen_rmsnorm_b<<<tq_norm_grid(Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
         if (paged_lm_head_wide()) {
             if ((ret = wide_quant_input(g_wide_norm, H, Kf)) != 0) return -102;
             if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, Kf)) != 0) return -102;

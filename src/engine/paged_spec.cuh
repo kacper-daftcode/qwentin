@@ -408,7 +408,7 @@ static int paged_verify_body(const int *tokens, const int *col_slot, const int *
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
             if (!norm_ready)
-                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(T), dim3(1024), 0, g_qwen.stream,
                           g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -64;
             const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
@@ -435,7 +435,7 @@ static int paged_verify_body(const int *tokens, const int *col_slot, const int *
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
             if (!norm_ready)
-                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(T), dim3(1024), 0, g_qwen.stream,
                           g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -71;
             const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
@@ -463,7 +463,7 @@ static int paged_verify_body(const int *tokens, const int *col_slot, const int *
     }
     cudaMemcpyAsync(g_vf_hidden, g_wide_h, (size_t)T * H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
     if (!norm_ready)
-        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, T), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(T), dim3(1024), 0, g_qwen.stream,
                   g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -78;
     if ((ret = wide_proj(&g_qwen.lm_head, g_vf_logits, T)) != 0) return -78;
@@ -771,14 +771,14 @@ static int mtp_fc_forward(const float *hsrc, const int *d_hidx, const int *d_tok
     int H = g_qwen.H;
     cudaStream_t st = g_qwen.stream;
     k_tq_embed_lookup_nk<<<dim3((H + 255) / 256, m), 256, 0, st>>>(g_mtp_e, g_qwen.d_embed, d_tok, H);
-    k_tq_qwen_rmsnorm_b_out<<<dim3(8, m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, 0, g_mtp_e, g_qwen.d_mtp_pre_fc_norm_emb, H, g_qwen.eps);
+    k_tq_qwen_rmsnorm_b_out<<<tq_norm_grid(m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, 0, g_mtp_e, g_qwen.d_mtp_pre_fc_norm_emb, H, g_qwen.eps);
     const float *hid = hsrc;
     if (d_hidx) {
         k_tq_gather_rows_nk<<<dim3((H + 255) / 256, m), 256, 0, st>>>(g_mtp_hid, hsrc, d_hidx, H);
-        k_tq_qwen_rmsnorm_b<<<dim3(8, m), 1024, 0, st>>>(g_mtp_hn, g_mtp_hid, g_qwen.d_norm, H, g_qwen.eps);
+        k_tq_qwen_rmsnorm_b<<<tq_norm_grid(m), 1024, 0, st>>>(g_mtp_hn, g_mtp_hid, g_qwen.d_norm, H, g_qwen.eps);
         hid = g_mtp_hn;
     }
-    k_tq_qwen_rmsnorm_b_out<<<dim3(8, m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, H, hid, g_qwen.d_mtp_pre_fc_norm_hidden, H, g_qwen.eps);
+    k_tq_qwen_rmsnorm_b_out<<<tq_norm_grid(m), 1024, 0, st>>>(g_mtp_fc_in, 2 * H, H, hid, g_qwen.d_mtp_pre_fc_norm_hidden, H, g_qwen.eps);
     int ret = wide_quant_input(g_mtp_fc_in, 2 * H, m);
     if (ret != 0) return ret;
     return wide_proj(&g_qwen.mtp_fc_x, g_mtp_x, m);
@@ -792,7 +792,7 @@ static int mtp_trunk_write(const float *hsrc, const int *d_hidx, const int *d_to
     if (ensure_wide_prefill_buffers(m) != 0) return -1;
     int ret = mtp_fc_forward(hsrc, d_hidx, d_tok, m);
     if (ret != 0) return ret;
-    k_tq_qwen_rmsnorm_b<<<dim3(8, m), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_mtp_x, mt->d_input_ln, H, g_qwen.eps);
+    k_tq_qwen_rmsnorm_b<<<tq_norm_grid(m), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_mtp_x, mt->d_input_ln, H, g_qwen.eps);
     if ((ret = wide_quant_input(g_wide_norm, H, m)) != 0) return ret;
     const tq_qmma_weight_t *kv[2] = {&mt->k_proj, &mt->v_proj};
     float *kv_out[2] = {g_wide_k, g_wide_v};
@@ -965,7 +965,7 @@ static int mtp_draft_body(int N, int K, int max_pos) {
         const int *d_tok = k == 0 ? mtp_ctl_row(1) : g_mtp_draft_d + (size_t)(k - 1) * g_pg_maxslots;
         const int *d_pos = mtp_ctl_row(3 + k);
         if ((ret = mtp_fc_forward(k == 0 ? g_mtp_last_h : g_mtp_hid, k == 0 ? mtp_ctl_row(2) : NULL, d_tok, N)) != 0) { ret = -10; break; }
-        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(N), dim3(1024), 0, g_qwen.stream,
                   g_wide_norm, g_mtp_x, mt->d_input_ln, H, g_qwen.eps);
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) { ret = -11; break; }
         const tq_qmma_weight_t *qkv[3] = {&mt->q_proj, &mt->k_proj, &mt->v_proj};
@@ -980,7 +980,7 @@ static int mtp_draft_body(int N, int K, int max_pos) {
         tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)N * H + 255) / 256), dim3(256), 0, g_qwen.stream,
                   g_wide_resid, g_mtp_x, g_wide_o, (int)((size_t)N * H));
         if ((ret = wide_mlp(mt, g_wide_resid, g_wide_h, N)) != 0) { ret = -14; break; }
-        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(N), dim3(1024), 0, g_qwen.stream,
                   g_mtp_hid, g_wide_h, g_qwen.d_mtp_norm, H, g_qwen.eps);         // post-norm hidden: next step + head
         if ((ret = wide_quant_input(g_mtp_hid, H, N)) != 0) { ret = -15; break; }
         if (g_qwen.draft_on) {

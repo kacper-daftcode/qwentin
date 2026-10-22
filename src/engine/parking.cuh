@@ -424,7 +424,7 @@ static int paged_decode_body(const int *tokens, const int *slot_ids_h, const int
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
             if (!norm_ready)
-                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(N), dim3(1024), 0, g_qwen.stream,
                           g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -64;
             const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
@@ -451,7 +451,7 @@ static int paged_decode_body(const int *tokens, const int *slot_ids_h, const int
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
             if (!norm_ready)
-                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+                tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(N), dim3(1024), 0, g_qwen.stream,
                           g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -71;
             const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
@@ -477,7 +477,7 @@ static int paged_decode_body(const int *tokens, const int *slot_ids_h, const int
         }
     }
     if (!norm_ready)
-        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, N), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(N), dim3(1024), 0, g_qwen.stream,
                   g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     if (paged_lm_head_wide()) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;

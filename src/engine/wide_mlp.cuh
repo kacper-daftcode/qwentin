@@ -75,10 +75,10 @@ static int wide_mlp(tq_layer_t *l, float *resid, float *layer_out, int n,
           can_use_qmma_sf_weight(&l->mlp_gate) && !l->mlp_gate.row_major &&
           can_use_qmma_sf_weight(&l->mlp_down) && !l->mlp_down.row_major)) return -1;
     if (add_a) {
-        tq_launch(g_pdl_small, k_tq_add_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_add_rmsnorm_b, tq_norm_grid(n), dim3(1024), 0, g_qwen.stream,
                   g_wide_pn, resid, add_a, add_b, l->d_post_ln, H, g_qwen.eps);
     } else {
-        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_qwen_rmsnorm_b, tq_norm_grid(n), dim3(1024), 0, g_qwen.stream,
                   g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
     }
     int ret = wide_quant_input(g_wide_pn, H, n);
@@ -98,7 +98,7 @@ static int wide_mlp(tq_layer_t *l, float *resid, float *layer_out, int n,
     if ((ret = wide_proj(&l->mlp_down, g_wide_down, n)) != 0) return ret;
     g_exl3_x2 = NULL;
     if (next_ln) {
-        tq_launch(g_pdl_small, k_tq_add_rmsnorm_b, dim3(8, n), dim3(1024), 0, g_qwen.stream,
+        tq_launch(g_pdl_small, k_tq_add_rmsnorm_b, tq_norm_grid(n), dim3(1024), 0, g_qwen.stream,
                   next_norm, layer_out, resid, g_wide_down, next_ln, H, g_qwen.eps);
     } else {
         tq_launch(g_pdl_small, k_tq_add_vec, dim3(((size_t)n * H + 255) / 256), dim3(256), 0, g_qwen.stream,

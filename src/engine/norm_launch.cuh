@@ -86,6 +86,15 @@ static unsigned g_graph_gen = 1;
 static void graph_cache_clear(void);
 static void graph_invalidate(void) { g_graph_gen++; graph_cache_clear(); }
 
+// Grid of the batched norms below (and k_tq_qwen_rmsnorm_b_out): every block of a row computes the row's FULL
+// reduction and the gridDim.x stripes only split the WRITES, so the outputs do not depend on the stripe count. 8 stripes
+// spread a few rows over more SMs (the decode step); for a wave of many rows (prefill, verify) one block per row does
+// 1/8 of the reads -- session 17: the prefill wave's 128 launches at 11.8 us were 1.5 ms of a 48.6 ms wave.
+#ifndef TQ_NORM_ONE_STRIPE_ROWS
+#define TQ_NORM_ONE_STRIPE_ROWS 16
+#endif
+static inline dim3 tq_norm_grid(int rows) { return dim3(rows >= TQ_NORM_ONE_STRIPE_ROWS ? 1 : 8, rows); }
+
 // Batched rmsnorm over `nodes` contiguous vectors (vector v at v*N). Grid = (stripes,
 // nodes), node = blockIdx.y. Bit-identical to k_tq_qwen_rmsnorm per node (same .x stripe
 // count); one launch replaces N for the Step-5 batched verify (cuts launch overhead).
