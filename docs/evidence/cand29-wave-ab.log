@@ -1,0 +1,25 @@
+[try-norm16] waiting for /tmp/exl3diff-gpu2.lock 03:37:37
+[try-norm16] start 03:37:37 lib qwentin-norm/build-norm/libforward_qwen.so md5 b2e93405f8a6 env: 
+   [norm16-32k] slot 0: restored 32768 tokens from runs/pattn/slot-32k.blob (608 MiB) in 0.15 s
+   [norm16-32k] 8 profiled 128-column waves at pos 32768+: 47.13 ms per wave (host wall; per wave 46.1 46.6 47.0 47.1 47.3 47.4 47.6 47.8)
+   [norm16-32k-dump] logits (4, 128, 248320) -> runs/ws/logits-norm16-32k.pt (argmax of the last column per wave: [579, 11, 11, 11])
+   vs base: [cmp] runs/ws/logits-norm16-32k.pt vs runs/ws/logits-base-32k.pt: waves 4 x 128 cols x 248320 vocab; BITWISE True
+   [norm16-128k] slot 0: restored 131072 tokens from runs/pattn/slot-128k.blob (2192 MiB) in 0.51 s
+   [norm16-128k] 8 profiled 128-column waves at pos 131072+: 72.27 ms per wave (host wall; per wave 71.2 71.7 71.9 72.3 72.6 72.7 72.8 72.9)
+   [norm16-128k-dump] logits (4, 128, 248320) -> runs/ws/logits-norm16-128k.pt (argmax of the last column per wave: [197, 197, 470, 1260])
+   vs base: [cmp] runs/ws/logits-norm16-128k.pt vs runs/ws/logits-base-128k.pt: waves 4 x 128 cols x 248320 vocab; BITWISE True
+[try-norm16] done 03:38:05
+[try-served17] waiting for /tmp/exl3diff-gpu2.lock 03:37:25
+[try-served17] start 03:37:25 lib qwentin/build-qwen/libforward_qwen.so md5 9be3c8e7513d env: 
+   [served17-32k] slot 0: restored 32768 tokens from runs/pattn/slot-32k.blob (608 MiB) in 0.15 s
+   [served17-32k] 8 profiled 128-column waves at pos 32768+: 47.86 ms per wave (host wall; per wave 46.9 47.3 47.7 47.9 48.1 48.2 48.4 48.5)
+   [served17-128k] slot 0: restored 131072 tokens from runs/pattn/slot-128k.blob (2192 MiB) in 0.66 s
+   [served17-128k] 8 profiled 128-column waves at pos 131072+: 72.96 ms per wave (host wall; per wave 71.8 72.4 72.7 73.0 73.2 73.4 73.5 73.6)
+[try-served17] done 03:37:37
+[try-served17b] waiting for /tmp/exl3diff-gpu2.lock 03:38:05
+[try-served17b] start 03:38:05 lib qwentin/build-qwen/libforward_qwen.so md5 9be3c8e7513d env: 
+   [served17b-32k] slot 0: restored 32768 tokens from runs/pattn/slot-32k.blob (608 MiB) in 0.16 s
+   [served17b-32k] 8 profiled 128-column waves at pos 32768+: 47.91 ms per wave (host wall; per wave 47.0 47.4 47.7 47.9 48.1 48.3 48.4 48.5)
+   [served17b-128k] slot 0: restored 131072 tokens from runs/pattn/slot-128k.blob (2192 MiB) in 0.52 s
+   [served17b-128k] 8 profiled 128-column waves at pos 131072+: 73.00 ms per wave (host wall; per wave 71.9 72.4 72.7 73.0 73.3 73.5 73.6 73.6)
+[try-served17b] done 03:38:17

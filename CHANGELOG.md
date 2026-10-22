@@ -8,6 +8,12 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+- **The prefill wave's norms run one block per row** (`k_tq_qwen_rmsnorm_b` and friends: 8 stripes per row each
+  recomputed the row's full reduction and only split the writes — a leftover of the single-stream decoder — so the
+  128-column wave spent 1.5 ms of its 48 on 128 launches of 11.8 µs). From 16 rows up one block per row: −0.75 ms per
+  128-column wave at 32K (47.9 → 47.1 ms), −0.7 at 128K, bitwise (the stripe count cannot change the output; the wave
+  logits equal the reference dumps); the decode step and the drafts keep the 8 stripes (one block per row costs +0.3
+  ms per round at one stream). Host code only (219 / 219 kernels SASS-identical). Gate: `docs/evidence/cand29-all.log`.
 - **`--spec-k auto` adapts the draft depth to the recent acceptance** (server only). Deeper drafts pay when the model's
   continuation is predictable (code) and cost when it is not (prose): at 4 streams @32K, K = 6 vs the table's 3 read
   708 vs 564 tok/s aggregate on the frozen CUDA corpus and 442 vs 480 on prose answers. The server now estimates the
