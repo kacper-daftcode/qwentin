@@ -8,6 +8,14 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+- **`--spec-k auto` adapts the draft depth to the recent acceptance** (server only). Deeper drafts pay when the model's
+  continuation is predictable (code) and cost when it is not (prose): at 4 streams @32K, K = 6 vs the table's 3 read
+  708 vs 564 tok/s aggregate on the frozen CUDA corpus and 442 vs 480 on prose answers. The server now estimates the
+  per-draft acceptance of the last ~32 rounds (`spec_p_hat`, a geometric estimate from the accepted counts) and drafts
+  6 deep at 3–4 active slots when it is ≥ 0.82, 4 deep at 5–6 slots when ≥ 0.78, the table otherwise; the waves stay
+  ≤ 30 columns. Through the server: code continuation at 4 streams 591 → 650 tok/s (+10 %), the design-note answers
+  unchanged at 4 / 6 / 8 streams; outputs are the verify's whatever K is (A/B texts identical, T1 unchanged).
+  `--spec-k table` keeps the fixed table; `/health` reports `spec_p_hat`. Gate: `docs/evidence/cand28-all.log`.
 - **The verify wave runs 33..64 columns in ONE pass over the weights** (`k_tq_exl3_wide_gemm<KB, 8, F32>`: 64-token
   EXL3 units with fp32 accumulators, the decode step's numerics). The verify used to cap its GEMM units at 32 tokens,
   so a wave of N (K + 1) > 32 columns ran as a 32-column pass plus a tail pass that re-read and re-decoded every Linear:

@@ -254,6 +254,16 @@ class Request:
 
 SPEC_MAX_T = 64      # verify wave column cap (qwn_paged_verify)
 SPEC_DEEP_MAX_POS = 65536   # --spec-k auto drafts 6 deep (with the reduced vocabulary) only while every active context is <= this
+# --spec-k auto, the acceptance-adaptive part (session 17): the server keeps a geometric estimate of the per-draft
+# acceptance p from the rounds' accepted counts (p_hat = A / (A + R): A = accepted drafts per slot, R = the share of slots
+# whose chain broke before K, both as exponential moving averages over ~SPEC_ACC_WINDOW rounds; the ratio is K-independent
+# under the geometric model). Above the thresholds the draft goes deeper at 3..6 active slots (the waves stay <= 30
+# columns, the cheap 32-token units): measured 10-22 at 32K, N = 4 -- K 3 / 6 = 564 / 708 tok/s aggregate on the frozen
+# CUDA corpus (p_hat ~0.9) and 480 / 442 on the vLLM prompts' design-note answers (p_hat ~0.7); the thresholds are the
+# geometric break-even of the measured round costs (K 6 vs 3 at N = 4: 33.4 vs 24.5 ms -> p >= 0.82; K 4 vs 3 at N = 6:
+# ~31.8 vs 28.5 -> p >= 0.78). The fixed table (--spec-k table) is 10-21's rule.
+SPEC_ACC_WINDOW = 32
+SPEC_ADAPT = ((4, 6, 0.82), (6, 4, 0.78))   # (slots <=, K, p_hat >=), first match wins; only when the table's K is lower
 
 
 class BatchedEngine:
@@ -305,6 +315,7 @@ class BatchedEngine:
         if self.spec:
             print(f"[spec] verify waves of up to {self.verify_onepass} columns in one pass over the weights; --spec-k auto = {self.spec_k_table()} by active slots", flush=True)
         self.rounds = 0; self.spec_tokens = 0; self.spec_cols = 0; self.spec_fallbacks = 0
+        self.acc_a = 0.0; self.acc_r = 0.0   # EMAs: accepted drafts per slot, share of slots with a rejection (p_hat)
         self.spec_draft_s = self.spec_verify_s = self.spec_commit_s = 0.0
         self.log_admits = os.environ.get("TQ_SERVE_LOG_ADMITS", "1") not in ("", "0")   # one line per admitted request
         self.free_slots = list(range(max_slots))
@@ -738,6 +749,11 @@ class BatchedEngine:
         for s in finished:
             self._detach(s)
 
+    def spec_p_hat(self):
+        """The geometric per-draft acceptance estimate of the recent rounds (0 before the first round)."""
+        d = self.acc_a + self.acc_r
+        return self.acc_a / d if d > 0 else 0.0
+
     def spec_k_table(self):
         """The auto rule as text: K at <= 2 / <= 8 / > 8 active slots."""
         k2 = 6 if self.draft_vocab else 4
@@ -754,10 +770,17 @@ class BatchedEngine:
         Capped by the wave width. max_pos = the longest active context: past 64K the drafter's own attention per
         step grows and K = 6 lost 7 % at 128K on the speed prompt (121.7 -> 113.4 tok/s), so the deep draft stops
         there."""
-        if self.spec_k == "auto":
+        if self.spec_k in ("auto", "table"):
             k = 4 if n <= 2 else (3 if (n <= 8 or self.verify_onepass >= 64) else 2)
             if n <= 2 and self.draft_vocab and max_pos <= SPEC_DEEP_MAX_POS:
                 k = 6          # the cheap draft step pays for two more drafts while the drafter's attention is short
+            if self.spec_k == "auto" and n > 2 and self.draft_vocab and max_pos <= SPEC_DEEP_MAX_POS:
+                p = self.spec_p_hat()
+                for n_max, k_deep, p_min in SPEC_ADAPT:
+                    if n <= n_max:
+                        if p >= p_min and k_deep > k:
+                            k = k_deep     # the recent acceptance pays for the deeper draft (SPEC_ADAPT, the note above)
+                        break
         else:
             k = int(self.spec_k)
         while k > 0 and n * (k + 1) > SPEC_MAX_T:
@@ -818,6 +841,11 @@ class BatchedEngine:
         ck(L.qwn_paged_commit(_ci(list(range(n))), _ci(n_acc), n), "paged_commit")
         t3 = time.time()
         tot = sum(n_acc)
+        # the acceptance estimate: a slot's chain of K drafts broke unless all K + 1 columns were committed (a request
+        # that stopped early inside the prefix counts as a break too -- rare, and it only lowers p_hat)
+        alpha = 1.0 / SPEC_ACC_WINDOW
+        self.acc_a += alpha * (sum(max(0, e - 1) for e in n_acc) / n - self.acc_a)
+        self.acc_r += alpha * (sum(1 for e in n_acc if e < K + 1) / n - self.acc_r)
         self.rounds += 1; self.steps += 1; self.decoded_tokens += tot; self.spec_tokens += tot; self.spec_cols += T
         self.spec_draft_s += t1 - t0; self.spec_verify_s += t2 - t1; self.spec_commit_s += t3 - t2
         for s in finished:
@@ -1101,7 +1129,7 @@ def make_handler(eng, tok, args):
                                  "park_ring": str(engine_settings(eng.L)["park_ring"]),
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "decoded_tokens": eng.decoded_tokens, "steps": eng.steps,
-                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k, "draft_vocab": getattr(eng, "draft_vocab", 0), "verify_onepass": getattr(eng, "verify_onepass", 32),
+                                 "spec": eng.spec, "spec_on": eng.spec_on, "spec_k": eng.spec_k, "draft_vocab": getattr(eng, "draft_vocab", 0), "verify_onepass": getattr(eng, "verify_onepass", 32), "spec_p_hat": round(eng.spec_p_hat(), 4) if hasattr(eng, "spec_p_hat") else 0.0,
                                  "rounds": eng.rounds, "spec_tokens": eng.spec_tokens,
                                  "tokens_per_round": round(eng.spec_tokens / eng.rounds, 3) if eng.rounds else None,
                                  "spec_verify_cols": eng.spec_cols, "spec_fallbacks": eng.spec_fallbacks,
@@ -1118,7 +1146,7 @@ def make_handler(eng, tok, args):
                     if kv.startswith("on="):
                         eng.spec_on = kv[3:] not in ("0", "false", "off")
                     elif kv.startswith("k="):
-                        eng.spec_k = "auto" if kv[2:] == "auto" else str(int(kv[2:]))
+                        eng.spec_k = kv[2:] if kv[2:] in ("auto", "table") else str(int(kv[2:]))
                 self._json(200, {"spec_on": eng.spec_on, "spec_k": eng.spec_k})
             else:
                 self._json(404, {"error": "not found"})
@@ -1293,7 +1321,9 @@ def serve(args):
                         cfg_overrides=args.cfg_overrides)
     fb, tb, pg, mb = eng._stats()
     spec_line = (f"speculative decoding ON (MTP drafter, K={args.spec_k}"
-                 + (f" = {eng.spec_k_table()} by active slots; draft vocabulary {eng.draft_vocab} ids; one-pass verify wave {eng.verify_onepass} columns" if args.spec_k == "auto" else "") + ")" if eng.spec
+                 + (f" = {eng.spec_k_table()} by active slots; draft vocabulary {eng.draft_vocab} ids; one-pass verify wave {eng.verify_onepass} columns"
+                    + (f"; adaptive: {' / '.join(f'{k} at <= {nm} slots when p_hat >= {pm}' for nm, k, pm in SPEC_ADAPT)}" if args.spec_k == "auto" and eng.draft_vocab else "")
+                    if args.spec_k in ("auto", "table") else "") + ")" if eng.spec
                  else "speculative decoding OFF (" + (eng.spec_off_reason or getattr(args, "spec_off_reason", "") or "--no-spec") + ")")
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}; "
           f"{kv_summary(eng.L, tb, pg)}; {spec_line}; {attn_st_summary(eng.L)}; "
@@ -1460,7 +1490,9 @@ def main():
                          "trellis-4 @32K): 2.7x per stream at N=1, 1.9x at N=4, 1.7x at N=8.")
     ap.add_argument("--no-spec", dest="spec", action="store_false")
     ap.add_argument("--spec-k", default="auto",
-                    help="draft depth: auto = 4 at <= 2 active slots, 3 at <= 8, 2 above; or a fixed number (1..16).")
+                    help="draft depth: auto = the table by active slots (6 at <= 2 with the reduced vocabulary, 3 above; 2 "
+                         "above 8 on an older engine) raised to 6 at <= 4 / 4 at <= 6 slots while the recent per-draft "
+                         "acceptance is high (SPEC_ADAPT); table = the same without the adaptive part; or a fixed number (1..16).")
     ap.add_argument("--dstate-bf16", dest="dstate", action="store_const", const=1, default=4,
                     help="store the per-slot GatedDeltaNet recurrent state as bf16 instead of fp32 (TQ_DSTATE_BF16=1; "
                          "compute stays fp32): 75.5 instead of 151 MiB per slot, ~0.9 GB freed at 12 slots (~+440 "
@@ -1496,10 +1528,10 @@ def main():
             args.spec = False
     if args.spec:
         args.mtp = True
-        if args.spec_k != "auto":
+        if args.spec_k not in ("auto", "table"):
             k = int(args.spec_k)
             if not 1 <= k <= 16:
-                raise SystemExit("--spec-k must be auto or 1..16")
+                raise SystemExit("--spec-k must be auto, table or 1..16")
     args.cfg_overrides = config_overrides(args)   # handed to qwn_init_with; explicit env overrides the flags
     if args.bench:
         bench(args)
