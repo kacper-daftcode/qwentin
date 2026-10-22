@@ -1,8 +1,8 @@
 # Flags — the engine's environment variables and the server's arguments (full reference)
 
 The full reference. The defaults are the served line, the engine's and the server's (the README's "Quick start" runs
-it with no flags and no environment). Current as of v0.12 (engine
-`40892ff`, library md5 `5f9cee32da7c`; what changed since: "Unreleased" in [`CHANGELOG.md`](../CHANGELOG.md)). Also here: the server's endpoints
+it with no flags and no environment). Current as of v0.13 (engine
+`e3be83d`, library md5 `b2e93405f8a6`; what changed since: "Unreleased" in [`CHANGELOG.md`](../CHANGELOG.md)). Also here: the server's endpoints
 and request-side behaviour (thinking, per-request stats, logging), the exposure guards, and the off-switches that
 restore each previous served line bit for bit.
 

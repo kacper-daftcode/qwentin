@@ -8,32 +8,43 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
-- **The prefill wave's norms run one block per row** (`k_tq_qwen_rmsnorm_b` and friends: 8 stripes per row each
-  recomputed the row's full reduction and only split the writes — a leftover of the single-stream decoder — so the
-  128-column wave spent 1.5 ms of its 48 on 128 launches of 11.8 µs). From 16 rows up one block per row: −0.75 ms per
-  128-column wave at 32K (47.9 → 47.1 ms), −0.7 at 128K, bitwise (the stripe count cannot change the output; the wave
-  logits equal the reference dumps); the decode step and the drafts keep the 8 stripes (one block per row costs +0.3
-  ms per round at one stream). Host code only (219 / 219 kernels SASS-identical). Gate: `docs/evidence/cand29-all.log`.
-- **`--spec-k auto` adapts the draft depth to the recent acceptance** (server only). Deeper drafts pay when the model's
-  continuation is predictable (code) and cost when it is not (prose): at 4 streams @32K, K = 6 vs the table's 3 read
-  708 vs 564 tok/s aggregate on the frozen CUDA corpus and 442 vs 480 on prose answers. The server now estimates the
-  per-draft acceptance of the last ~32 rounds (`spec_p_hat`, a geometric estimate from the accepted counts) and drafts
-  6 deep at 3–4 active slots when it is ≥ 0.82, 4 deep at 5–6 slots when ≥ 0.78, the table otherwise; the waves stay
-  ≤ 30 columns. Through the server: code continuation at 4 streams 591 → 650 tok/s (+10 %), the design-note answers
-  unchanged at 4 / 6 / 8 streams; outputs are the verify's whatever K is (A/B texts identical, T1 unchanged).
-  `--spec-k table` keeps the fixed table; `/health` reports `spec_p_hat`. Gate: `docs/evidence/cand28-all.log`.
-- **The verify wave runs 33..64 columns in ONE pass over the weights** (`k_tq_exl3_wide_gemm<KB, 8, F32>`: 64-token
-  EXL3 units with fp32 accumulators, the decode step's numerics). The verify used to cap its GEMM units at 32 tokens,
-  so a wave of N (K + 1) > 32 columns ran as a 32-column pass plus a tail pass that re-read and re-decoded every Linear:
-  at 12 slots with K = 2 (the `--spec-k auto` rule above 8 slots) every round paid it — 49.5 ms per round vs 31.3 at
-  K = 1 on the frozen code corpus at 32K; at 8 slots K = 4 cost 48.5 vs 33.7 at K = 3. Now (same corpus, 12 slots):
-  K 2 / 3 / 4 = 40.1 / 45.8 / 53.2 ms per round = **861 / 984 / 1022 tok/s aggregate (698 before)**; 8 slots K = 4 39.6 ms.
-  Every column is bit-identical to plain decode's (`spec_paged_check.py` at 36 / 40 / 48 / 60 columns, ctx 300, the
-  standard cells: 0 differing logits); the ≤ 32-column waves, decode and prefill are untouched (212 / 212 kernels
-  SASS-identical, 7 new). The engine reports the one-pass width (`qwn_verify_onepass_cols`, 61 entry points) and
-  **`--spec-k auto` drafts 3 deep above 8 active slots** (2 before; the table reads 6/3/3 with the reduced vocabulary)
-  — with an older library the server keeps 2. `/health` reports `verify_onepass`. `tools/spec_paged_check.py` gained
-  `--kmax` / `--k-fixed` (pinned wave widths) and `--bench` cells at 40 / 36 columns. Gate: `docs/evidence/cand27-all.log`.
+Nothing yet.
+
+## [v0.13] — 2026-10-22
+
+Speculative decoding faster at every stream count, all of it lossless (outputs are plain decode's bit for bit at the
+same client count): the drafter argmaxes over a reduced vocabulary (a 0.25 GB head instead of the 0.95 GB lm_head), the
+draft goes 6 deep at ≤ 2 streams, the verify wave of 33..64 columns runs in one pass over the weights (12 streams no
+longer pay a second weight pass per round), `--spec-k auto` adapts the draft depth to the recent acceptance at 3–6
+streams, and the prefill wave's norms run one block per row. Engine `e3be83d`, library `build-qwen/libforward_qwen.so`
+md5 `b2e93405f8a6`, the served line `--max-slots 12 --num-blocks 4500` with no flags and no environment on the opt-5.75
+version-2 `.tqf` **with the DRAFT lm_head section** (`...-mtp4-dv64k.tqf`: `tools/draft_head_build.py` + `convert_qwen_tqf.py
+--draft-head`; a file without the section serves as before with the full-head drafts); the 16 GB line is v0.12's (`t45v4`,
+unchanged). CUDA 13.1, driver 610.57.04, RTX 5090 at 550 W.
+
+### Numbers pinned at this tag
+
+| | value | log |
+|---|---|---|
+| Pooled KV capacity | **576 000 tokens** (4500 × 128-token pages, 12 slots × up to 256K) at **30 138 MiB** at start (+240 MiB for the draft head; 30 586 after a 128K prefill and the 12-stream runs) | `docs/evidence/rel13-table.log` |
+| Needle-in-a-repository | **6/6** at 32K and 128K (3 depths × 3 decoys) | `rel13-table.log`; `cand29-all.log` gate 3 |
+| Time to first token, cold | **11.4 s @32K · 58.5 s @128K** (v0.12: 11.6 / 60.1; 11.36–11.38 / 58.4–58.5 in the table run, 11.35 / 58.5–58.7 in the cand29 gate on this library) | `rel13-table.log`, `cand29-all.log` |
+| Decode per stream @32K, N = 1 / 2 / 4 / 8 / 12, spec on | **213 / 166 / 120 / 88 / 64 tok/s** — the mean of two readings of one prompt per stream (212.6 / 212.5, 165.9 / 165.7, 120.9 / 118.7, 88.2 / 88.5, 63.3 / 65.2); 780 tok/s aggregate at 12 streams (v0.12: 179 / 153 / 114 / 82 / —) | `rel13-table.log` |
+| Decode per stream @32K, spec off | 66 / 62 / 57 / 48 / 42 tok/s | `rel13-table.log` |
+| Decode per stream @128K, N = 1 / 2, spec on (off) | **123 / 102 tok/s** (58 / 53) (v0.12: 114 / 100) | `rel13-table.log` |
+| Spec A/B | 10/10 identical texts, and the same texts as every gate since `cand12` | `rel13-table.log`, `cand27/28/29-all.log` |
+| T1 EvalPlus with speculative decoding on | HumanEval/+ **93.9 / 91.5** (= the spec-off reference) on the one-pass wave, the adaptive K and the norm grid | `cand27-all.log`, `cand28-all.log`, `cand29-all.log` |
+| Quality vs the bf16 original | KL 0.0021–0.0027, top-1 99.0–99.1 % — unchanged: the trunk, the verify and the decode kernels compute what v0.12's did (the drafter's reduced vocabulary cannot change an output; 212 / 212 kernels SASS-identical through the engine landings, 7 new) | `cand25/27/29-all.log` gate 1 |
+| Full occupancy | **800 / 800 tok/s aggregate at 12 streams** in the one-pass gate vs **666 / 680** on the v0.12 + reduced-vocabulary library in the same gate (the table run read 774 / 788) | `cand27-all.log` |
+| Code continuation at 3–6 streams | 586 → 659 tok/s aggregate at 4 streams, 735 → 803 at 6 (the adaptive draft depth); prose answers unchanged | `cand28-all.log` |
+| Prefill wave | 47.9 → 47.1 ms per 128-column wave at 32K, 73.0 → 72.3 at 128K; the wave logits bitwise | `cand29-wave-ab.log` |
+| Wikitext-2 KL (exllamav3 `model_diff.py`, 100 × 2048) | opt-5.75 **0.00207 / 98.35 %** vs the bf16 original; t45v4 0.01123 / 96.01, t45-s425 0.01048 / 96.10 | `docs/evidence/wiki2/`, QUALITY.md § 7 |
+
+The spec-on cells follow the accepted draft length of one prompt per stream (4.62 tokens per round @32K N = 1 at K = 6,
+2.86 @128K at K = 4); a round costs ~22 ms @32K and ~23 ms @128K at one stream, 33 ms at 8 and 40–46 ms at 12 (K 2 / 3).
+
+### Changes
+
 - **The drafter's reduced vocabulary (a DRAFT lm_head section in the `.tqf`, `TQ_DRAFT_VOCAB`).** Every draft step
   read the full 248 320-row 6-bit lm_head (0.95 GB, 585 µs — 72 % of the step; 2.3 ms of a 21.3 ms round at one
   stream). The drafter now argmaxes over the 65 536 most frequent token ids through a 0.25 GB EXL3 head built from
@@ -54,6 +65,32 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 - **A public yardstick next to ours**: exllamav3's `eval/model_diff.py` on wikitext-2 (100 × 2048 tokens) for the
   served and candidate weights vs the bf16 original — docs/QUALITY.md § 7 (`docs/evidence/wiki2/`). It also shows
   that the 16 GB model `t45v4` (−19 % KL on the code yardstick) reads +7 % on prose: its allocation is code-weighted.
+- **The verify wave runs 33..64 columns in ONE pass over the weights** (`k_tq_exl3_wide_gemm<KB, 8, F32>`: 64-token
+  EXL3 units with fp32 accumulators, the decode step's numerics). The verify used to cap its GEMM units at 32 tokens,
+  so a wave of N (K + 1) > 32 columns ran as a 32-column pass plus a tail pass that re-read and re-decoded every Linear:
+  at 12 slots with K = 2 (the `--spec-k auto` rule above 8 slots) every round paid it — 49.5 ms per round vs 31.3 at
+  K = 1 on the frozen code corpus at 32K; at 8 slots K = 4 cost 48.5 vs 33.7 at K = 3. Now (same corpus, 12 slots):
+  K 2 / 3 / 4 = 40.1 / 45.8 / 53.2 ms per round = **861 / 984 / 1022 tok/s aggregate (698 before)**; 8 slots K = 4 39.6 ms.
+  Every column is bit-identical to plain decode's (`spec_paged_check.py` at 36 / 40 / 48 / 60 columns, ctx 300, the
+  standard cells: 0 differing logits); the ≤ 32-column waves, decode and prefill are untouched (212 / 212 kernels
+  SASS-identical, 7 new). The engine reports the one-pass width (`qwn_verify_onepass_cols`, 61 entry points) and
+  **`--spec-k auto` drafts 3 deep above 8 active slots** (2 before; the table reads 6/3/3 with the reduced vocabulary)
+  — with an older library the server keeps 2. `/health` reports `verify_onepass`. `tools/spec_paged_check.py` gained
+  `--kmax` / `--k-fixed` (pinned wave widths) and `--bench` cells at 40 / 36 columns. Gate: `docs/evidence/cand27-all.log`.
+- **`--spec-k auto` adapts the draft depth to the recent acceptance** (server only). Deeper drafts pay when the model's
+  continuation is predictable (code) and cost when it is not (prose): at 4 streams @32K, K = 6 vs the table's 3 read
+  708 vs 564 tok/s aggregate on the frozen CUDA corpus and 442 vs 480 on prose answers. The server now estimates the
+  per-draft acceptance of the last ~32 rounds (`spec_p_hat`, a geometric estimate from the accepted counts) and drafts
+  6 deep at 3–4 active slots when it is ≥ 0.82, 4 deep at 5–6 slots when ≥ 0.78, the table otherwise; the waves stay
+  ≤ 30 columns. Through the server: code continuation at 4 streams 591 → 650 tok/s (+10 %), the design-note answers
+  unchanged at 4 / 6 / 8 streams; outputs are the verify's whatever K is (A/B texts identical, T1 unchanged).
+  `--spec-k table` keeps the fixed table; `/health` reports `spec_p_hat`. Gate: `docs/evidence/cand28-all.log`.
+- **The prefill wave's norms run one block per row** (`k_tq_qwen_rmsnorm_b` and friends: 8 stripes per row each
+  recomputed the row's full reduction and only split the writes — a leftover of the single-stream decoder — so the
+  128-column wave spent 1.5 ms of its 48 on 128 launches of 11.8 µs). From 16 rows up one block per row: −0.75 ms per
+  128-column wave at 32K (47.9 → 47.1 ms), −0.7 at 128K, bitwise (the stripe count cannot change the output; the wave
+  logits equal the reference dumps); the decode step and the drafts keep the 8 stripes (one block per row costs +0.3
+  ms per round at one stream). Host code only (219 / 219 kernels SASS-identical). Gate: `docs/evidence/cand29-all.log`.
 
 ## [v0.12] — 2026-10-21
 

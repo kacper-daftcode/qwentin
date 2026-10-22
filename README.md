@@ -12,7 +12,7 @@ comes from EXL3 trellis-quantized weights at 5.75 bpw (quantized with turboderp'
 (Cursor) directed by the maintainer; every number below is backed by a log in [`docs/evidence/`](docs/evidence/README.md),
 and `bench/reproduce.sh` re-measures the served line on your card.
 
-## One 32 GB card (2026-10-22, `main`)
+## One 32 GB card (v0.13, 2026-10-22)
 
 | | **qwentin**, 1 × RTX 5090 | vLLM NVFP4, 1 × RTX 5090 (bf16 KV ; fp8 KV) | vLLM FP8, 2 × RTX 5090 (TP2) |
 |---|---|---|---|
@@ -42,7 +42,7 @@ its one prompt: 4.62 tokens per round @32K N = 1 (K = 6), 2.86 @128K (K = 4) at 
 one 5090. Cell-by-cell sources: [`docs/evidence/README.md`](docs/evidence/README.md); the story behind the numbers:
 [`docs/NOTES.md`](docs/NOTES.md).</sub>
 
-## One 16 GB card (v0.12, 2026-10-21)
+## One 16 GB card (v0.12, 2026-10-21 — unchanged in v0.13)
 
 The 4.25 bpw model `t45v4` (−19 % KL on the code yardstick at the same size as the previous `t45-s425`; +7 % on
 wikitext-2 prose — the allocation is code-weighted, see `docs/QUALITY.md` § 7) with the same engine, two sessions,
