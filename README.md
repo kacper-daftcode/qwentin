@@ -12,7 +12,7 @@ comes from EXL3 trellis-quantized weights at 5.75 bpw (quantized with turboderp'
 (Cursor) directed by the maintainer; every number below is backed by a log in [`docs/evidence/`](docs/evidence/README.md),
 and `bench/reproduce.sh` re-measures the served line on your card.
 
-## One 32 GB card (main, 2026-10-22; v0.12 + the Unreleased changes)
+## One 32 GB card (2026-10-22, `main`)
 
 | | **qwentin**, 1 × RTX 5090 | vLLM NVFP4, 1 × RTX 5090 (bf16 KV ; fp8 KV) | vLLM FP8, 2 × RTX 5090 (TP2) |
 |---|---|---|---|
@@ -28,8 +28,9 @@ and `bench/reproduce.sh` re-measures the served line on your card.
 re-measured 2026-10-22 on one library and the served reduced-vocabulary file, each speed cell twice in one run
 (`docs/evidence/rel13-table.log`: 212.6 / 212.5, 120.9 / 118.7, 88.2 / 88.5, 63.3 / 65.2 per stream at N = 1 / 4 / 8 / 12
 @32K spec on, 774 / 788 aggregate at 12; 123.4 / 123.7 and 103.9 / 100.5 @128K; TTFT 11.36–11.38 / 58.4–58.5 s; 30 138 →
-30 586 MiB over the run). The decode cells were measured on library `9be3c8e7` — the later `cand-1218` changes only
-the prefill waves' norm grid (bitwise; −0.75 ms per 128-column wave: `cand29-wave-ab.log`) — and its gate read the TTFT at
+30 586 MiB over the run). The decode cells were measured on library `9be3c8e7`; the later `cand-1218` changes only the
+norm grid of waves with ≥ 16 rows (prefill waves and the verify waves of ≥ 4 streams; bitwise, −0.75 ms per 128-column prefill
+wave, speed-neutral on the verify wave at 8 streams: `cand29-wave-ab.log`, `cand29-all.log`) — its gate read the TTFT at
 11.35 / 58.5–58.7 s. `--spec-k auto` at 12 streams is 3 drafts since 2026-10-22 (the verify wave runs up to 64 columns in
 one pass: 666 / 680 aggregate before, `cand27-all.log`); at 3–6 streams it deepens the draft when the recent acceptance is
 high (`cand28-all.log`: code continuation 586 → 659 tok/s at 4 streams, prose answers unchanged — the table's prose cells
