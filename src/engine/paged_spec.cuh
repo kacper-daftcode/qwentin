@@ -160,6 +160,15 @@ __global__ void k_tq_linear_conv_seq_paged_all(const tq_vf_lp *lp, int channels,
 // columns of a segment (grid.y) with the state slice in registers: same thread layout, same per-column
 // math and reduction order, so the column outputs and the final state equal n sequential launches of
 // the per-token kernel. core_out = NULL skips the core (commit replay); write_state stores the state.
+// Session 17: the segment's q / k norms (the only block-wide reductions) are computed for ALL its columns in a
+// prologue -- one warp per column, tq_warp_sumsq128 (the decode core's sums, bit for bit), qn / kn rows in shared
+// memory (2 x TQ_VF_CORE_RC x dim floats per chunk of TQ_VF_CORE_RC columns; the served drafts are K <= 6 = one chunk)
+// -- behind ONE __syncthreads per chunk; the column loop then carries the state with no barrier at all (the 8-lane
+// shuffles are the only exchange). Before: two 7-step shared-memory trees + 4 barriers per column, 48 launches per wave.
+#define TQ_VF_CORE_RC 8
+#ifndef TQ_VF_CORE_MINB
+#define TQ_VF_CORE_MINB 2
+#endif
 template <int G, int HS, int DS>
 static __device__ __forceinline__ void tq_linear_core_seq_body(
         float *core_out, void *recurrent_state, const float *qkv_conv, const float *b_proj, const float *a_proj,
@@ -167,7 +176,6 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
         const int *seg_slot, const int *seg_off, const int *seg_len,
         int recur_stride, int conv_dim, int core_stride, int write_state, int seg, const int *col_pos) {
     extern __shared__ float smem[];
-    float *qn = smem, *kn = smem + dim, *red = smem + 2 * dim;
     int slot = seg_slot[seg], off = seg_off[seg], n = seg_len[seg];
     int blk = blockIdx.x, head = blk / HS, part = blk % HS;
     if (head >= value_heads) return;
@@ -178,43 +186,43 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
     tq_ds_acc<DS> state = tq_ds_make<DS>(recurrent_state, (size_t)slot, (size_t)recur_stride, (size_t)head * dim * dim);
     constexpr int NKK = 128 / G;                      // dim == 128: constant-trip loops keep st[] in registers
     float st[NKK];
-    int nkk = 0;
-    // The segment's inputs are all known up front: the next column's q/k/v/b/a are loaded while this column runs
-    // (software pipelining; the per-column math and reduction order are unchanged -> the state stays bitwise).
-    // bs >= dim for every valid (G, HS) config, so thread t owns q[t]/k[t] (t < dim) and v[tid].
-    float q_c = 0.0f, k_c = 0.0f, v_c = 0.0f, b_c = 0.0f, a_c = 0.0f;
+    // the per-column scalars (b, a -> beta, decay) and v[tid] of column s, loaded one column ahead
+    float v_c = 0.0f, b_c = 0.0f, a_c = 0.0f;
     {
         const float *qc = qkv_conv + (size_t)off * conv_dim;
-        if (t < dim) { q_c = qc[key_head * dim + t]; k_c = qc[key_dim + key_head * dim + t]; }
         v_c = qc[2 * key_dim + head * dim + tid];
         b_c = b_proj[(size_t)off * value_heads + head]; a_c = a_proj[(size_t)off * value_heads + head];
     }
     #pragma unroll
     for (int j = 0; j < NKK; j++) st[j] = state.ld((size_t)(klane + j * G) * dim + tid);
-    (void)nkk;
+    const int warp = t >> 5, lane = t & 31, nwarps = bs >> 5;
     for (int s = 0; s < n; s++) {
         int col = off + s;
+        if ((s % TQ_VF_CORE_RC) == 0) {
+            // prologue of this chunk of columns: qn / kn rows (qn at 2r, kn at 2r + 1), one warp per column
+            if (s > 0) __syncthreads();                   // the previous chunk's rows are still being read
+            const int cend = (n - s < TQ_VF_CORE_RC) ? n : s + TQ_VF_CORE_RC;
+            for (int c = s + warp; c < cend; c += nwarps) {
+                const float *qc = qkv_conv + (size_t)(off + c) * conv_dim;
+                const float *q = qc + key_head * dim, *k = qc + key_dim + key_head * dim;
+                const float qsum = tq_warp_sumsq128(q, lane), ksum = tq_warp_sumsq128(k, lane);
+                float *qn = smem + (size_t)(2 * (c - s)) * dim, *kn = qn + dim;
+                #pragma unroll
+                for (int i = lane; i < 128; i += 32) {       // the decode core's expressions, same association
+                    qn[i] = q[i] * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
+                    kn[i] = k[i] * rsqrtf(ksum + 1.0e-6f);
+                }
+            }
+            __syncthreads();
+        }
         if constexpr (DS == 4) state.pos = (uint32_t)col_pos[col];
-        float q_n = 0.0f, k_n = 0.0f, v_n = 0.0f, b_n = 0.0f, a_n = 0.0f;
+        const float *qn = smem + (size_t)(2 * (s % TQ_VF_CORE_RC)) * dim, *kn = qn + dim;
+        float v_n = 0.0f, b_n = 0.0f, a_n = 0.0f;
         if (s + 1 < n) {
             const float *qc = qkv_conv + (size_t)(col + 1) * conv_dim;
-            if (t < dim) { q_n = qc[key_head * dim + t]; k_n = qc[key_dim + key_head * dim + t]; }
             v_n = qc[2 * key_dim + head * dim + tid];
             b_n = b_proj[(size_t)(col + 1) * value_heads + head]; a_n = a_proj[(size_t)(col + 1) * value_heads + head];
         }
-        if (t < dim) red[t] = q_c * q_c;
-        __syncthreads();
-        float qsum = tq_block_reduce_sum_sh(red, dim, t);
-        __syncthreads();
-        if (t < dim) red[t] = k_c * k_c;
-        __syncthreads();
-        float ksum = tq_block_reduce_sum_sh(red, dim, t);
-        __syncthreads();
-        if (t < dim) {
-            qn[t] = q_c * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
-            kn[t] = k_c * rsqrtf(ksum + 1.0e-6f);
-        }
-        __syncthreads();
         float beta = 1.0f / (1.0f + expf(-b_c));
         float softplus_arg = a_c + tq_bf16_to_float(dt_bias[head]);
         float softplus = log1pf(expf(-fabsf(softplus_arg))) + fmaxf(softplus_arg, 0.0f);
@@ -227,7 +235,7 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
         for (int o = G >> 1; o > 0; o >>= 1) psum += __shfl_down_sync(0xffffffffu, psum, o, G);
         float kv_mem = __shfl_sync(0xffffffffu, psum, 0, G) * decay;
         float delta = (v_c - kv_mem) * beta;
-        q_c = q_n; k_c = k_n; v_c = v_n; b_c = b_n; a_c = a_n;
+        v_c = v_n; b_c = b_n; a_c = a_n;
         float pcore = 0.0f;
         #pragma unroll
         for (int j = 0; j < NKK; j++) {
@@ -240,7 +248,6 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
         for (int o = G >> 1; o > 0; o >>= 1) pcore += __shfl_down_sync(0xffffffffu, pcore, o, G);
         float core = __shfl_sync(0xffffffffu, pcore, 0, G);
         if (core_out && klane == 0) core_out[(size_t)col * core_stride + head * dim + tid] = core;
-        __syncthreads();                                  // qn/kn/red are rebuilt for the next column
     }
     if (write_state) {
         // the carried values are already rounded (rnd == st's rounding; with DS = 4 the same seed: the last column's)
@@ -250,7 +257,7 @@ static __device__ __forceinline__ void tq_linear_core_seq_body(
     }
 }
 template <int G, int HS, int DS>
-__global__ void k_tq_linear_core_seq_paged(float *core_out, void *recurrent_state,
+__global__ void __launch_bounds__(256, TQ_VF_CORE_MINB) k_tq_linear_core_seq_paged(float *core_out, void *recurrent_state,
                                            const float *qkv_conv, const float *b_proj, const float *a_proj,
                                            const float *A_log, const uint16_t *dt_bias,
                                            int value_heads, int key_heads, int dim,
@@ -263,7 +270,7 @@ __global__ void k_tq_linear_core_seq_paged(float *core_out, void *recurrent_stat
                                        write_state, blockIdx.y, col_pos);
 }
 template <int G, int HS, int DS>
-__global__ void k_tq_linear_core_seq_paged_all(const tq_vf_lp *lp, int value_heads, int key_heads, int dim,
+__global__ void __launch_bounds__(256, TQ_VF_CORE_MINB) k_tq_linear_core_seq_paged_all(const tq_vf_lp *lp, int value_heads, int key_heads, int dim,
                                                const int *seg_slot, const int *seg_off, const int *seg_len,
                                                int recur_stride, int conv_dim, const int *col_pos) {
     tq_pdl_enter();
@@ -282,7 +289,7 @@ static int vf_linear_core_seq(tq_layer_t *l, float *core_out, void *recur_base, 
     int dim = g_qwen.linear_value_head_dim;
     const int lc_g = 8, lc_hs = 4;                                      // paged_linear_core's split
     if (dim != 128) return -1;
-    size_t shA = (size_t)3 * dim * sizeof(float);
+    size_t shA = (size_t)2 * TQ_VF_CORE_RC * dim * sizeof(float);   // qn / kn rows of a chunk of columns
     int blkA = (dim / lc_hs) * lc_g;
     dim3 gridA(heads * lc_hs, nseg);
     #define VF_CORE_HS1(GG, HH, DS)                                                               \
@@ -627,7 +634,7 @@ extern "C" int qwn_paged_commit(const int *seg_idx, const int *n_accept, int M) 
         if (dim != 128) { g_pdl_small = 0; return -7; }
         tq_launch(g_pdl_small, k_tq_linear_conv_seq_paged_all, dim3((conv_dim + 255) / 256, m, g_vf_nlin), dim3(256), 0,
                   g_qwen.stream, (const tq_vf_lp *)g_vf_lp, conv_dim, g_qwen.linear_conv_kernel_dim, d_cslot, d_coff, d_clen, conv_f);
-        size_t shA = (size_t)3 * dim * sizeof(float);
+        size_t shA = (size_t)2 * TQ_VF_CORE_RC * dim * sizeof(float);   // qn / kn rows of a chunk of columns
         dim3 gridA(heads * lc_hs, m, g_vf_nlin), blkA((dim / lc_hs) * lc_g);
         #define VF_CORE_ALL1(GG, HH, DS) \
             tq_launch(g_pdl_small, k_tq_linear_core_seq_paged_all<GG, HH, DS>, gridA, blkA, shA, g_qwen.stream, \

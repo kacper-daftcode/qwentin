@@ -761,7 +761,26 @@ __global__ void k_tq_linear_conv_update_paged(float *out, float *state, const fl
     outn[i] = sum / (1.0f + expf(-sum));
 }
 
+// Sum of squares of a 128-vector by one warp, BIT FOR BIT the value of tq_block_reduce_sum_sh(red = x[i]^2, 128, t):
+// that tree adds red[t] += red[t + 64] (t < 64), then += red[t + 32] (t < 32), then += red[t + 16], 8, 4, 2, 1 and reads
+// red[0]. With lane l holding the squares of x[l], x[l + 32], x[l + 64], x[l + 96], the first two levels are in-lane
+// ((x[l]^2 + x[l+64]^2) + (x[l+32]^2 + x[l+96]^2) = red[l] after level 2), the five others are shfl_down pairs (t, t +
+// off), and lane 0 ends with red[0]; the result is broadcast from lane 0. Explicit __fmul_rn / __fadd_rn: the tree's
+// own operations (a plain multiply stored to shared memory, plain adds) cannot be contracted, and neither can these.
+// Session 17: it replaces the 7-step shared-memory tree (7 __syncthreads each, two per column) in the DeltaNet decode
+// core AND the verify's sequential core; the outputs of both are the previous kernels' bit for bit.
+static __device__ __forceinline__ float tq_warp_sumsq128(const float *x, int lane) {
+    const float s0 = __fmul_rn(x[lane], x[lane]), s1 = __fmul_rn(x[lane + 32], x[lane + 32]);
+    const float s2 = __fmul_rn(x[lane + 64], x[lane + 64]), s3 = __fmul_rn(x[lane + 96], x[lane + 96]);
+    float v = __fadd_rn(__fadd_rn(s0, s2), __fadd_rn(s1, s3));      // levels 64 and 32: red[lane] of the old tree
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, o));   // levels 16 .. 1: red[t] += red[t + o]
+    return __shfl_sync(0xffffffffu, v, 0);                             // red[0]
+}
+
 // DS: storage format of recurrent_state (tq_ds_ld / tq_ds_st; 0 = fp32, main's kernel bit for bit).
+// Session 17: the q / k norms' sums come from tq_warp_sumsq128 (every warp computes them, no shared memory, no
+// barrier) and only the qn / kn write needs one __syncthreads (18 per column before: two 7-step trees + 4).
 template <int G, int HS, int DS>
 __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, void *recurrent_state,
                                              const float *qkv_conv,
@@ -772,7 +791,7 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, void *recurren
                                              int conv_dim, int core_stride, const int *positions) {
     tq_pdl_enter();
     extern __shared__ float smem[];
-    float *qn = smem, *kn = smem + dim, *red = smem + 2 * dim;
+    float *qn = smem, *kn = smem + dim;
     int col = blockIdx.y;
     int slot = slot_ids[col];
     float *core_o = core_out + (size_t)col * core_stride;
@@ -788,14 +807,8 @@ __global__ void k_tq_linear_decode_core_hs_paged(float *core_out, void *recurren
     const float *q = qkv_conv + key_head * dim;
     const float *k = qkv_conv + key_dim + key_head * dim;
     const float *v = qkv_conv + 2 * key_dim + head * dim;
-    for (int i = t; i < dim; i += bs) red[i] = q[i] * q[i];
-    __syncthreads();
-    float qsum = tq_block_reduce_sum_sh(red, dim, t);
-    __syncthreads();
-    for (int i = t; i < dim; i += bs) red[i] = k[i] * k[i];
-    __syncthreads();
-    float ksum = tq_block_reduce_sum_sh(red, dim, t);
-    __syncthreads();
+    const int lane = t & 31;
+    const float qsum = tq_warp_sumsq128(q, lane), ksum = tq_warp_sumsq128(k, lane);   // dim == 128 (the launcher checks)
     for (int i = t; i < dim; i += bs) {
         qn[i] = q[i] * rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)dim);
         kn[i] = k[i] * rsqrtf(ksum + 1.0e-6f);
@@ -849,7 +862,7 @@ static int paged_linear_core(tq_layer_t *l, float *core_base, void *recur_base,
     // 8 threads per state element, each head split over 4 blocks (fills 170 SMs); the cores unroll over dim == 128
     const int lc_g = 8, lc_hs = 4;
     if (dim != 128) return -1;
-    size_t shA = (size_t)3 * dim * sizeof(float), shB = (size_t)dim * sizeof(float);
+    size_t shA = (size_t)2 * dim * sizeof(float), shB = (size_t)dim * sizeof(float);   // qn, kn
     int blkA = (dim / lc_hs) * lc_g;
     dim3 gridA(heads * lc_hs, N);
     #define PAGED_CORE_HS1(GG, HH, DS)                                                 \
