@@ -1,0 +1,14 @@
+[dn-speed] start 15:22:18
+   served N=1 K=6 ctx=32768: 60 rounds, 21.46 ms per round (host wall); draft 2.49 + verify 18.54 + commit 0.42 ms; 4.13 tokens per round per sl
+   served N=8 K=3 ctx=32768: 60 rounds, 32.91 ms per round (host wall); draft 1.92 + verify 28.33 + commit 2.66 ms; 3.71 tokens per round per sl
+   served N=12 K=3 ctx=32768: 60 rounds, 45.02 ms per round (host wall); draft 2.28 + verify 38.77 + commit 3.96 ms; 3.73 tokens per round per s
+   dn     N=1 K=6 ctx=32768: 60 rounds, 21.22 ms per round (host wall); draft 2.49 + verify 18.37 + commit 0.35 ms; 4.13 tokens per round per sl
+   dn     N=8 K=3 ctx=32768: 60 rounds, 32.03 ms per round (host wall); draft 1.92 + verify 27.85 + commit 2.26 ms; 3.71 tokens per round per sl
+   dn     N=12 K=3 ctx=32768: 60 rounds, 43.73 ms per round (host wall); draft 2.29 + verify 38.11 + commit 3.33 ms; 3.73 tokens per round per s
+   served N=1 K=6 ctx=32768: 60 rounds, 21.50 ms per round (host wall); draft 2.49 + verify 18.58 + commit 0.42 ms; 4.13 tokens per round per sl
+   served N=8 K=3 ctx=32768: 60 rounds, 32.93 ms per round (host wall); draft 1.91 + verify 28.35 + commit 2.66 ms; 3.71 tokens per round per sl
+   served N=12 K=3 ctx=32768: 60 rounds, 45.07 ms per round (host wall); draft 2.28 + verify 38.82 + commit 3.96 ms; 3.73 tokens per round per s
+   dn     N=1 K=6 ctx=32768: 60 rounds, 21.22 ms per round (host wall); draft 2.49 + verify 18.38 + commit 0.35 ms; 4.13 tokens per round per sl
+   dn     N=8 K=3 ctx=32768: 60 rounds, 32.05 ms per round (host wall); draft 1.92 + verify 27.87 + commit 2.26 ms; 3.71 tokens per round per sl
+   dn     N=12 K=3 ctx=32768: 60 rounds, 43.76 ms per round (host wall); draft 2.29 + verify 38.14 + commit 3.33 ms; 3.73 tokens per round per s
+[dn-speed] done 15:40:07

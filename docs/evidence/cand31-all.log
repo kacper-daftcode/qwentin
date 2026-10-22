@@ -1,0 +1,74 @@
+[cand31-all] start 15:40:33; cand 200e037d2b61 = 96e735b engine: the DeltaNet decode core and the verify's se; served b2e93405f8a6
+== gate 0: ruff + pytest, the exported ABI   15:40:33
+[1;32mAll checks passed![0m
+77 passed, 7 skipped in 0.86s
+84 passed in 0.87s
+[gate0] PASS (61 exports)
+== gate 1: SASS + bitwise   15:41:03
+kernels: old 219, new 219, common 219; identical 204, different 15
+[plab] N=3 cand-1221 (bitwise build) vs served: bitwise True (max |d| 0.000e+00, 25 tensors)
+[plab] N=8 cand-1221 (bitwise build) vs served: bitwise True (max |d| 0.000e+00, 25 tensors)
+[plab] N=3 --mtp-on (dv64k file) cand-1221 (bitwise build) vs served: bitwise True (max |d| 0.000e+00, 25 tensors)
+[gate1] PASS
+== gate 2: spec exactness -- the 33..64-column waves + the standard cells   15:42:30
+   4k-n8k4: [spec-check] unpinned band over 406 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [8]) 
+   4k-n4k6: [spec-check] unpinned band over 288 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [4]) 
+   4k-n2k8: [spec-check] unpinned band over 186 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [2]) 
+   4k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 4096, Ns [1, 3, 8]) 
+   32k: [spec-check] unpinned band over 518 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 32768, Ns [1, 3, 8]) 
+   300: [spec-check] unpinned band over 982 verify columns: 0 with different logits (max |d| 0.000e+00), 0 argmax flips [spec-check] ALL PASS (ctx 300, Ns [1, 3]) 
+[gate2] PASS
+== gate 3: THE SERVED LINE (dv64k file), K auto = 6/3/3, one-pass wave 64   15:44:50
+   server up after 10 s, pid 272783, 30138 MiB; 576000 pooled tokens; speculative decoding ON (MTP drafter, K=auto = 6/3/3 by active slots; draft vocabulary 65536 ids; one-pass verify wave 64 columns; adaptive: 6 at <= 4 slots when p_hat >= 0.82 / 4 at <= 6 slots when p_hat >= 0.78)
+   /health "draft_vocab": 65536
+   /health "verify_onepass": 64
+   [repro] garbage 0 / 6
+[   32k depth=0.95 rep=0] PASS prompt=32596 ttft=11.218s e2e=11.262s ans='FF-699212-PR' exp=['FF-699
+[   32k depth=0.50 rep=0] PASS prompt=32596 ttft=11.211s e2e=11.255s ans='UI-672763-WB' exp=['UI-672
+[   32k depth=0.05 rep=0] PASS prompt=32602 ttft=11.216s e2e=11.259s ans='ZU-821600-AR' exp=['ZU-821
+[  128k depth=0.95 rep=0] PASS prompt=130903 ttft=57.809s e2e=57.855s ans='HE-215844-MW' exp=['HE-21
+[  128k depth=0.50 rep=0] PASS prompt=130905 ttft=57.827s e2e=57.874s ans='AB-416549-JJ' exp=['AB-41
+[  128k depth=0.05 rep=0] PASS prompt=130905 ttft=57.879s e2e=57.926s ans='ND-297860-GH' exp=['ND-29
+[ab] on: 10 prompts, 2647 tokens in 17.4s = 152.2 tok/s (concurrency 1); per-request mean 152.4 tok/s; rounds 648, tokens/round 4.07
+[ab] off: 10 prompts, 2647 tokens in 43.1s = 61.4 tok/s (concurrency 1); per-request mean 61.0 tok/s; rounds 0, tokens/round nan
+[ab] identical outputs: 10/10
+[ab-vs-cand21] prompts identical True; texts identical to cand21's: on 10/10, off 10/10 (required: the library is bitwise)
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 215.0 (min 215.0, max 215.0), aggregate 215.0; 300 tokens in 1.5s; rounds 65 steps 65 tokens/round
+[speed] ctx=32768 N=1 spec=on: per-stream tok/s p50 215.0 (min 215.0, max 215.0), aggregate 215.0; 300 tokens in 1.5s; rounds 65 steps 65 tokens/round
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 160.9 (min 123.0, max 160.9), aggregate 283.9; 600 tokens in 2.5s; rounds 103 steps 103 tokens/rou
+[speed] ctx=32768 N=2 spec=on: per-stream tok/s p50 169.9 (min 134.4, max 169.9), aggregate 304.3; 600 tokens in 2.3s; rounds 92 steps 92 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 89.5 (min 82.3, max 97.3), aggregate 709.0; 2400 tokens in 3.8s; rounds 114 steps 114 tokens/round
+[speed] ctx=32768 N=8 spec=on: per-stream tok/s p50 91.1 (min 81.9, max 99.3), aggregate 726.5; 2400 tokens in 4.1s; rounds 130 steps 130 tokens/round
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 69.0 (min 63.5, max 83.6), aggregate 833.4; 3600 tokens in 5.7s; rounds 148 steps 148 tokens/roun
+[speed] ctx=32768 N=12 spec=on: per-stream tok/s p50 68.9 (min 63.9, max 80.7), aggregate 838.5; 3600 tokens in 5.4s; rounds 131 steps 131 tokens/roun
+[speed] ctx=131072 N=1 spec=on: per-stream tok/s p50 125.0 (min 125.0, max 125.0), aggregate 125.0; 300 tokens in 2.6s; rounds 105 steps 105 tokens/ro
+   cand28 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand28 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand28 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand28 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand28 ctx=32768 N=8: 18.60 tokens per round (2400 tokens / 129 rounds)
+   cand28 ctx=32768 N=8: 18.75 tokens per round (2400 tokens / 128 rounds)
+   cand30 ctx=32768 N=1: 4.05 tokens per round (300 tokens / 74 rounds)
+   cand30 ctx=32768 N=1: 4.05 tokens per round (300 tokens / 74 rounds)
+   cand30 ctx=32768 N=2: 5.66 tokens per round (600 tokens / 106 rounds)
+   cand30 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand30 ctx=32768 N=8: 18.32 tokens per round (2400 tokens / 131 rounds)
+   cand30 ctx=32768 N=8: 18.32 tokens per round (2400 tokens / 131 rounds)
+   cand31 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand31 ctx=32768 N=1: 4.62 tokens per round (300 tokens / 65 rounds)
+   cand31 ctx=32768 N=2: 5.83 tokens per round (600 tokens / 103 rounds)
+   cand31 ctx=32768 N=2: 6.52 tokens per round (600 tokens / 92 rounds)
+   cand31 ctx=32768 N=8: 21.05 tokens per round (2400 tokens / 114 rounds)
+   cand31 ctx=32768 N=8: 18.46 tokens per round (2400 tokens / 130 rounds)
+   cand28-n12 ctx=32768 N=12: 25.90 tokens per round (3600 tokens / 139 rounds)
+   cand28-n12 ctx=32768 N=12: 26.67 tokens per round (3600 tokens / 135 rounds)
+   cand30-n12 ctx=32768 N=12: 26.09 tokens per round (3600 tokens / 138 rounds)
+   cand30-n12 ctx=32768 N=12: 26.47 tokens per round (3600 tokens / 136 rounds)
+   cand31-n12 ctx=32768 N=12: 24.32 tokens per round (3600 tokens / 148 rounds)
+   cand31-n12 ctx=32768 N=12: 27.48 tokens per round (3600 tokens / 131 rounds)
+   -- T1 HumanEval+ with spec on   15:59:49
+   humaneval exit 0 16:03:03: pass@1: 0.939 pass@1: 0.915 
+   [t1] humaneval spec on, K auto 6/3/3: [0.939, 0.915] (must equal 93.9 / 91.5: the library is bitwise); degenerate 0 / 164 -> ok
+   server log error lines: 0; repro clean 1; needle PASS 6 FAIL 0; A/B 10/10: 1, texts = cand21: 1; speed rc 0/0/0; T1 rc 0
+[gate3] PASS
+== ALL PASS   16:03:05  (landing: build-qwen/ := the candidate, main := cand-1221 (ff), patches 0148-0149)

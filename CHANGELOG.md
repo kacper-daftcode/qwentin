@@ -8,7 +8,22 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changes
+
+- **The DeltaNet recurrence's q / k norms without per-column block reductions (bitwise).** The decode core and the
+  verify's sequential core (`k_tq_linear_decode_core_hs_paged`, `k_tq_linear_core_seq_paged[_all]`) computed each column's
+  two norms with a 7-step shared-memory tree each (14 `__syncthreads`) plus 4 more barriers per column; the verify
+  carried that chain through every column of every segment in 48 launches per wave and once more in the commit replay —
+  6.1 ms of a 33 ms round at 8 streams, 7.5 of 46 at 12. Now one warp sums the 128 squares in the tree's exact
+  association (`tq_warp_sumsq128`), the decode core needs one barrier per column and the sequential core computes the
+  q / k rows of up to 8 columns behind one barrier and runs the column loop with none (`__launch_bounds__(256, 2)`,
+  ≤ 128 registers). Every normalizer is the same float as before, so the library is bitwise against v0.13's (paged
+  logits at N = 3 / 8 and with the drafter's hooks: max |d| 0) and speculative decoding stays plain decode's bit for
+  bit. The spec round on the frozen code corpus at 32K (60 rounds, two A/B pairs): **21.5 → 21.2 ms at N = 1 (−1.2 %),
+  32.9 → 32.0 at N = 8 (−2.7 %), 45.0 → 43.7 at N = 12 (−2.9 %)**; the commit replay 2.66 → 2.26 ms at N = 8, the
+  sequential core 69.8 → 45.5 µs per launch. Prefill and the attention path are untouched (204 / 219 kernels
+  SASS-identical; the 15 that differ are the three DeltaNet-core families × 5 state formats). Gate:
+  `docs/evidence/cand31-all.log`.
 
 ## [v0.13] — 2026-10-22
 
