@@ -8,6 +8,39 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [v0.14] — 2026-10-23
+
+The last single-GPU release of this line: three bitwise speed levers on v0.13's kernels — the DeltaNet recurrence's
+q / k norms without per-column block reductions in the decode step, the verify wave and the commit replay (the spec
+round −1.2 / −2.7 / −2.9 % at 1 / 8 / 12 streams), the trellis page encoder's step loop at its issue floor (−24 % on the
+kernel) and the prefill wave on the verify wave's fused launch set (208 fewer launches per wave): the 128-column prefill
+wave 46.9 → 45.9 ms at 32K and 71.9 → 70.9 at 128K, the cold TTFT 11.4 → 10.9 s at 32K and 58.5 → 56.8 s at 128K, every
+output bit for bit v0.13's. Engine `49bc602`, library `build-qwen/libforward_qwen.so` md5 `8f42ffdde443`, the served line
+`--max-slots 12 --num-blocks 4500` with no flags and no environment on the opt-5.75 version-2 `.tqf` with the DRAFT lm_head
+section (`...-mtp4-dv64k.tqf`); the 16 GB line is v0.12's (`t45v4`, unchanged). CUDA 13.1, driver 610.57.04, RTX 5090 at
+550 W. Measured but not landed (branches `cand-1219`, `cand-1220`, `cand-1223`; the research notes): the encoder on a
+higher-priority stream and a k-split makespan picker for the wide GEMM (−0.3 % each), and a two-warps-per-m-tile prefill
+attention kernel (slower: the kernel is co-limited by the shared-memory pipe of the trellis lookups).
+
+### Numbers pinned at this tag
+
+| | value | log |
+|---|---|---|
+| Pooled KV capacity | **576 000 tokens** (4500 × 128-token pages, 12 slots × up to 256K) at **30 138 MiB** at start (30 350 after the needle, 30 586 after everything) | `docs/evidence/rel14-table.log` |
+| Needle-in-a-repository | **6/6** at 32K and 128K (3 depths × 3 decoys) | `rel14-table.log`; `cand32-all.log` gate 3 |
+| Time to first token, cold | **10.9 s @32K · 56.8 s @128K** (v0.13: 11.4 / 58.5; 10.94–10.97 / 56.76–56.89 in the table run, 10.92–10.94 / 56.65–56.71 in the cand32 gate) | `rel14-table.log`, `cand32-all.log` |
+| Decode per stream @32K, N = 1 / 2 / 4 / 8 / 12, spec on | **217 / 163 / 125 / 89 / 69 tok/s** — the mean of two readings of one prompt per stream (216.8 / 216.9, 164.0 / 161.6, 127.2 / 123.4, 89.1 / 89.3, 69.4 / 68.3; **830 / 829 aggregate at 12**; v0.13: 213 / 166 / 120 / 88 / 64, 774 / 788) | `rel14-table.log` |
+| Decode per stream @32K, spec off | 66 / 63 / 58 / 49 / 42 tok/s | `rel14-table.log` |
+| Decode per stream @128K, N = 1 / 2, spec on (off) | **126 / 103 tok/s** (58 / 53) (v0.13: 123 / 102) | `rel14-table.log` |
+| Spec A/B | 10/10 identical texts, and the same texts as every gate since `cand12` | `rel14-table.log`, `cand31/32-all.log` |
+| T1 EvalPlus with speculative decoding on | HumanEval/+ **93.9 / 91.5** (= the spec-off reference) on both landed changes | `cand31-all.log`, `cand32-all.log` |
+| Quality vs the bf16 original | KL 0.0021–0.0027, top-1 99.0–99.1 % — unchanged: every kernel computes what v0.13's did bit for bit (paged logits max \|d\| 0 at N = 3 / 8 and with the drafter; the prefill wave's 4-wave logits = the reference dumps at 32K / 128K) | `cand31-all.log`, `cand32-all.log`, `cand32-wave-ab.log` |
+| The spec round (frozen code corpus, 32K, 60 rounds, two A/B pairs) | 21.5 → 21.2 ms at N = 1 K = 6, 32.9 → 32.0 at N = 8 K = 3, 45.0 → 43.7 at N = 12 K = 3 | `cand31-round-ab.log` |
+| Prefill wave | 46.87 → 45.87 ms per 128-column wave at 32K, 71.85 → 70.89 at 128K (the encoder alone −0.65 / −0.54); the trellis encoder's 1024-tile launch 235 → 178 µs | `cand32-wave-ab.log`, `cand32-encoder-ab.log` |
+| Wikitext-2 KL (exllamav3 `model_diff.py`, 100 × 2048) | opt-5.75 **0.00207 / 98.35 %** vs the bf16 original (the weights are v0.12's) | `docs/evidence/wiki2/`, QUALITY.md § 7 |
+
 ### Changes
 
 - **The trellis page encoder's step loop without the per-step shuffle chain (bitwise).** `k_t4_encode` (the
@@ -448,5 +481,6 @@ server with the MTP covering tree, Reservoir Dogs and `--bark-all-day`; a 256K s
 2 059 prompt tok/s, needle 4/4 @239K; the batched server of that build held 196K pooled tokens (FP6). Kept as
 `docs/legacy-fp6.md`.
 
-[Unreleased]: https://github.com/kacper-daftcode/qwentin/compare/v0.10...HEAD
+[Unreleased]: https://github.com/kacper-daftcode/qwentin/compare/v0.14...HEAD
+[v0.14]: https://github.com/kacper-daftcode/qwentin/releases/tag/v0.14
 [v0.10]: https://github.com/kacper-daftcode/qwentin/releases/tag/v0.10

@@ -1,10 +1,22 @@
 # Evidence pack — the logs behind the README's numbers
 
-Every headline number in the top-level `README.md` (pinned at **v0.13**) is a line in one of the files in this
+Every headline number in the top-level `README.md` (pinned at **v0.14**) is a line in one of the files in this
 directory. The files are verbatim copies of the research project's (`kacper-daftcode/qwentin-internal`) `logs/`,
 `notes/` and `runs/` — nothing was edited or trimmed (the paths `/mnt/nvme/...` and `/root/work/venv/bin/python` are
 the measurement box's). `scripts/` holds the exact shell scripts that produced each log, so every flag of every gate is
 on record. The narrative around the numbers is [`docs/NOTES.md`](../NOTES.md); the release notes, [`CHANGELOG.md`](../../CHANGELOG.md).
+
+## v0.14 (2026-10-23): what was re-measured
+
+v0.14 re-measured every served-line cell of the README's 32 GB table on the tagged library itself (`8f42ffdde443` = main
+`5ab8417`, engine `49bc602`; the served reduced-vocabulary file), each speed cell twice in one run (`rel14-table.log`,
+`scripts/rel14-table.sh`): 576 000 pooled tokens at 30 138 MiB (30 586 after everything), needle 6/6 (TTFT 10.94–10.97 s @32K,
+56.76–56.89 s @128K), A/B 10/10 with `cand21`'s texts, **216.8 / 164.0–161.6 / 127.2–123.4 / 89.1–89.3 / 69.4–68.3 tok/s per
+stream @32K spec on at N = 1 / 2 / 4 / 8 / 12** (66.0 / 62.9 / 57.7 / 49.1 / 42.5 off; 830 / 829 aggregate at 12), **125.5–125.9 /
+103.3 @128K at N = 1 / 2** (58.5 / 53.1 off). Everything since v0.13 is bitwise (the three levers' gates `cand31-all.log` and
+`cand32-all.log`: paged logits max |d| 0, the prefill wave's 4-wave logits = the reference dumps, T1 93.9 / 91.5, the A/B texts
+= `cand21`'s), so the quality rows, the 24 GB variant, the 16 GB table (v0.12's) and the vLLM columns of 2026-10-17 carry over
+unchanged.
 
 ## v0.13 (2026-10-22): what was re-measured
 

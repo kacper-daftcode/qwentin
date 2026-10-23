@@ -12,26 +12,25 @@ comes from EXL3 trellis-quantized weights at 5.75 bpw (quantized with turboderp'
 (Cursor) directed by the maintainer; every number below is backed by a log in [`docs/evidence/`](docs/evidence/README.md),
 and `bench/reproduce.sh` re-measures the served line on your card.
 
-## One 32 GB card (v0.13, 2026-10-22)
+## One 32 GB card (v0.14, 2026-10-23)
 
 | | **qwentin**, 1 × RTX 5090 | vLLM NVFP4, 1 × RTX 5090 (bf16 KV ; fp8 KV) | vLLM FP8, 2 × RTX 5090 (TP2) |
 |---|---|---|---|
 | Weights, KV cache | EXL3 5.75 bpw, 4-bit trellis K+V (16.5 KiB/token) | NVFP4 4.5 bpw, bf16 ; fp8 K+V | FP8, bf16 K+V |
 | Pooled KV capacity | **576K tokens** (12 slots, 30 138 MiB) | 147–179K ; 283K | 493K over two cards |
 | Quality vs bf16 (KL / top-1) | **0.0021–0.0027 / 99.0–99.1 %**, EvalPlus = FP8 (93.9 / 91.5 · 90.7 / 77.8 with speculative decoding on) | ≈ 0.04 KL (fake-quant estimate) | 0.0037 / 98.7 % |
-| Decode per stream @32K, N = 1 / 4 / 8 / 12 | **213 / 120 / 88 / 64 tok/s** (66 / 57 / 48 / 42 without spec; 780 tok/s aggregate at 12 streams) | 71.5 / 51.4 / — / — ; 75.3 / 58.8 / — / — | 76.8 / 60.3 / 50.4 / — |
-| Decode per stream @128K, N = 1 / 2 | **123 / 102 tok/s** (58 / 53 without spec) | 55.5 / — ; 66.0 / — | 65.8 / — |
-| Cold TTFT, 32K / 128K | 11.4 / 58.5 s | **3.1 / 25.2 s** ; 3.3 / 30.0 s | **4.4 / 24.1 s** |
+| Decode per stream @32K, N = 1 / 4 / 8 / 12 | **217 / 125 / 89 / 69 tok/s** (66 / 58 / 49 / 42 without spec; 830 tok/s aggregate at 12 streams) | 71.5 / 51.4 / — / — ; 75.3 / 58.8 / — / — | 76.8 / 60.3 / 50.4 / — |
+| Decode per stream @128K, N = 1 / 2 | **126 / 103 tok/s** (58 / 53 without spec) | 55.5 / — ; 66.0 / — | 65.8 / — |
+| Cold TTFT, 32K / 128K | 10.9 / 56.8 s | **3.1 / 25.2 s** ; 3.3 / 30.0 s | **4.4 / 24.1 s** |
 | Needle in a repository, 32K + 128K | 6/6 | 6/6 | 6/6 |
 
-<sub>qwentin: engine `e3be83d`, library md5 `b2e93405f8a6`, the serve line below, 550 W, CUDA 13.1. Every served-line cell
-re-measured 2026-10-22 on one library and the served reduced-vocabulary file, each speed cell twice in one run
-(`docs/evidence/rel13-table.log`: 212.6 / 212.5, 120.9 / 118.7, 88.2 / 88.5, 63.3 / 65.2 per stream at N = 1 / 4 / 8 / 12
-@32K spec on, 774 / 788 aggregate at 12; 123.4 / 123.7 and 103.9 / 100.5 @128K; TTFT 11.36–11.38 / 58.4–58.5 s; 30 138 →
-30 586 MiB over the run). The decode cells were measured on library `9be3c8e7`; the later `cand-1218` changes only the
-norm grid of waves with ≥ 16 rows (prefill waves and the verify waves of ≥ 4 streams; bitwise, −0.75 ms per 128-column prefill
-wave, speed-neutral on the verify wave at 8 streams: `cand29-wave-ab.log`, `cand29-all.log`) — its gate read the TTFT at
-11.35 / 58.5–58.7 s. `--spec-k auto` at 12 streams is 3 drafts since 2026-10-22 (the verify wave runs up to 64 columns in
+<sub>qwentin: engine `49bc602`, library md5 `8f42ffdde443`, the serve line below, 550 W, CUDA 13.1. Every served-line cell
+re-measured 2026-10-23 on this library and the served reduced-vocabulary file, each speed cell twice in one run
+(`docs/evidence/rel14-table.log`: 216.8 / 216.9, 127.2 / 123.4, 89.1 / 89.3, 69.4 / 68.3 per stream at N = 1 / 4 / 8 / 12
+@32K spec on, 830 / 829 aggregate at 12; 125.5 / 125.9 and 103.3 / 103.3 @128K; TTFT 10.94–10.97 / 56.76–56.89 s; 30 138 →
+30 586 MiB over the run). Since v0.13 every kernel computes the same bits (three bitwise levers: `cand31-all.log`,
+`cand32-all.log`): the DeltaNet norms without per-column barriers (the spec round −1..−3 %), the trellis encoder's loop and
+the prefill wave's fused launches (the wave −1.0 ms, TTFT −0.5 / −1.7 s). `--spec-k auto` at 12 streams is 3 drafts since 2026-10-22 (the verify wave runs up to 64 columns in
 one pass: 666 / 680 aggregate before, `cand27-all.log`); at 3–6 streams it deepens the draft when the recent acceptance is
 high (`cand28-all.log`: code continuation 586 → 659 tok/s at 4 streams, prose answers unchanged — the table's prose cells
 are the conservative case). Since v0.11: the drafter reads the trunk hidden after the final norm (+0.17 tokens per
@@ -42,7 +41,7 @@ its one prompt: 4.62 tokens per round @32K N = 1 (K = 6), 2.86 @128K (K = 4) at 
 one 5090. Cell-by-cell sources: [`docs/evidence/README.md`](docs/evidence/README.md); the story behind the numbers:
 [`docs/NOTES.md`](docs/NOTES.md).</sub>
 
-## One 16 GB card (v0.12, 2026-10-21 — unchanged in v0.13)
+## One 16 GB card (v0.12, 2026-10-21 — unchanged in v0.13 / v0.14)
 
 The 4.25 bpw model `t45v4` (−19 % KL on the code yardstick at the same size as the previous `t45-s425`; +7 % on
 wikitext-2 prose — the allocation is code-weighted, see `docs/QUALITY.md` § 7) with the same engine, two sessions,

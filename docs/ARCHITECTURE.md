@@ -240,6 +240,6 @@ docs/FLAGS.md                every engine environment flag and server argument, 
 docs/VARIANTS.md             the 16 GB and 24 GB variants (tables + serve lines)
 docs/legacy-fp6.md           FP6 E2M3 models on the batched server; the retired single-stream path (last release v0.11)
 docs/QUALITY.md, docs/TQF_FORMAT.md, docs/evidence/   the quality protocol, the file format, the gate logs behind the numbers
-CHANGELOG.md                 what landed in each release (v0.10 = the 2026-10 served stack, v0.11 = its prefill + hygiene, v0.12 = the config struct, two spec-decode fixes, the t45v4 16 GB model, v0.13 = speculative decoding faster at every stream count: the reduced draft vocabulary, deeper and acceptance-adaptive drafts, the one-pass verify wave)
+CHANGELOG.md                 what landed in each release (v0.10 = the 2026-10 served stack, v0.11 = its prefill + hygiene, v0.12 = the config struct, two spec-decode fixes, the t45v4 16 GB model, v0.13 = speculative decoding faster at every stream count: the reduced draft vocabulary, deeper and acceptance-adaptive drafts, the one-pass verify wave, v0.14 = three bitwise speed levers: the DeltaNet norms, the trellis encoder's loop, the prefill wave's fused launches)
 .github/workflows/           CI (compile check, ruff, pytest) and the disabled nightly 5090 gate
 ```

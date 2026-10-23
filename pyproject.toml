@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwentin"
-version = "0.13.0"
+version = "0.14.0"
 description = "Qwen3.6/3.8-27B inference engine for one SM120 GPU: EXL3 trellis weights, trellis-coded KV cache, speculative decoding, OpenAI API"
 readme = "README.md"
 license = "MIT"
