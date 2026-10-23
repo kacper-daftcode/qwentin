@@ -365,16 +365,25 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
     for (int j = 0; j < T; j++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
             g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    // Session 17: the wave takes the verify wave's fused launch set (wide_mlp's add + post norm, the layer's final
+    // residual add + the NEXT layer's input norm, one fragment build for the Linears that share an input) -- the same
+    // kernels and expressions as the separate launches (k_tq_add_rmsnorm_b carries k_tq_qwen_rmsnorm_b's reduction;
+    // a grouped fragment build computes each Linear's fragments as the single build does), so the wave's logits are
+    // bit for bit the same with 208 fewer launches per 64 layers.
+    const int fuse = (g_qwen.flags & TQ_FLAG_EXL3_WEIGHTS) != 0;
+    int norm_ready = 0;                       // the previous layer's fused tail produced this layer's input norm
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
+        const uint16_t *next_ln = (L + 1 < g_qwen.L) ? g_qwen.layers[L + 1].d_input_ln : g_qwen.d_norm;
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -92;
-            k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if (!norm_ready)
+                k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -93;
-            if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
-            if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
-            if ((ret = wide_proj(&l->v_proj, g_wide_v, T)) != 0) return -93;
+            const tq_qmma_weight_t *qkv[3] = {&l->q_proj, &l->k_proj, &l->v_proj};
+            float *qkv_out[3] = {g_wide_q, g_wide_k, g_wide_v};
+            if ((ret = wide_proj_group(qkv, qkv_out, 3, T)) != 0) return -93;
             if (g_cfg.wide_attn_mma && g_pg_page >= 128) {
                 if (launch_paged_attn_q4_mma_prefill(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
@@ -388,17 +397,24 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                                      g_pg_t4 ? seg_slot : NULL, seg_off, seg_len, K) != 0) return -94;
             if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -95;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -95;
-            k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -96;
+            if (fuse) {
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T, g_wide_h, g_wide_o, next_ln, g_wide_norm)) != 0) return -96;
+                norm_ready = 1;
+            } else {
+                k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -96;
+            }
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -97;
-            k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if (!norm_ready)
+                k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
-            if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
-            if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
+            const tq_qmma_weight_t *qz[2] = {&l->linear_in_qkv, &l->linear_in_z};
+            float *qz_out[2] = {g_wide_qkv, g_wide_z};
+            if ((ret = wide_proj_group(qz, qz_out, 2, T)) != 0) return -98;
             if ((ret = wide_proj_pair(&l->linear_in_b, g_wide_b, &l->linear_in_a, g_wide_a, T)) != 0) return -98;
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
@@ -422,13 +438,20 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             }
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -100;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -100;
-            k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -101;
+            if (fuse) {
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T, g_wide_h, g_wide_o, next_ln, g_wide_norm)) != 0) return -101;
+                norm_ready = 1;
+            } else {
+                k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
+                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -101;
+            }
         }
     }
+    // after the last layer g_wide_norm = rmsnorm(g_wide_h, d_norm) for every column when the tail was fused
     if (g_pg_sink) {     // every column's logits; the head in decode-size chunks (f32 accumulators)
         if (T > g_pg_sink_cap) return -106;
-        k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+        if (!norm_ready)
+            k_tq_qwen_rmsnorm_b<<<tq_norm_grid(T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
         for (int c0 = 0; c0 < T; c0 += g_pg_sink_head) {
             int nc = T - c0 < g_pg_sink_head ? T - c0 : g_pg_sink_head;
             if ((ret = wide_quant_input(g_wide_norm + (size_t)c0 * H, H, nc)) != 0) return -107;
@@ -443,12 +466,17 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         out_seed[k] = -1;
         if (!seg_final[k]) continue;
         int last_col = seg_off[k] + seg_len[k] - 1;
-        cudaMemcpyAsync(g_wide_resid + (size_t)Kf * H, g_wide_h + (size_t)last_col * H,
+        // the final norm of the last column: already in g_wide_norm when the tail was fused (gathered from there), else
+        // the hidden rows are gathered and normed below (the same kernel on the same rows: bitwise either way)
+        cudaMemcpyAsync(g_wide_resid + (size_t)Kf * H, (norm_ready ? g_wide_norm : g_wide_h) + (size_t)last_col * H,
                         (size_t)H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
         fk[Kf++] = k;
     }
     if (Kf > 0) {
-        k_tq_qwen_rmsnorm_b<<<tq_norm_grid(Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
+        if (norm_ready)
+            cudaMemcpyAsync(g_wide_norm, g_wide_resid, (size_t)Kf * H * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+        else
+            k_tq_qwen_rmsnorm_b<<<tq_norm_grid(Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
         if (paged_lm_head_wide()) {
             if ((ret = wide_quant_input(g_wide_norm, H, Kf)) != 0) return -102;
             if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, Kf)) != 0) return -102;
