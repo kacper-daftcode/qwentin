@@ -1,0 +1,72 @@
+[try-enc-s1] waiting for /tmp/exl3diff-gpu2.lock 09:39:09
+[try-enc-s1] start 09:43:03 lib qwentin/build-qwen/libforward_qwen.so md5 200e037d2b61 env: 
+   [enc-s1-32k] slot 0: restored 32768 tokens from runs/pattn/slot-32k.blob (608 MiB) in 0.23 s
+   [enc-s1-32k] 8 profiled 128-column waves at pos 32768+: 46.91 ms per wave (host wall; per wave 46.0 46.4 46.7 46.8 47.1 47.3 47.4 47.5)
+   [enc-s1-128k] slot 0: restored 131072 tokens from runs/pattn/slot-128k.blob (2192 MiB) in 0.74 s
+   [enc-s1-128k] 8 profiled 128-column waves at pos 131072+: 71.99 ms per wave (host wall; per wave 70.9 71.2 71.6 72.0 72.4 72.5 72.6 72.7)
+[try-enc-s1] done 09:43:19
+[try-enc] waiting for /tmp/exl3diff-gpu2.lock 09:43:19
+[try-enc] start 09:43:19 lib qwentin-enc/build-enc/libforward_qwen.so.enc md5 5ccfa9d0243b env: 
+   [enc-32k] slot 0: restored 32768 tokens from runs/pattn/slot-32k.blob (608 MiB) in 0.20 s
+   [enc-32k] 8 profiled 128-column waves at pos 32768+: 46.22 ms per wave (host wall; per wave 45.3 45.6 46.1 46.2 46.4 46.6 46.7 46.8)
+   [enc-32k-dump] logits (4, 128, 248320) -> runs/ws/logits-enc-32k.pt (argmax of the last column per wave: [579, 11, 11, 11])
+   vs base: [cmp] runs/ws/logits-enc-32k.pt vs runs/ws/logits-base-32k.pt: waves 4 x 128 cols x 248320 vocab; BITWISE True
+   [enc-128k] slot 0: restored 131072 tokens from runs/pattn/slot-128k.blob (2192 MiB) in 0.57 s
+   [enc-128k] 8 profiled 128-column waves at pos 131072+: 71.31 ms per wave (host wall; per wave 70.2 70.6 70.9 71.3 71.7 71.8 71.9 72.0)
+   [enc-128k-dump] logits (4, 128, 248320) -> runs/ws/logits-enc-128k.pt (argmax of the last column per wave: [197, 197, 470, 1260])
+   vs base: [cmp] runs/ws/logits-enc-128k.pt vs runs/ws/logits-base-128k.pt: waves 4 x 128 cols x 248320 vocab; BITWISE True
+[try-enc] done 09:43:51
+[try-encfuse] waiting for /tmp/exl3diff-gpu2.lock 09:43:51
+[try-encfuse] start 09:44:56 lib qwentin-enc/build-enc/libforward_qwen.so.encfuse md5 8f42ffdde443 env: 
+       raise RuntimeError(f"{what} failed: {r}")
+   RuntimeError: init failed: -1
+       raise RuntimeError(f"{what} failed: {r}")
+   RuntimeError: init failed: -1
+   vs base: Traceback (most recent call last):
+   vs base:   File "/mnt/nvme/qwen256k/analysis/pattn_cmp.py", line 8, in <module>
+   vs base:     a = torch.load(sys.argv[1])["logits"]
+   vs base:         ~~~~~~~~~~^^^^^^^^^^^^^
+   vs base:   File "/root/work/venv/lib/python3.14/site-packages/torch/serialization.py", line 1565, in load
+   vs base:     with _open_file_like(f, "rb") as opened_file:
+   vs base:          ~~~~~~~~~~~~~~~^^^^^^^^^
+   vs base:   File "/root/work/venv/lib/python3.14/site-packages/torch/serialization.py", line 795, in _open_file_like
+   vs base:     return _open_file(name_or_buffer, mode)
+   vs base:   File "/root/work/venv/lib/python3.14/site-packages/torch/serialization.py", line 776, in __init__
+   vs base:     super().__init__(open(name, mode))  # noqa: SIM115
+   vs base:                      ~~~~^^^^^^^^^^^^
+   vs base: FileNotFoundError: [Errno 2] No such file or directory: 'runs/ws/logits-encfuse-32k.pt'
+       raise RuntimeError(f"{what} failed: {r}")
+   RuntimeError: init failed: -1
+       raise RuntimeError(f"{what} failed: {r}")
+   RuntimeError: init failed: -1
+   vs base: Traceback (most recent call last):
+   vs base:   File "/mnt/nvme/qwen256k/analysis/pattn_cmp.py", line 8, in <module>
+   vs base:     a = torch.load(sys.argv[1])["logits"]
+   vs base:         ~~~~~~~~~~^^^^^^^^^^^^^
+   vs base:   File "/root/work/venv/lib/python3.14/site-packages/torch/serialization.py", line 1565, in load
+   vs base:     with _open_file_like(f, "rb") as opened_file:
+   vs base:          ~~~~~~~~~~~~~~~^^^^^^^^^
+   vs base:   File "/root/work/venv/lib/python3.14/site-packages/torch/serialization.py", line 795, in _open_file_like
+   vs base:     return _open_file(name_or_buffer, mode)
+   vs base:   File "/root/work/venv/lib/python3.14/site-packages/torch/serialization.py", line 776, in __init__
+   vs base:     super().__init__(open(name, mode))  # noqa: SIM115
+   vs base:                      ~~~~^^^^^^^^^^^^
+   vs base: FileNotFoundError: [Errno 2] No such file or directory: 'runs/ws/logits-encfuse-128k.pt'
+[try-encfuse] done 09:45:06
+[try-enc-s2] waiting for /tmp/exl3diff-gpu2.lock 09:45:06
+[try-enc-s2] start 09:45:06 lib qwentin/build-qwen/libforward_qwen.so md5 200e037d2b61 env: 
+       raise RuntimeError(f"{what} failed: {r}")
+   RuntimeError: init failed: -1
+       raise RuntimeError(f"{what} failed: {r}")
+   RuntimeError: init failed: -1
+[try-enc-s2] done 09:45:09
+[fuse-ab encfuse] start 09:46:20; cand 8f42ffdde443, served 200e037d2b61
+   [encfuse-s1-32k] 8 profiled 128-column waves at pos 32768+: 46.87 ms per wave 
+   [encfuse-s1-128k] 8 profiled 128-column waves at pos 131072+: 71.85 ms per wave 
+   [encfuse-32k] 8 profiled 128-column waves at pos 32768+: 45.87 ms per wave 
+   vs base: [cmp] runs/ws/logits-encfuse-32k.pt vs runs/ws/logits-base-32k.pt: waves 4 x 128 cols x 248320 vocab; BITWISE True
+   [encfuse-128k] 8 profiled 128-column waves at pos 131072+: 70.89 ms per wave 
+   vs base: [cmp] runs/ws/logits-encfuse-128k.pt vs runs/ws/logits-base-128k.pt: waves 4 x 128 cols x 248320 vocab; BITWISE True
+   [encfuse-s2-32k] 8 profiled 128-column waves at pos 32768+: 46.87 ms per wave 
+   [encfuse-s2-128k] 8 profiled 128-column waves at pos 131072+: 71.85 ms per wave 
+[fuse-ab encfuse] done 09:47:15

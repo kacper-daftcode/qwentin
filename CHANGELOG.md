@@ -10,6 +10,26 @@ yardstick of [`docs/QUALITY.md`](docs/QUALITY.md).
 
 ### Changes
 
+- **The trellis page encoder's step loop without the per-step shuffle chain (bitwise).** `k_t4_encode` (the
+  Viterbi that writes the completed pages' K / V as trellis codes, 16 launches of 1024 tiles per prefill wave on the
+  side stream) packed each step's 256 argmin nibbles into words through a 3-shuffle chain that sat between the min
+  and the barrier on all 255 steps. Each thread now keeps its own class's nibbles (a funnel shift per step, one
+  shared-memory store per 8 steps, the same 32 KB traceback) and the step loop is unrolled by two: 121 → 104
+  instructions per step, 89 of them the Viterbi arithmetic itself, at the issue-rate floor. The arithmetic per state is
+  unchanged (fp32 sub / mul / add without contraction, the same min tree and ties), so the codes are bit for bit the
+  same (`tools/t4_encode_ab.py`: 8192 fixed rows with a scale spread, heavy tails, an outlier channel, exact cost ties,
+  near-zero, constant and zero rows — codes and scales identical). **The 1024-tile launch 235 → 178 µs (−24 %); the
+  128-column prefill wave 46.9 → 46.2 ms at 32K, 72.0 → 71.3 at 128K** (the encoder displaces the GEMMs' SM time).
+- **The prefill wave on the verify wave's fused launch set (bitwise, host code).** Per layer the wave launched the input
+  norm, three (q / k / v) or two (qkv / z) fragment builds of the same normalized input, the residual add after the
+  attention / DeltaNet output projection, the post norm and the layer's final residual add as separate kernels; the
+  verify wave has run the same layer since v0.11 as one fragment build per shared input, the add fused with the post
+  norm and the final add fused with the next layer's input norm (`k_tq_add_rmsnorm_b` carries `k_tq_qwen_rmsnorm_b`'s
+  reduction). The prefill wave now does the same — **208 fewer launches per wave**, the same kernels, expressions and
+  reduction order. **Together with the encoder: the wave 46.87 → 45.87 ms at 32K and 71.85 → 70.89 at 128K (−1.0 ms,
+  −2.1 / −1.3 %), the 4-wave logits bitwise = the reference dumps at both contexts; the served line's TTFT 11.22 →
+  10.93 s at 32K and 57.8 → 56.7 s at 128K (needle 6/6)**, decode untouched (217 / 219 kernels SASS-identical, the
+  two that differ are the encoder's). Gate: `docs/evidence/cand32-all.log` (+ `cand32-wave-ab.log`, `cand32-encoder-ab.log`).
 - **The DeltaNet recurrence's q / k norms without per-column block reductions (bitwise).** The decode core and the
   verify's sequential core (`k_tq_linear_decode_core_hs_paged`, `k_tq_linear_core_seq_paged[_all]`) computed each column's
   two norms with a 7-step shared-memory tree each (14 `__syncthreads`) plus 4 more barriers per column; the verify
