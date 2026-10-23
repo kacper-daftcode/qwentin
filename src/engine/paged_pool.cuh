@@ -252,6 +252,12 @@ static __device__ __forceinline__ void tq_t4_tile_coords(const tq_t4_job &jb, in
 // ~3 us) -- the two-kernel version with the traceback in global memory was latency-bound at ~100 us per launch for
 // the small batches of a verify wave / decode step (255 dependent L2 loads per tile). x from the fp16 staging row,
 // unit RMS with the fp16-rounded scale (kv_fakequant), codes + side word straight into the pool rows.
+// Session 17: each thread packs its own argmin nibbles of 8 consecutive steps into one word (a funnel shift per step)
+// and stores it once per 8 steps -- layout [step / 8][class], nibble step & 7 -- where the previous kernel packed 8
+// classes' nibbles per step through a 3-shuffle chain that sat on the barrier's critical path; the step loop is
+// unrolled by two (the m buffers' parity is then static). The arithmetic per state is the previous kernel's
+// instruction for instruction (sub / mul / add without contraction, the same min tree, the same ties): the codes are
+// bit for bit the same (tools: analysis/t4_encode_ab.py), the 1024-tile launch 235 -> 178 us.
 // The body is shared by the two kernels below: the job by value (kernel parameter; the eager decode / verify /
 // prefill paths) or read from device memory (k_t4_encode_dev: the graph-captured verify wave, whose jobs the host
 // writes before every replay). Same code, same arithmetic -> the same codes.
@@ -261,21 +267,21 @@ static __device__ __forceinline__ void t4_encode_body(const tq_t4_job &jb, const
     __shared__ __align__(16) float ms[2][NG * TQ_T4_MROW];
     __shared__ float rv[NW];
     __shared__ int rs[NW];
-    __shared__ uint32_t tbs[256 * (NT / 8)];           // traceback nibbles: [step][class / 8]
+    __shared__ uint32_t tbs[32 * NT];                  // traceback nibbles: [step / 8][class], nibble step & 7
     const int tile = blockIdx.x, i = threadIdx.x, lane = i & 31, warp = i >> 5, g = i >> 4;
     int fl, h, kv;
     size_t srow, drow;
     tq_t4_tile_coords(jb, jb.tile0 + tile, fl, srow, drow, h, kv);
     const uint16_t *src = jb.src[fl] + ((srow * jb.nkv + h) << 9) + kv * 256;
     const float xi = __half2float(__ushort_as_half(src[i]));
-    float ss = xi * xi;
+    float ss = __fmul_rn(xi, xi);
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    for (int o = 16; o > 0; o >>= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
     if (lane == 0) rv[warp] = ss;
     __syncthreads();
     float tot = 0.0f;
     #pragma unroll
-    for (int w = 0; w < NW; w++) tot += rv[w];
+    for (int w = 0; w < NW; w++) tot = __fadd_rn(tot, rv[w]);
     float rms = __half2float(__float2half(sqrtf(tot * (1.0f / 256.0f))));
     if (!(rms > 1e-12f)) rms = 1e-12f;
     xs[i] = xi / rms;
@@ -289,25 +295,19 @@ static __device__ __forceinline__ void t4_encode_body(const tq_t4_job &jb, const
         for (int j = 0; j < 16; ++j) { const float d = __fsub_rn(x0, cbv[j]); cost[j] = __fmul_rn(d, d); }
     }
     const int mslot = (i & (NG - 1)) * TQ_T4_MROW + (i >> 4);
-    const float4 *mrow0 = reinterpret_cast<const float4 *>(&ms[0][g * TQ_T4_MROW]);
-    const float4 *mrow1 = reinterpret_cast<const float4 *>(&ms[1][g * TQ_T4_MROW]);
-    #pragma unroll 1
+    uint32_t tbw = 0u;
+    #pragma unroll 2
     for (int st = 1; st < 256; ++st) {
         float m;
         int a;
         tq_t4_min16(cost, m, a);
         const int par = st & 1;
         ms[par][mslot] = m;
+        tbw = __funnelshift_r(tbw, (uint32_t)a, 4);    // the nibble of step st lands at bits 4 (st & 7) once the word is full
+        if ((st & 7) == 7) tbs[(st >> 3) * NT + i] = tbw;   // (word 0 holds steps 1..7: step 0 has no predecessor)
         __syncthreads();
-        // the step's traceback nibbles are packed after the barrier so the shuffle chain overlaps the next
-        // step's m loads / cost update instead of sitting on the barrier's critical path
-        uint32_t w = (uint32_t)a;
-        w |= __shfl_down_sync(0xffffffffu, w, 1) << 4;
-        w |= __shfl_down_sync(0xffffffffu, w, 2) << 8;
-        w |= __shfl_down_sync(0xffffffffu, w, 4) << 16;
-        if ((lane & 7) == 0) tbs[st * (NT / 8) + (i >> 3)] = w;
         const float xt = xs[st];
-        const float4 *mr = par ? mrow1 : mrow0;
+        const float4 *mr = reinterpret_cast<const float4 *>(&ms[par][g * TQ_T4_MROW]);
         const float4 m0 = mr[0], m1 = mr[1], m2 = mr[2], m3 = mr[3];
         const float mm[16] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w,
                               m2.x, m2.y, m2.z, m2.w, m3.x, m3.y, m3.z, m3.w};
@@ -344,8 +344,8 @@ static __device__ __forceinline__ void t4_encode_body(const tq_t4_job &jb, const
             const uint32_t b = (uint32_t)(s & 15);
             if (st & 1) byte = b << 4; else codes[st >> 1] = (uint8_t)(byte | b);
             const int c = s >> 4;
-            const uint32_t w = tbs[st * (NT / 8) + (c >> 3)];
-            const int nib = (int)((w >> ((c & 7) * 4)) & 15u);
+            const uint32_t w = tbs[(st >> 3) * NT + c];
+            const int nib = (int)((w >> ((st & 7) * 4)) & 15u);
             s = c | (nib << SH);
         }
         codes[0] = (uint8_t)(byte | (uint32_t)(s & 15));                       // b_1 << 4 | b_0
