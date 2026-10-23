@@ -1,7 +1,7 @@
 # qwentin
 
 **Qwen3.8-27B on one RTX 5090 (32 GB): 576K pooled context tokens across 12 sessions at FP8 quality, with speculative
-decoding on every stream — 213 / 120 / 88 / 64 tok/s per stream at 1 / 4 / 8 / 12 streams @32K. On a 16 GB card: 51K
+decoding on every stream — 217 / 125 / 89 / 69 tok/s per stream at 1 / 4 / 8 / 12 streams @32K. On a 16 GB card: 51K
 tokens, 198 tok/s @32K.**
 
 A from-scratch CUDA inference engine for the 27B hybrid-attention Qwen3.6/3.8 model on one consumer Blackwell GPU
